@@ -2,6 +2,14 @@
   "name": "karin-plugin-glory-of-kings",
   "version": "1.0.0",
   "description": "王者荣耀营地查询插件（Karin 版）",
+  "homepage": "https://github.com/cchanlan/karin-plugin-glory-of-kings",
+  "bugs": {
+    "url": "https://github.com/cchanlan/karin-plugin-glory-of-kings/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cchanlan/karin-plugin-glory-of-kings.git"
+  },
   "type": "module",
   "main": "lib/index.js",
   "author": "cchanlan",
