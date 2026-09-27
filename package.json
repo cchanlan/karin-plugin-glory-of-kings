@@ -1,0 +1,53 @@
+{
+  "name": "karin-plugin-glory-of-kings",
+  "version": "1.0.0",
+  "description": "王者荣耀营地查询插件（Karin 版）",
+  "type": "module",
+  "main": "lib/index.js",
+  "author": "cchanlan",
+  "license": "MIT",
+  "keywords": [
+    "karin",
+    "karin-plugin",
+    "王者荣耀",
+    "营地"
+  ],
+  "scripts": {
+    "app": "karin start",
+    "dev": "karin dev",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "moment": "^2.30.1",
+    "node-fetch": "^3.3.0",
+    "yaml": "^2.2.2"
+  },
+  "peerDependencies": {
+    "node-karin": "^1.17.0"
+  },
+  "peerDependenciesMeta": {
+    "node-karin": {
+      "optional": true
+    }
+  },
+  "imports": {
+    "#components": "./components/index.js",
+    "#utils": "./utils/index.js",
+    "#puppeteer": "./lib/compat/render.js",
+    "#common": "./lib/compat/common.js",
+    "#update": "./lib/compat/update.js"
+  },
+  "karin": {
+    "apps": [
+      "karin-apps"
+    ],
+    "static": [
+      "resources"
+    ],
+    "files": [
+      "config",
+      "data",
+      "resources"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+# 包管理器文件
+.npmrc
+yarn.lock
+pnpm-lock.yaml
+package-lock.json
+
+# 包管理器日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# 编辑器配置
+.idea/
+.vscode/
+
+# 临时文件
+/logs/
+/temp/
+
+# 依赖
+node_modules/
+
+# 运行期数据：营地的登录令牌、用户绑定表、图片缓存、排行榜快照 —— 全是本机私有
+# 数据，绝不能进仓库。`config/default_config/` 是模板要提交，`config/config/` 下
+# 才是用户填的值（Config.js 首次运行会从模板复制过去，所以不进仓库也不影响使用）。
+/data/*
+/config/config/*.yaml
+
+# karin 的运行时目录（karin 自己生成）
+/@karinjs
+.pnpmfile.cjs
+index.mjs
