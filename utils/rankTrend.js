@@ -50,7 +50,7 @@
  */
 
 /** 默认看多少天 */
-export const RANK_TREND_DEFAULT_DAYS = 14
+export const RANK_TREND_DEFAULT_DAYS = 14;
 /**
  * 想凑够多少场排位局。
  *
@@ -58,56 +58,140 @@ export const RANK_TREND_DEFAULT_DAYS = 14
  * 所以天数只是首选窗口：窗口内不足这个数就放宽到全库最近这么多场（见 pickRankWindow），
  * 调用方也据此决定要不要现拉几页补上。
  */
-export const RANK_TREND_TARGET_POINTS = 10
+export const RANK_TREND_TARGET_POINTS = 10;
 /** 折线最多画多少个点，超了等距抽稀（首尾必留） */
-const MAX_POINTS = 60
+const MAX_POINTS = 60;
 /**
  * 编号跳变多少算「不是正常升降段」。
  * 正常打一晚上最多升降 1~2 个小段；跳 3 段以上要么是切了角色（见文件头第 4 点）、
  * 要么是赛季重置，两种都不该连成一条线。
  */
-const JUMP_TOLERANCE = 3
-
+const JUMP_TOLERANCE = 3;
 const toInt = value => {
-  const num = Number(value)
-  return Number.isFinite(num) ? Math.trunc(num) : 0
-}
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : 0;
+};
 
 /**
  * 大段位层级表，低 → 高。测试顺序有讲究：
  * 「荣耀黄金III」和「荣耀王者」都含「荣耀」，黄金必须排在王者前面先命中；
  * 王者那条只认「王者」二字，好把最强/非凡/绝世/至圣/荣耀/传奇王者一网打尽。
  */
-const RANK_BANDS = [
-  { test: /青铜/, band: 1, short: '青铜' },
-  { test: /白银/, band: 2, short: '白银' },
-  { test: /黄金/, band: 3, short: '黄金' },
-  { test: /铂金|白金/, band: 4, short: '铂金' },
-  { test: /钻石/, band: 5, short: '钻石' },
-  { test: /星耀/, band: 6, short: '星耀' },
-  { test: /王者/, band: 7, short: '王者' }
-]
+const RANK_BANDS = [{
+  test: /青铜/,
+  band: 1,
+  short: '青铜'
+}, {
+  test: /白银/,
+  band: 2,
+  short: '白银'
+}, {
+  test: /黄金/,
+  band: 3,
+  short: '黄金'
+}, {
+  test: /铂金|白金/,
+  band: 4,
+  short: '铂金'
+}, {
+  test: /钻石/,
+  band: 5,
+  short: '钻石'
+}, {
+  test: /星耀/,
+  band: 6,
+  short: '星耀'
+}, {
+  test: /王者/,
+  band: 7,
+  short: '王者'
+}];
 
 /** 段位名 → 大段位层级。认不出来时返回 0，参与排序时会被当成最低（但仍然照常画点） */
-export function rankBand (jobName) {
-  const name = String(jobName || '').trim()
-  return RANK_BANDS.find(item => item.test.test(name))?.band || 0
+export function rankBand(jobName) {
+  const name = String(jobName || '').trim();
+  return RANK_BANDS.find(item => item.test.test(name))?.band || 0;
 }
 
 /** 段位名 → 「星耀」这种两字简称，图上做分层标签用 */
-export function rankBandShort (jobName) {
-  const name = String(jobName || '').trim()
-  return RANK_BANDS.find(item => item.test.test(name))?.short || (name.slice(0, 2) || '未知')
+export function rankBandShort(jobName) {
+  const name = String(jobName || '').trim();
+  return RANK_BANDS.find(item => item.test.test(name))?.short || name.slice(0, 2) || '未知';
 }
 
 /** 是不是王者段。王者段的 stars 是累积值（实测到 97 星），跟别的段不是一个量纲 */
-export function isKingBand (jobName) {
-  return rankBand(jobName) === 7
+export function isKingBand(jobName) {
+  return rankBand(jobName) === 7;
+}
+
+/** 小段罗马数字从低到高。各段的小段数不同，见 rankStarTotal 的注释 */
+const SEG_ORDER = ['V', 'IV', 'III', 'II', 'I'];
+/** 各大段第一小段之前的累计星数（青铜III 0 星起算） */
+const RANK_BASE = {
+  1: 0,
+  2: 9,
+  3: 18,
+  4: 34,
+  5: 50,
+  6: 75,
+  7: 100
+};
+/** 每小段满星：青铜/白银 3 星、黄金/铂金 4 星、钻石/星耀 5 星 */
+const SEG_FULL = {
+  1: 3,
+  2: 3,
+  3: 4,
+  4: 4,
+  5: 5,
+  6: 5
+};
+/** 各大段有几个小段：青铜/白银 III~I、黄金/铂金 IV~I、钻石/星耀 V~I */
+const SEG_COUNT = {
+  1: 3,
+  2: 3,
+  3: 4,
+  4: 4,
+  5: 5,
+  6: 5
+};
+
+/**
+ * 段位累计星数：把「大段 + 小段 + 段内星」折算成从青铜III 0 星起算的一条连续刻度，
+ * 让跨段的净升星可以相减（星耀I 4星 → 王者1星 = 99 → 101 = +2 星）。
+ *
+ * 为什么不能直接用 roleJob 编号：真实归档里编号会乱跳（同一个「永恒钻石IV」出现过
+ * job=20/21，「至尊星耀V」出现过 15/22），而段位名里的小段罗马数字是稳定阶梯。
+ *
+ * ⚠️ 只用于报表排序和文案，不写回任何数据。营地给历史局的 roleJobName 偶尔会被
+ * 后一次抓取改写成「抓取那一刻的段位」（2026-10-25 实测 1807995411 在 26 分钟里
+ * 从钻石V 2星变成星耀V 2星），那种记录算出来的单段星差是假的，
+ * 调用方要拿「排位场次 + 5」做上限校验，见 reportStore.pickProgress。
+ *
+ * @param {string} jobName 段位名，如「至尊星耀III」「最强王者」
+ * @param {number} stars 段内星数（王者段本身就是累计星数）
+ * @returns {number|null} 累计星数；段位认不出或缺少小段时返回 null
+ */
+export function rankStarTotal(jobName, stars) {
+  const band = rankBand(jobName);
+  if (!band) return null;
+  const star = toInt(stars);
+  if (band === 7) return RANK_BASE[7] + star;
+  const m = String(jobName || '').trim().match(/(IV|V|III|II|I)$/);
+  if (!m) return null;
+  // 各段的小段数不同（青铜/白银从 III 起、钻石/星耀从 V 起），先对齐到「离本段底几格」
+  const segIdx = SEG_ORDER.indexOf(m[1]) - (5 - SEG_COUNT[band]);
+  if (segIdx < 0) return null;
+  return RANK_BASE[band] + segIdx * SEG_FULL[band] + star;
+}
+
+/** 段位名里的小段标签（「至尊星耀III」→「III」，「最强王者」→ 空串） */
+export function rankSegLabel(jobName) {
+  return String(jobName || '').trim().match(/(IV|V|III|II|I)$/)?.[1] || '';
 }
 
 /** 排位赛才改变段位。巅峰赛改的是巅峰分，娱乐模式什么都不改 */
-export function isRankedBattle (item) {
-  return String(item?.mapName || '').includes('排位')
+export function isRankedBattle(item) {
+  return String(item?.mapName || '').includes('排位');
 }
 
 /**
@@ -120,17 +204,9 @@ export function isRankedBattle (item) {
  * @param {number} fromSec 区间起点（秒）
  * @returns {Array<object>} 正序
  */
-export function pickRankBattles (battles = [], fromSec = 0) {
-  const from = toInt(fromSec)
-  return (Array.isArray(battles) ? battles : [])
-    .filter(item => (
-      isRankedBattle(item) &&
-      toInt(item?.dtEventTime) >= from &&
-      String(item?.roleJobName || '').trim() &&
-      toInt(item?.roleJob) > 0
-    ))
-    .slice()
-    .sort((a, b) => toInt(a.dtEventTime) - toInt(b.dtEventTime))
+export function pickRankBattles(battles = [], fromSec = 0) {
+  const from = toInt(fromSec);
+  return (Array.isArray(battles) ? battles : []).filter(item => isRankedBattle(item) && toInt(item?.dtEventTime) >= from && String(item?.roleJobName || '').trim() && toInt(item?.roleJob) > 0).slice().sort((a, b) => toInt(a.dtEventTime) - toInt(b.dtEventTime));
 }
 
 /**
@@ -142,52 +218,56 @@ export function pickRankBattles (battles = [], fromSec = 0) {
  *
  * @returns {{list: Array<object>, relaxed: boolean}} relaxed=true 表示突破了天数窗口
  */
-export function pickRankWindow (battles = [], fromSec = 0, target = RANK_TREND_TARGET_POINTS) {
-  const inRange = pickRankBattles(battles, fromSec)
-  if (inRange.length >= target) return { list: inRange, relaxed: false }
-
-  const all = pickRankBattles(battles, 0)
-  if (all.length <= inRange.length) return { list: inRange, relaxed: false }
-  return { list: all.slice(-target), relaxed: true }
+export function pickRankWindow(battles = [], fromSec = 0, target = RANK_TREND_TARGET_POINTS) {
+  const inRange = pickRankBattles(battles, fromSec);
+  if (inRange.length >= target) return {
+    list: inRange,
+    relaxed: false
+  };
+  const all = pickRankBattles(battles, 0);
+  if (all.length <= inRange.length) return {
+    list: inRange,
+    relaxed: false
+  };
+  return {
+    list: all.slice(-target),
+    relaxed: true
+  };
 }
 
 /** 等距抽稀，首尾必留 */
-function thin (list, max = MAX_POINTS) {
-  if (list.length <= max) return list
-  const step = (list.length - 1) / (max - 1)
-  const out = []
-  for (let i = 0; i < max; i++) out.push(list[Math.round(i * step)])
-  return out
+function thin(list, max = MAX_POINTS) {
+  if (list.length <= max) return list;
+  const step = (list.length - 1) / (max - 1);
+  const out = [];
+  for (let i = 0; i < max; i++) out.push(list[Math.round(i * step)]);
+  return out;
 }
-
 const dayKey = sec => {
-  const d = new Date(sec * 1000)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-
+  const d = new Date(sec * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
 const mdText = sec => {
-  const d = new Date(sec * 1000)
-  return `${d.getMonth() + 1}-${d.getDate()}`
-}
-
+  const d = new Date(sec * 1000);
+  return `${d.getMonth() + 1}-${d.getDate()}`;
+};
 const hmText = sec => {
-  const d = new Date(sec * 1000)
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
-
-const signed = n => (n > 0 ? `+${n}` : String(n))
+  const d = new Date(sec * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+const signed = n => n > 0 ? `+${n}` : String(n);
 
 /** 「至尊星耀III 4星」这种完整标签 */
-export function rankLabel (point) {
-  if (!point?.jobName) return '未知段位'
-  return `${point.jobName} ${point.stars}星`
+export function rankLabel(point) {
+  if (!point?.jobName) return '未知段位';
+  return `${point.jobName} ${point.stars}星`;
 }
 
 /** 「星耀III 4★」这种短标签，图上的 y 轴刻度用，太长会顶出去 */
-function shortLabel (point) {
-  if (!point?.jobName) return '未知'
-  const tail = point.jobName.match(/(I{1,3}|IV|V)$/)?.[1] || ''
-  return `${rankBandShort(point.jobName)}${tail} ${point.stars}★`
+function shortLabel(point) {
+  if (!point?.jobName) return '未知';
+  const tail = point.jobName.match(/(I{1,3}|IV|V)$/)?.[1] || '';
+  return `${rankBandShort(point.jobName)}${tail} ${point.stars}★`;
 }
 
 /**
@@ -200,12 +280,11 @@ function shortLabel (point) {
  * 注意 value **不能直接当画图的 y 值**：跨大段差 1e7，一张图里混了两个大段就被压成两条
  * 贴边直线。画图另用离散刻度（见 buildRankTrendView 里的 levels）。
  */
-export function rankPoint (item) {
-  const jobName = String(item?.roleJobName || '').trim()
-  const jobNum = toInt(item?.roleJob)
-  const stars = toInt(item?.stars)
-  const band = rankBand(jobName)
-
+export function rankPoint(item) {
+  const jobName = String(item?.roleJobName || '').trim();
+  const jobNum = toInt(item?.roleJob);
+  const stars = toInt(item?.stars);
+  const band = rankBand(jobName);
   return {
     jobName,
     jobNum,
@@ -217,7 +296,7 @@ export function rankPoint (item) {
     win: toInt(item?.gameresult) === 1,
     heroId: String(item?.heroId || ''),
     mode: String(item?.mapName || '').trim()
-  }
+  };
 }
 
 /**
@@ -225,9 +304,29 @@ export function rankPoint (item) {
  *
  * - 大段跨 2 级以上：一晚上从钻石打到王者不可能，是切角色或赛季重置
  * - 同一大段内编号跳 JUMP_TOLERANCE 以上：实测 1630945798 的 12 ↔ 20（文件头第 4 点）
+ * - **大段降 1 级 + 编号反而大涨**：赛季重置（2026-10-06 补，原来漏了这一类）
  *
  * 「星耀 → 王者」是 band 6→7、差 1，不断开——那正是最该连起来报喜的一段。
  * 编号只在两边都有值时才比：一边取不到编号（0）时硬减会把 0 ↔ 20 当成跳 20 段。
+ *
+ * ## ⚠️⚠️ 为什么必须单独处理 `bandGap === 1`（2026-10-06 修，原来这条是漏的）
+ *
+ * 旧写法是 `if (bandGap !== 0) return false` —— 只要大段差 1 就**直接放行，编号压根不看**。
+ * 而**赛季重置的真实形态恰好就是大段差 1**：S45 于 2026-09-23 开赛，
+ * 上个赛季的荣耀王者会掉回至尊星耀。实测真实归档（22 个账号、874 对排位相邻点）：
+ *
+ *   荣耀王者(b7/j16) → 至尊星耀V(b6/j22)   大段降 1、编号涨 6
+ *   荣耀王者(b7/j16) → 至尊星耀IV(b6/j23)  大段降 1、编号涨 7
+ *   荣耀王者(b7/j16) → 至尊星耀III(b6/j24) 大段降 1、编号涨 8
+ *
+ * 一共 **6 处** `bandGap === 1`，旧判据 **0 处断开**。后果是用户在图上看到
+ * **「王者 → 星耀」红色 down** —— 一个荣耀王者被告知「你掉到星耀了」，而这其实是赛季重置；
+ * 逐日战况那一行同样标红，`segNote`（作者专门为这个场景写的「赛季重置」提示）还是空的，
+ * `countSteps` 的降段计数也会多算一次。
+ *
+ * 判据用「方向相反」：大段在**降**、编号却在**涨**，这只能是重置（真降段编号会跟着降）。
+ * 反向的「大段升 + 编号降」（如 星耀25 → 王者16）**不**断，仍然连起来报喜 ——
+ * 王者段编号恒 16，比星耀的 22~25 小，那是最该连起来的一段（见上面那句）。
  *
  * 折线在这里断开，单场推送的段位文案也在这里放弃比较
  * （pushStore.formatScoreChange）——同一个判据只该有一份。
@@ -235,13 +334,18 @@ export function rankPoint (item) {
  * @param {{band:number, jobNum:number}} prev 更早的一点
  * @param {{band:number, jobNum:number}} next 更晚的一点
  */
-export function isRankJump (prev, next) {
-  if (!prev || !next) return false
-  const bandGap = Math.abs(next.band - prev.band)
-  if (bandGap >= 2) return true
-  if (bandGap !== 0) return false
-  if (!prev.jobNum || !next.jobNum) return false
-  return Math.abs(next.jobNum - prev.jobNum) >= JUMP_TOLERANCE
+export function isRankJump(prev, next) {
+  if (!prev || !next) return false;
+  const bandGap = Math.abs(next.band - prev.band);
+  if (bandGap >= 2) return true;
+  if (bandGap === 0) {
+    if (!prev.jobNum || !next.jobNum) return false;
+    return Math.abs(next.jobNum - prev.jobNum) >= JUMP_TOLERANCE;
+  }
+
+  // bandGap === 1：大段降 1 级 + 编号反而大涨 = 赛季重置
+  if (!prev.jobNum || !next.jobNum) return false;
+  return next.band < prev.band && next.jobNum > prev.jobNum && next.jobNum - prev.jobNum >= JUMP_TOLERANCE;
 }
 
 /**
@@ -251,24 +355,33 @@ export function isRankJump (prev, next) {
  * 2. 同一大段内换了小段 → 说段数差（「+2 段」），星数在升段时会重置，相减没有意义
  * 3. 跨了大段 → 说大段名（「星耀 → 王者」），这是最该报喜的一句，别把它压成数字
  */
-function describeDelta (first, last) {
-  if (!first || !last) return { text: '—', cls: 'flat' }
-
+function describeDelta(first, last) {
+  if (!first || !last) return {
+    text: '—',
+    cls: 'flat'
+  };
   if (last.band !== first.band) {
     return {
       text: `${rankBandShort(first.jobName)} → ${rankBandShort(last.jobName)}`,
       cls: last.band > first.band ? 'up' : 'down'
-    }
+    };
   }
-
   if (last.jobNum !== first.jobNum) {
-    const diff = last.jobNum - first.jobNum
-    return { text: `${signed(diff)} 段`, cls: diff > 0 ? 'up' : 'down' }
+    const diff = last.jobNum - first.jobNum;
+    return {
+      text: `${signed(diff)} 段`,
+      cls: diff > 0 ? 'up' : 'down'
+    };
   }
-
-  const diff = last.stars - first.stars
-  if (!diff) return { text: '持平', cls: 'flat' }
-  return { text: `${signed(diff)} 星`, cls: diff > 0 ? 'up' : 'down' }
+  const diff = last.stars - first.stars;
+  if (!diff) return {
+    text: '持平',
+    cls: 'flat'
+  };
+  return {
+    text: `${signed(diff)} 星`,
+    cls: diff > 0 ? 'up' : 'down'
+  };
 }
 
 /**
@@ -277,49 +390,50 @@ function describeDelta (first, last) {
  * 王者段必须看涨星掉星：王者段的 band 恒 7、roleJob 编号恒 16（文件头第 2 点），
  * 段位全靠累积星数体现，只统计升降段的话王者玩家看到的永远是 0 / 0。
  */
-function countSteps (points) {
-  let up = 0
-  let down = 0
-  let starUp = 0
-  let starDown = 0
-
+function countSteps(points) {
+  let up = 0;
+  let down = 0;
+  let starUp = 0;
+  let starDown = 0;
   for (let i = 1; i < points.length; i++) {
-    const prev = points[i - 1]
-    const cur = points[i]
+    const prev = points[i - 1];
+    const cur = points[i];
     // 跳变处不算：那是切角色或赛季重置，不是打上去的
-    if (isRankJump(prev, cur)) continue
-
-    if (cur.value > prev.value) starUp++
-    else if (cur.value < prev.value) starDown++
-
+    if (isRankJump(prev, cur)) continue;
+    if (cur.value > prev.value) starUp++;else if (cur.value < prev.value) starDown++;
     if (cur.band !== prev.band) {
-      cur.band > prev.band ? up++ : down++
+      cur.band > prev.band ? up++ : down++;
     } else if (cur.jobNum !== prev.jobNum) {
-      cur.jobNum > prev.jobNum ? up++ : down++
+      cur.jobNum > prev.jobNum ? up++ : down++;
     }
   }
-
-  return { up, down, starUp, starDown }
+  return {
+    up,
+    down,
+    starUp,
+    starDown
+  };
 }
 
 /**
  * 最长连胜 / 连败。只传排位局进来——娱乐局的胜负和段位无关，混进来这个数字就没意义了。
  * 逃跑（gameresult 既不是 1 也不是 2）算断。
  */
-function streaks (points) {
-  let win = 0
-  let lose = 0
-  let curWin = 0
-  let curLose = 0
-
+function streaks(points) {
+  let win = 0;
+  let lose = 0;
+  let curWin = 0;
+  let curLose = 0;
   for (const p of points) {
-    curWin = p.result === 1 ? curWin + 1 : 0
-    curLose = p.result === 2 ? curLose + 1 : 0
-    if (curWin > win) win = curWin
-    if (curLose > lose) lose = curLose
+    curWin = p.result === 1 ? curWin + 1 : 0;
+    curLose = p.result === 2 ? curLose + 1 : 0;
+    if (curWin > win) win = curWin;
+    if (curLose > lose) lose = curLose;
   }
-
-  return { win, lose }
+  return {
+    win,
+    lose
+  };
 }
 
 /**
@@ -343,54 +457,51 @@ function streaks (points) {
  * @param {number} [ctx.recent] 「最近战况」列几场
  * @returns {object|null} 少于 2 场时返回 null（一个点画不出趋势）
  */
-export function buildRankTrendView (picked = [], {
+export function buildRankTrendView(picked = [], {
   heroMap = {},
   iconOf = () => '',
   days = RANK_TREND_DEFAULT_DAYS,
   relaxed = false,
   recent = 10
 } = {}) {
-  if (picked.length < 2) return null
-
+  if (picked.length < 2) return null;
   const all = picked.map(item => ({
     ...rankPoint(item),
     result: toInt(item.gameresult),
     kda: `${toInt(item.killcnt)}/${toInt(item.deadcnt)}/${toInt(item.assistcnt)}`
-  }))
+  }));
   // 进来的已经全是排位局（pickRankBattles 过滤过），留一道过滤是为了让「只有排位改变段位」
   // 这个前提在数据层写明：万一以后有人把别的模式喂进来，升降段统计不会跟着错
-  const rankedOnly = all.filter(p => p.ranked)
+  const rankedOnly = all.filter(p => p.ranked);
 
   /**
    * 先给每一场标上「属于第几段折线」，跳变处开新段（文件头第 4 点）。
    * 抽稀之后再算段号是不行的：抽稀可能正好把跳变的那两场之一丢掉，跳变就凭空消失了。
    */
-  let segIdx = 0
+  let segIdx = 0;
   all.forEach((p, i) => {
-    if (i > 0 && isRankJump(all[i - 1], p)) segIdx += 1
-    p.seg = segIdx
-  })
-  const segCount = segIdx + 1
+    if (i > 0 && isRankJump(all[i - 1], p)) segIdx += 1;
+    p.seg = segIdx;
+  });
+  const segCount = segIdx + 1;
   /**
    * 段位高低类的统计（区间变化 / 最高 / 最低）只看最后一段。
    * 跨角色比高低会得出荒谬结论——实测 1630945798 的编号 12 与 20 交替，
    * 直接拿首尾比会报「+8 段」，拿全区间取极值会出现「最高 2 星、最低 3 星」。
    * 场次、胜率、逐日这些「这个营地号打了多少」的统计仍然按全区间算。
    */
-  const tail = all.filter(p => p.seg === segIdx)
-
-  const first = all[0]
-  const last = all[all.length - 1]
-  const highest = tail.reduce((a, b) => (b.value > a.value ? b : a), tail[0])
-  const lowest = tail.reduce((a, b) => (b.value < a.value ? b : a), tail[0])
-  const delta = describeDelta(tail[0], last)
-  const steps = countSteps(rankedOnly)
+  const tail = all.filter(p => p.seg === segIdx);
+  const first = all[0];
+  const last = all[all.length - 1];
+  const highest = tail.reduce((a, b) => b.value > a.value ? b : a, tail[0]);
+  const lowest = tail.reduce((a, b) => b.value < a.value ? b : a, tail[0]);
+  const delta = describeDelta(tail[0], last);
+  const steps = countSteps(rankedOnly);
 
   // 折线点。抽稀后再建刻度表，刻度就只覆盖真的画出来的档位，不留空排
-  const shown = thin(all)
-  const levelValues = [...new Set(shown.map(p => p.value))].sort((a, b) => a - b)
-  const levelOf = value => levelValues.indexOf(value)
-
+  const shown = thin(all);
+  const levelValues = [...new Set(shown.map(p => p.value))].sort((a, b) => a - b);
+  const levelOf = value => levelValues.indexOf(value);
   const trend = shown.map(p => ({
     level: levelOf(p.value),
     time: p.time,
@@ -398,32 +509,32 @@ export function buildRankTrendView (picked = [], {
     full: rankLabel(p),
     ranked: p.ranked,
     seg: p.seg
-  }))
+  }));
 
   // y 轴刻度：档位可能有十几档，全标会糊成一片，等距挑最多 5 档（首尾必留）
-  const levels = thin(
-    levelValues.map((value, index) => ({
-      level: index,
-      label: shortLabel(shown.find(p => p.value === value))
-    })),
-    5
-  )
+  const levels = thin(levelValues.map((value, index) => ({
+    level: index,
+    label: shortLabel(shown.find(p => p.value === value))
+  })), 5);
 
   // 逐日战况：一天一行。段位取当天最后一场的快照，变化和前一天的收盘比
-  const byDay = new Map()
+  const byDay = new Map();
   for (const p of all) {
-    const key = dayKey(p.time)
-    if (!byDay.has(key)) byDay.set(key, [])
-    byDay.get(key).push(p)
+    const key = dayKey(p.time);
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(p);
   }
-  const dayList = [...byDay.entries()]
+  const dayList = [...byDay.entries()];
   const dayRows = dayList.map(([key, list], index) => {
-    const dayEnd = list[list.length - 1]
+    const dayEnd = list[list.length - 1];
     // 前一天的收盘快照。第一天没有前一天可比，就用当天第一场的快照当起点
-    const base = index > 0 ? dayList[index - 1][1].slice(-1)[0] : list[0]
+    const base = index > 0 ? dayList[index - 1][1].slice(-1)[0] : list[0];
     // 跨了角色切换就别给数字了，「钻石 +8 段」这种结论比不给更糟
-    const diff = isRankJump(base, dayEnd) ? { text: '—', cls: 'flat' } : describeDelta(base, dayEnd)
-    const ranked = list.filter(p => p.ranked)
+    const diff = isRankJump(base, dayEnd) ? {
+      text: '—',
+      cls: 'flat'
+    } : describeDelta(base, dayEnd);
+    const ranked = list.filter(p => p.ranked);
     return {
       date: key.slice(5).replace('-', '/'),
       count: list.length,
@@ -433,21 +544,24 @@ export function buildRankTrendView (picked = [], {
       label: shortLabel(dayEnd),
       deltaText: diff.text,
       deltaClass: diff.cls
-    }
-  }).reverse()
+    };
+  }).reverse();
 
   // 最近几场：倒序列出，变化是这一场自己造成的（和上一场的快照比）。
   // 段位快照是「打这局时的段位」而不是这局的结果（文件头第 1 点），所以严格说
   // 这里的差值是「上一场之后到这一场之前」的变化，对连续对局来说就是上一场的战果
   const recentRows = all.slice(-recent).map((p, i, arr) => {
-    const idx = all.length - arr.length + i
-    const prev = idx > 0 ? all[idx - 1] : null
-    const diff = prev && !isRankJump(prev, p) ? describeDelta(prev, p) : { text: '—', cls: 'flat' }
+    const idx = all.length - arr.length + i;
+    const prev = idx > 0 ? all[idx - 1] : null;
+    const diff = prev && !isRankJump(prev, p) ? describeDelta(prev, p) : {
+      text: '—',
+      cls: 'flat'
+    };
     return {
       heroName: heroMap[p.heroId] || `英雄${p.heroId}`,
       heroIcon: iconOf(p.heroId),
-      resultText: p.result === 1 ? '胜' : (p.result === 2 ? '负' : '—'),
-      resultClass: p.result === 1 ? 'win' : (p.result === 2 ? 'lose' : 'flat'),
+      resultText: p.result === 1 ? '胜' : p.result === 2 ? '负' : '—',
+      resultClass: p.result === 1 ? 'win' : p.result === 2 ? 'lose' : 'flat',
       kda: p.kda,
       mode: p.mode || '对局',
       ranked: p.ranked,
@@ -455,33 +569,34 @@ export function buildRankTrendView (picked = [], {
       deltaText: diff.text,
       deltaClass: diff.cls,
       timeText: `${mdText(p.time)} ${hmText(p.time)}`
-    }
-  }).reverse()
+    };
+  }).reverse();
 
   // 模式分布：只取排位局之后这里剩的是「排位赛 单排 / 双排 / 五排」这类开黑形态，
   // 能看出是单排硬打上去的还是被人带的
-  const byMode = new Map()
+  const byMode = new Map();
   for (const p of all) {
-    const key = p.mode || '其它'
-    if (!byMode.has(key)) byMode.set(key, { mode: key, count: 0, win: 0, ranked: p.ranked })
-    const row = byMode.get(key)
-    row.count += 1
-    if (p.result === 1) row.win += 1
+    const key = p.mode || '其它';
+    if (!byMode.has(key)) byMode.set(key, {
+      mode: key,
+      count: 0,
+      win: 0,
+      ranked: p.ranked
+    });
+    const row = byMode.get(key);
+    row.count += 1;
+    if (p.result === 1) row.win += 1;
   }
-  const modeRows = [...byMode.values()]
-    .sort((a, b) => b.count - a.count)
-    .map(row => ({
-      ...row,
-      winRate: row.count ? Math.round((row.win / row.count) * 100) : 0
-    }))
-
-  const rWin = rankedOnly.filter(p => p.result === 1).length
-  const rLose = rankedOnly.filter(p => p.result === 2).length
-  const played = rWin + rLose
-  const winRate = played ? Math.round((rWin / played) * 1000) / 10 : 0
-  const streak = streaks(rankedOnly)
-  const spanDays = Math.max(1, Math.round((last.time - first.time) / 86400 * 10) / 10)
-
+  const modeRows = [...byMode.values()].sort((a, b) => b.count - a.count).map(row => ({
+    ...row,
+    winRate: row.count ? Math.round(row.win / row.count * 100) : 0
+  }));
+  const rWin = rankedOnly.filter(p => p.result === 1).length;
+  const rLose = rankedOnly.filter(p => p.result === 2).length;
+  const played = rWin + rLose;
+  const winRate = played ? Math.round(rWin / played * 1000) / 10 : 0;
+  const streak = streaks(rankedOnly);
+  const spanDays = Math.max(1, Math.round((last.time - first.time) / 86400 * 10) / 10);
   return {
     count: all.length,
     rankedCount: rankedOnly.length,
@@ -519,11 +634,9 @@ export function buildRankTrendView (picked = [], {
     // 断点如实交代：这多半是同一个营地账号下切了游戏角色（文件头第 4 点），
     // 不说清楚用户会以为图画错了
     segCount,
-    segNote: segCount > 1
-      ? `检测到 ${segCount - 1} 处段位跳变，已断成 ${segCount} 段（多为切换游戏角色或赛季重置）；区间变化与最高最低只统计最后一段`
-      : '',
+    segNote: segCount > 1 ? `检测到 ${segCount - 1} 处段位跳变，已断成 ${segCount} 段（多为切换游戏角色或赛季重置）；区间变化与最高最低只统计最后一段` : '',
     dayRows,
     recentRows,
     modeRows
-  }
+  };
 }

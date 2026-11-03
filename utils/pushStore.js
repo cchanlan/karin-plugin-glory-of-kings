@@ -1,3 +1,4 @@
+import { logger } from "node-karin";
 /**
  * 战绩推送 / 开局提醒的数据层。
  *
@@ -17,42 +18,48 @@
  * 3. stars 的语义随段位体系变化：旧体系「最强王者」按 roleJob 小编号每 5 星一段
  *    （段内星 0~5 循环，2026-07 底赛季切换前的数据实测 roleJob=23~26）；新体系
  *    「荣耀王者」恒为 roleJob=16、stars 直接是累计星数。所以判升降优先比 roleJob
- *    编号，编号没变时星数差才是真实变动；段位名变了就只报段位变化，不算差。
+ *    编号，编号没变时星数差才是真实变动。
+ * 4. **roleJobName 对历史对局返回的是「查询那一刻玩家的当前段位」，不是该局结束时的段位**
+ *    （2026-10-15 查实，详见 resolvePrevRankName 的注释）。同一批请求里所有历史局名字
+ *    完全相同，于是 `jobFrom` 恒等于 `jobTo`，代码里「段位 A → B」那条分支实际永远走不到，
+ *    起点段位名只能靠 roleJob 编号反推。
  *
  * 纯计算逻辑（连胜、筛新场次、文案）都放在这个文件里而不是 apps/ 下，
  * 因为 apps/*.js 的 `extends plugin` 依赖 Yunzai 注入的全局，脱离 Bot 环境 import 就崩，没法单测。
  */
-import fs from 'node:fs'
-import path from 'path'
-import { readYamlFile, writeYamlFile } from './yamlUtils.js'
-import { quarantineCorrupt } from './safeStore.js'
-import ApiService from './api.js'
-import cache from './cache.js'
-import { archiveBattles } from './battleArchive.js'
+import fs from 'node:fs';
+import path from 'path';
+import { readYamlFile, writeYamlFile } from './yamlUtils.js';
+import { quarantineCorrupt } from './safeStore.js';
+import ApiService from './api.js';
+import cache from './cache.js';
+// 批内待落盘队列必须跨热重载共享，否则热重载会吞掉旧实例攒下的 patch（见 utils/hotState.js）
+import { hotBox } from './hotState.js';
+import { archiveBattles } from './battleArchive.js';
 // 营地昵称里常有私有区图标和不可见字符，直接拼进文案会显示成豆腐块或整段空白，
 // 清洗规则和排行榜是同一套，复用 rankStore 的实现。
 // 再导出一次：apps/gameRecordPush.js 拼战绩文案时也要洗名字，
 // 让它只依赖 pushStore 这一个数据层，不用再单独引 rankStore
-import { normalizeName } from './rankStore.js'
-export { normalizeName }
+import { normalizeName } from './rankStore.js';
+export { normalizeName };
 // ⚠️ 必须 **import 一次再 export** —— 只写 `export { x } from './y.js'` 是**转出**，
 //    本文件作用域里没有 `x` 这个绑定，同文件里调用它就是 `ReferenceError: x is not defined`
 //    （2026-09-20 踩过：decideHint 里调 isWatchableMode 直接炸，见文件里那处注释）
-import { isWatchableMode } from './watchMode.js'
+import { isWatchableMode } from './watchMode.js';
 // 段位高低的判据（大段位层级）与「跳变」的判据都在段位趋势那边，同一套口径只留一份实现
-import { rankBand, isRankJump } from './rankTrend.js'
-import { PluginData } from '#components'
-
-const PUSH_FILE = path.join(PluginData, 'GameRecordPush.yaml')
+import { rankBand, isRankJump } from './rankTrend.js';
+// ⚠️ 依赖方向：groupIndex 只 import yamlUtils / #components，**不回头 import 本文件**，
+//    所以这里反向引用它不会成环。退群判据必须用实时的 gml（见 detectLeftGroups 的注释）
+import { detectLeftGroups } from './groupIndex.js';
+import { PluginData } from '#components';
+const PUSH_FILE = path.join(PluginData, 'GameRecordPush.yaml');
 
 /**
  * 深拷贝。优先 `structuredClone`（Node 17+ 全局），拿不到时退回 JSON 往返 ——
  * 订阅项里只有字符串/数字/布尔，JSON 往返语义完全够。能力探测是必要的：
  * 插件会被装在各种 Node 版本上跑，这里不该成为启动即崩的那一行。
  */
-const deepCopy = typeof structuredClone === 'function'
-  ? structuredClone
-  : (value) => JSON.parse(JSON.stringify(value))
+const deepCopy = typeof structuredClone === 'function' ? structuredClone : value => JSON.parse(JSON.stringify(value));
 
 /**
  * 订阅表的解析结果缓存：`{ mtimeNs, size, data }`。data 是整张表（qq -> 订阅项）。
@@ -73,7 +80,7 @@ const deepCopy = typeof structuredClone === 'function'
  * 对外的 `loadPushList()` 一律返回拷贝 —— 调用方拿到的表可以随便改，
  * 而写盘失败时也不会留下「内存有、盘上没有」的脏缓存。
  */
-let listCache = null
+let listCache = null;
 
 /**
  * 取文件的指纹。文件不存在或 stat 失败时返回 null。
@@ -86,36 +93,44 @@ let listCache = null
  *    所以它不是绝对保证。真正的保证来自写入方：`savePushList` 写完会主动把缓存
  *    对齐过去，不依赖指纹；指纹只用来接住「用户手改了文件」这类外部改动。
  */
-function fingerprint () {
+function fingerprint() {
   try {
-    const stat = fs.statSync(PUSH_FILE, { bigint: true })
-    return { mtimeNs: stat.mtimeNs, size: stat.size }
+    const stat = fs.statSync(PUSH_FILE, {
+      bigint: true
+    });
+    return {
+      mtimeNs: stat.mtimeNs,
+      size: stat.size
+    };
   } catch {
-    return null
+    return null;
   }
 }
 
 /** 拿缓存里的整张订阅表（**不拷贝**）。调用方不得修改返回值 */
-function currentList () {
-  const fp = fingerprint()
+function currentList() {
+  const fp = fingerprint();
   if (!fp) {
-    listCache = null
-    return {}
+    listCache = null;
+    return {};
   }
-  if (listCache && listCache.mtimeNs === fp.mtimeNs && listCache.size === fp.size) return listCache.data
-
+  if (listCache && listCache.mtimeNs === fp.mtimeNs && listCache.size === fp.size) return listCache.data;
   try {
-    const data = readYamlFile(PUSH_FILE)
-    const list = data?.pushList
-    const value = list && typeof list === 'object' ? list : {}
-    listCache = { mtimeNs: fp.mtimeNs, size: fp.size, data: value }
-    return value
+    const data = readYamlFile(PUSH_FILE);
+    const list = data?.pushList;
+    const value = list && typeof list === 'object' ? list : {};
+    listCache = {
+      mtimeNs: fp.mtimeNs,
+      size: fp.size,
+      data: value
+    };
+    return value;
   } catch (error) {
     // 解析失败要把坏文件隔离出去（留证 + 打日志），理由见 utils/safeStore.js。
     // 隔离后文件不在了，下次读会走上面 !fp 那条路返回空表
-    quarantineCorrupt(PUSH_FILE, error, '[王者推送]')
-    listCache = null
-    return {}
+    quarantineCorrupt(PUSH_FILE, error, '[王者推送]');
+    listCache = null;
+    return {};
   }
 }
 
@@ -132,28 +147,47 @@ function currentList () {
  *
  * @returns {Record<string, object>} qq -> 订阅项
  */
-export function loadPushList () {
-  return deepCopy(currentList())
+export function loadPushList() {
+  return deepCopy(currentList());
 }
 
 /** 整表写回。只在指令场景用（开启/关闭订阅），轮询里一律走 mergeSubState / mergeSubStates */
-export function savePushList (pushList) {
-  const data = { pushList: pushList || {} }
-  writeYamlFile(PUSH_FILE, data)
+export function savePushList(pushList) {
+  const data = {
+    pushList: pushList || {}
+  };
+  writeYamlFile(PUSH_FILE, data);
 
   // 写盘之后把缓存对齐到刚写下去的内容。存的是拷贝：调用方常常是
   // `savePushList(list)` 之后就 return，但也可能顺手再改 list，存引用会让缓存跟着变。
   // ⚠️ 顺序不能反 —— 必须先写盘成功再更新缓存，写盘抛错时缓存保持旧值，
   //    下次读会因指纹对不上而重新读盘，不会出现「内存新、盘上旧」的假象
-  const fp = fingerprint()
-  listCache = fp ? { mtimeNs: fp.mtimeNs, size: fp.size, data: deepCopy(data.pushList) } : null
+  const fp = fingerprint();
+  listCache = fp ? {
+    mtimeNs: fp.mtimeNs,
+    size: fp.size,
+    data: deepCopy(data.pushList)
+  } : null;
 }
 
 /**
  * 批内待落盘的 patch。null = 当前不在批里。
  * 见 beginSubBatch / endSubBatch。
+ *
+ * ⚠️ 跨热重载共享（`hotBox`，2026-10-06 修）。这是本轮唯一一处**真数据丢失**的模块级状态：
+ *    `checkOne` 的结构是 `beginSubBatch()` → `await checkOneInner(...)` → `finally endSubBatch()`。
+ *    热重载若正好落在那段 `await` 中间，模块重新求值 → `pendingPatches` 变成新的 `null`；
+ *    等旧实例的 `finally` 跑到 `endSubBatch()` 时，它操作的是**新实例的** `pendingPatches`（null），
+ *    于是 `return 0` —— **旧实例攒下的那一批 patch 直接丢掉**：
+ *    战绩游标、上下线基准、退避计数、开播提示全没写盘。
+ *    退避计数丢了后果最重（注释里写过：漏了就永远停在原地，等于把自适应节流整个关掉，
+ *    每个离线号每轮都真查一次，正是 -30107 的来源）。
+ *
+ * 对照：同文件的 `listCache` 是**纯缓存**，热重载丢它只是重新读一次盘，无害，故不锚。
  */
-let pendingPatches = null
+const S = hotBox('pushStore.pendingPatches', {
+  pendingPatches: null
+});
 
 /**
  * 开始一个「订阅写批」。
@@ -168,21 +202,21 @@ let pendingPatches = null
  *
  * @returns {boolean} 是否成功开批（false = 已经在批里）
  */
-export function beginSubBatch () {
-  if (pendingPatches) return false
-  pendingPatches = []
-  return true
+export function beginSubBatch() {
+  if (S.pendingPatches) return false;
+  S.pendingPatches = [];
+  return true;
 }
 
 /**
  * 结束批并把攒下的 patch 一次落盘。
  * @returns {number} 实际写入的条数（订阅已被删掉的会跳过，不计入）
  */
-export function endSubBatch () {
-  const patches = pendingPatches
-  pendingPatches = null
-  if (!patches?.length) return 0
-  return mergeSubStates(patches)
+export function endSubBatch() {
+  const patches = S.pendingPatches;
+  S.pendingPatches = null;
+  if (!patches?.length) return 0;
+  return mergeSubStates(patches);
 }
 
 /**
@@ -197,20 +231,21 @@ export function endSubBatch () {
  * @param {object} patch 要合并进去的字段
  * @returns {boolean} 是否写入成功（在批里时恒为 true，见 beginSubBatch 的警告）
  */
-export function mergeSubState (qq, patch) {
-  const key = String(qq)
+export function mergeSubState(qq, patch) {
+  const key = String(qq);
   // 在批里：只攒不写，批结束时统一落盘
-  if (pendingPatches) {
-    pendingPatches.push([key, patch])
-    return true
+  if (S.pendingPatches) {
+    S.pendingPatches.push([key, patch]);
+    return true;
   }
-
-  const list = deepCopy(currentList())
-  if (!list[key]) return false
-
-  list[key] = { ...list[key], ...patch }
-  savePushList(list)
-  return true
+  const list = deepCopy(currentList());
+  if (!list[key]) return false;
+  list[key] = {
+    ...list[key],
+    ...patch
+  };
+  savePushList(list);
+  return true;
 }
 
 /**
@@ -226,41 +261,51 @@ export function mergeSubState (qq, patch) {
  * @param {Array<[string|number, object]>} patches 要合并的 (qq, patch) 列表
  * @returns {number} 实际写入的条数
  */
-export function mergeSubStates (patches) {
-  if (!patches?.length) return 0
-
-  const list = deepCopy(currentList())
-  let count = 0
+export function mergeSubStates(patches) {
+  if (!patches?.length) return 0;
+  const list = deepCopy(currentList());
+  let count = 0;
   for (const [qq, patch] of patches) {
-    const key = String(qq)
+    const key = String(qq);
     // 订阅已被删除时不重建，理由同 mergeSubState
-    if (!list[key]) continue
-    list[key] = { ...list[key], ...patch }
-    count += 1
+    if (!list[key]) continue;
+    list[key] = {
+      ...list[key],
+      ...patch
+    };
+    count += 1;
   }
-
-  if (count) savePushList(list)
-  return count
+  if (count) savePushList(list);
+  return count;
 }
 
 /**
  * 每个订阅之间的间隔。rankStore 用 600ms 拉 profile 能稳定跑完 20+ 账号，
  * morebattlelist 返回体比 profile 大一个量级，这里保守一档取 800ms。
  */
-export const REQUEST_INTERVAL = 800
+export const REQUEST_INTERVAL = 800;
 
 /** 对方隐藏了主页，这类账号永远拿不到战绩，不必重试 */
-const CODE_PROFILE_HIDDEN = -10107
+const CODE_PROFILE_HIDDEN = -10107;
+
+/**
+ * `-30032 用户不存在`：这个营地号在营地侧取不到数据。
+ *
+ * ⚠️ 和 -10107 是**同一件事的两个码**（实测同一时刻 profile 端点回 -10107、
+ *    战绩端点回 -30032），别只管一个 —— 原来漏了它，导致这类号永远在「每轮失败」
+ *    却什么都不报（见 fetchLatest 的注释）。
+ */
+const CODE_USER_NOT_EXIST = -30032;
 
 /** fetchLatest 的特殊返回：账号隐藏了战绩 */
-export const FETCH_HIDDEN = Symbol('hidden')
+export const FETCH_HIDDEN = Symbol('hidden');
 
 /** 一次推送最多详细列几场，多出来的只报数量，避免轮询间隔内打了好几局把群刷炸 */
-export const MAX_DETAIL_BATTLES = 3
+export const MAX_DETAIL_BATTLES = 3;
 
 /** 英雄总表的内存缓存键与有效期（秒）。表内容几乎不变，只有新英雄上线才需要更新 */
-const HERO_MAP_CACHE_KEY = 'gok:heroNameMap'
-const HERO_MAP_TTL = 6 * 60 * 60
+const HERO_MAP_CACHE_KEY = 'gok:heroNameMap';
+const HERO_MAP_TTL = 6 * 60 * 60;
 
 /**
  * 离线退避的档位：不活跃多久（毫秒）→ 检查间隔是 cron 的几倍。
@@ -272,27 +317,30 @@ const HERO_MAP_TTL = 6 * 60 * 60
  *
  * 档位从长到短排列，取第一个命中的。
  */
-const IDLE_BACKOFF_STEPS = [
-  { afterMs: 3 * 3600 * 1000, multiplier: null },
-  { afterMs: 1 * 3600 * 1000, multiplier: 3 },
-  { afterMs: 0, multiplier: 2 }
-]
+const IDLE_BACKOFF_STEPS = [{
+  afterMs: 3 * 3600 * 1000,
+  multiplier: null
+}, {
+  afterMs: 1 * 3600 * 1000,
+  multiplier: 3
+}, {
+  afterMs: 0,
+  multiplier: 2
+}];
 
 /** 离线最长退避到几倍 cron 间隔。1 = 关闭自适应，全程按 cron 轮询 */
-export const DEFAULT_IDLE_BACKOFF_MAX = 5
+export const DEFAULT_IDLE_BACKOFF_MAX = 5;
 
 /**
  * 「最近打过」的判定窗口（秒）。只开战绩推送、没有 profile 信号的订阅靠它判活跃：
  * 玩家真在连着打时每 15 分钟左右就有一局进列表，30 分钟没有新场次基本就是收工了。
  */
-const RECENT_BATTLE_WINDOW = 30 * 60
-
-export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-
+const RECENT_BATTLE_WINDOW = 30 * 60;
+export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const toInt = value => {
-  const num = Number(value)
-  return Number.isFinite(num) ? Math.trunc(num) : 0
-}
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : 0;
+};
 
 /* --------------------------------------------------------------- 订阅开关 */
 
@@ -312,21 +360,21 @@ const toInt = value => {
  *    2026-09-26 废除：那份名单现在由群成员索引现算、查看时现刷（apps/whoIsPlaying.js），
  *    不需要任何订阅记录垫底。别把它加回来。
  */
-export const SUB_FLAGS = ['battle', 'online', 'daily', 'weekly', 'monthly']
+export const SUB_FLAGS = ['battle', 'online', 'daily', 'weekly', 'monthly'];
 
 /**
  * 某个开关是否开着。
  * battle 要按「缺字段算开着」处理——首个版本的订阅没写这个字段，
  * 其余几个都是后加的，缺失就是没开。
  */
-export function isFlagOn (sub, key) {
-  if (!sub) return false
-  return key === 'battle' ? sub.battle !== false : sub[key] === true
+export function isFlagOn(sub, key) {
+  if (!sub) return false;
+  return key === 'battle' ? sub.battle !== false : sub[key] === true;
 }
 
 /** 这条订阅还有任何一路推送开着吗 */
-export function hasAnyFlag (sub) {
-  return SUB_FLAGS.some(key => isFlagOn(sub, key))
+export function hasAnyFlag(sub) {
+  return SUB_FLAGS.some(key => isFlagOn(sub, key));
 }
 
 /**
@@ -339,22 +387,26 @@ export function hasAnyFlag (sub) {
  * @param {'battle'|'online'|'daily'|'weekly'|'monthly'} key 要关掉的开关
  * @returns {{wasOn: boolean, removed: boolean}} wasOn 为假时什么都没改
  */
-export function disableSubFlag (qq, key) {
-  const id = String(qq)
-  const list = loadPushList()
-  const sub = list[id]
-  if (!sub) return { wasOn: false, removed: false }
-
-  if (!isFlagOn(sub, key)) return { wasOn: false, removed: false }
-
-  sub[key] = false
-  const removed = !hasAnyFlag(sub)
-
-  if (removed) delete list[id]
-  else list[id] = sub
-
-  savePushList(list)
-  return { wasOn: true, removed }
+export function disableSubFlag(qq, key) {
+  const id = String(qq);
+  const list = loadPushList();
+  const sub = list[id];
+  if (!sub) return {
+    wasOn: false,
+    removed: false
+  };
+  if (!isFlagOn(sub, key)) return {
+    wasOn: false,
+    removed: false
+  };
+  sub[key] = false;
+  const removed = !hasAnyFlag(sub);
+  if (removed) delete list[id];else list[id] = sub;
+  savePushList(list);
+  return {
+    wasOn: true,
+    removed
+  };
 }
 
 /* --------------------------------------------------------------- 推送群 */
@@ -369,17 +421,22 @@ export function disableSubFlag (qq, key) {
  * @param {object} sub 订阅项
  * @returns {string[]} 群号数组，已去重去空
  */
-export function subGroups (sub) {
-  const out = []
+export function subGroups(sub) {
+  const out = [];
   const push = value => {
-    const id = String(value ?? '').trim()
-    if (id && !out.includes(id)) out.push(id)
-  }
-
-  push(sub?.group)
-  if (Array.isArray(sub?.groups)) sub.groups.forEach(push)
-
-  return out
+    // ⚠️ 排除 0 / 非正数：`String(0)` 得 `"0"`，是个**像群号的假值**，
+    //    会让 `if (id)` 成立、往名单里塞一个永远不会存在的群 `"0"`。
+    //    （实测 `subGroups({group:0, groups:[1,2]})` 曾返回 `["0","1","2"]`。）
+    //    后果：send 会对 `"0"` 调 pickGroupSafe 白拿一次群（多一条 warn），
+    //    且 `isJunkSub` 会因为 groups 非空而不判它是空壳订阅。
+    const n = Number(value);
+    if (Number.isFinite(n) && n <= 0) return;
+    const id = String(value ?? '').trim();
+    if (id && !out.includes(id)) out.push(id);
+  };
+  push(sub?.group);
+  if (Array.isArray(sub?.groups)) sub.groups.forEach(push);
+  return out;
 }
 
 /**
@@ -398,10 +455,10 @@ export function subGroups (sub) {
  * ⚠️ 「有推送目标群」的订阅一律不算空壳：用户开着 battle 但还没打过、groups 是空的，
  * 那是他明确要的推送；首个版本的订阅同样没有 `battle` 字段，靠群号把它认出来。
  */
-export function isJunkSub (sub) {
-  if (!sub) return true
-  if (subGroups(sub).length) return false
-  return !SUB_FLAGS.some(key => sub[key] === true)
+export function isJunkSub(sub) {
+  if (!sub) return true;
+  if (subGroups(sub).length) return false;
+  return !SUB_FLAGS.some(key => sub[key] === true);
 }
 
 /**
@@ -409,13 +466,16 @@ export function isJunkSub (sub) {
  * `group` 恒等于列表第一项：只认单值 `group` 的旧代码路径至少还能推到一个群。
  * @returns {{groups:string[], group:string, added:boolean}}
  */
-export function withSubGroup (sub, groupId) {
-  const id = String(groupId ?? '').trim()
-  const groups = subGroups(sub)
-  const added = Boolean(id) && !groups.includes(id)
-  if (added) groups.push(id)
-
-  return { groups, group: groups[0] || '', added }
+export function withSubGroup(sub, groupId) {
+  const id = String(groupId ?? '').trim();
+  const groups = subGroups(sub);
+  const added = Boolean(id) && !groups.includes(id);
+  if (added) groups.push(id);
+  return {
+    groups,
+    group: groups[0] || '',
+    added
+  };
 }
 
 /**
@@ -423,17 +483,171 @@ export function withSubGroup (sub, groupId) {
  * @returns {{groups:string[], group:string, removed:boolean, empty:boolean}}
  *   empty 为真表示一个群都不剩了，调用方应该顺手把开关整个关掉
  */
-export function withoutSubGroup (sub, groupId) {
-  const id = String(groupId ?? '').trim()
-  const groups = subGroups(sub)
-  const rest = id ? groups.filter(item => item !== id) : groups
-
+export function withoutSubGroup(sub, groupId) {
+  const id = String(groupId ?? '').trim();
+  const groups = subGroups(sub);
+  const rest = id ? groups.filter(item => item !== id) : groups;
   return {
     groups: rest,
     group: rest[0] || '',
     removed: rest.length !== groups.length,
     empty: rest.length === 0
+  };
+}
+
+/* --------------------------------------------------- 退群清理（一次落盘） */
+
+/**
+ * 把「人已经退了的群」从订阅上处理掉，**整表只读改写一次**。
+ *
+ * ## 为什么要它
+ *
+ * 推送的投放判据从头到尾只有 `subGroups(sub)` —— 发消息时 `pickGroupSafe(group)`
+ * 拿到群就发，**从来不校验订阅者本人在不在那个群里**。于是人退群之后，订阅记录还在、
+ * 群号还有效，插件就永远往那个群推他的战绩。
+ * （这段归属闸门在 2026-09-26「定时任务不再卡死」那笔重构里被当成影子订阅机制的一部分
+ * 误删了 —— 实际上它是独立的，删完 `groupsOfMember` 就成了全仓库没人调用的死代码。）
+ *
+ * ## ⭐ 五路推送都是「这个人的事」，人走了就一起停
+ *
+ * `pushList` 是**按 QQ 存**的一张表，五路推送全都往 `subGroups(sub)` 发：
+ * - `battle` / `online`：他的战绩、他的上下线
+ * - `daily` / `weekly` / `monthly`：他的个人日报/周报/月报 ——
+ *   出图用的是**订阅者自己的号**（`battleReport.pushOne` → `buildView(campId, qq)`），
+ *   发到他订阅的那个群。**群报告是另一套**（`#王者群日报`，住 `data/GroupReportPush.yaml`），
+ *   压根不读这张表。
+ *
+ * 所以五路一视同仁：人退群 = 这些内容在那个群没人要了。
+ *   `{ battle: true, daily: true, groups: ['G1','G2'] }` + 退 G1
+ *   → `{ battle: true, daily: true, groups: ['G2'] }`（G2 照旧）
+ *   `{ battle: true, daily: true, groups: ['G1'] }` + 退 G1
+ *   → 整条删掉（一个能发的群都不剩）
+ *
+ * ## 记录的去留
+ *
+ * - 还有群在 → 摘掉退了的那些，其余原样
+ * - 群退光了 → 整条删掉。留着只会在 `entries` 里白占一个请求预算
+ *   （轮询循环里的 `sent += 1` 是**无条件**的）加一次 800ms 错峰
+ * - `optedOut: true` → **永远留着**（缩成只剩标记本身）。它是「别把我列进 #谁在打游戏」
+ *   的隐身标记，跟群列表无关，人重新进群之后依然算数，绝不能顺手清掉
+ *
+ * ⚠️ 只有「**确定**退了」才动。`detectLeftGroups` 返回 `ok: false`（拿不到成员缓存）
+ *    时必须原样放行 —— 冷启动/适配器没连上时把所有人判成退群，等于一次把推送全停掉。
+ *
+ * ⚠️ 这个函数**天然幂等**，别再加「和上一轮比有没有变」的护栏：
+ *    删掉的记录下一轮 `table[qq]` 直接不存在；缩成 `{optedOut:true}` 的下一轮
+ *    `subGroups` 为空、`gone` 里那几个群已经不在列表里 → 走「无事可做」那条 `continue`。
+ *
+ * @param {Record<string, string[]>} gone qq -> 确定已退的群号数组
+ * @param {Record<string, object>} [list] 已读好的订阅表（就地改，省一次整表读）。
+ *   不传就自己 loadPushList。传了的话**调用方要接着用这个对象**，它已经被改过了
+ * @returns {{cleared: number, stopped: number}} cleared 摘掉的群数，stopped 整条停掉的订阅数
+ */
+export function dropLeftGroups(gone, list = null) {
+  const ids = Object.keys(gone || {});
+  if (!ids.length) return {
+    cleared: 0,
+    stopped: 0
+  };
+  const table = list || loadPushList();
+  let cleared = 0;
+  let stopped = 0;
+  // ⚠️ 落盘用独立的 changed：任一路径改过就写。虽然现在是「改了就一定动 counts」，
+  //    但把判据绑在计数上，将来加一条不动计数的分支就会静默丢改动
+  //    （内存里改了、盘上没写，下一轮读回来又是旧的）。
+  let changed = false;
+  for (const qq of ids) {
+    const sub = table[qq];
+    if (!sub) continue;
+    const left = new Set(gone[qq].map(String));
+    const all = subGroups(sub);
+    const rest = all.filter(gid => !left.has(gid));
+    // 退的群压根不在这条订阅的列表里 —— 无事可做（也顺便保证了幂等）
+    if (rest.length === all.length) continue;
+    const dropped = all.length - rest.length;
+
+    // 还有别的群在 → 摘掉退了的那些，两个字段一起维护（`group` 恒为列表首项）
+    if (rest.length) {
+      table[qq] = {
+        ...sub,
+        groups: rest,
+        group: rest[0] || ''
+      };
+      cleared += dropped;
+      changed = true;
+      logger.mark(`[王者推送] ${qq} 已退 ${dropped} 个推送群，已摘掉`);
+      continue;
+    }
+
+    // 群退光了。隐身标记跟群列表无关，必须留（存量记录缩成只剩标记本身）
+    if (sub.optedOut === true) {
+      table[qq] = {
+        optedOut: true
+      };
+      cleared += dropped;
+      changed = true;
+      logger.mark(`[王者推送] ${qq} 已退 ${dropped} 个推送群，保留隐身标记`);
+      continue;
+    }
+
+    // 一个能发的群都不剩了 → 整条停掉
+    delete table[qq];
+    stopped += 1;
+    cleared += dropped;
+    changed = true;
+    logger.mark(`[王者推送] ${qq} 已退全部推送群，订阅已停`);
   }
+  if (changed) savePushList(table);
+  return {
+    cleared,
+    stopped
+  };
+}
+
+/**
+ * 退群巡检：读表 → 判定 → 清理，**一次到位**。给所有投放路径共用。
+ *
+ * ## 为什么必须是一个共用函数
+ *
+ * 退群清理只挂在 `checkAll`（战绩推送那条 cron）里是**盖不全**的：
+ * `daily` / `weekly` / `monthly` 走的是 battleReport 自己注册的三个 cron task
+ * （`pushAll('daily')` …），压根不经过 `checkAll`；而 admin 也可能把
+ * `battleResultCron` 留空 —— 那时 `checkAll` 的 task 根本不会注册，
+ * 日历推送却照跑。两条路各写一份必然漂移，所以收在这里一处。
+ *
+ * ## 调用时机
+ *
+ * 两条投放路径的开头各调一次即可（都是几十秒一次的定时任务，开销可忽略）：
+ * - `checkAll`（战绩/上下线，cron 那条）
+ * - `battleReport.pushAll`（日报/周报/月报，三个 cron）
+ * 判定是纯内存读（`Bot.gml`）+ 一张表的读改写，**不发任何请求**。
+ *
+ * ⚠️ 拿不到成员缓存时 `detectLeftGroups` 返回 `ok: false`，这里直接返回全 0
+ *    —— 冷启动/适配器没连上时一个人都不许动。
+ *
+ * @param {Record<string, object>} [list] 已读好的订阅表（就地改）。不传自己读
+ * @returns {{cleared: number, stopped: number, ok: boolean}}
+ */
+export async function sweepLeftGroups(list = null) {
+  const table = list || loadPushList();
+  const left = await detectLeftGroups(Object.entries(table).map(([qq, sub]) => ({
+    qq,
+    groups: subGroups(sub)
+  })));
+  if (!left.ok) return {
+    cleared: 0,
+    stopped: 0,
+    ok: false
+  };
+  const {
+    cleared,
+    stopped
+  } = dropLeftGroups(left.gone, table);
+  return {
+    cleared,
+    stopped,
+    ok: true
+  };
 }
 
 /* ------------------------------------------------------- 连胜/连败里程碑 */
@@ -443,7 +657,7 @@ export function withoutSubGroup (sub, groupId) {
  * 之下不播：2 连胜起战绩文案里本来就有一行 `🔥 当前 N 连胜`（见 buildBattleMessage），
  * 里程碑是在那之上单独拎出来的一条，太早喊就成了每局都在刷。
  */
-export const STREAK_MIN = 3
+export const STREAK_MIN = 3;
 
 /**
  * 连胜文案池：按连胜数落在哪一段分池，播报时从那一池里随机抽一条。`{count}` 换连胜数。
@@ -458,217 +672,81 @@ export const STREAK_MIN = 3
  * 3. 不写只对某个具体数字成立的话（「再赢一把就上两位数」这种）—— 一池覆盖好几个场次，
  *    抽到时数字对不上就闹笑话。一句话要在整段区间里都说得通才能放进来。
  */
-const WIN_STREAK_POOLS = [
-  {
-    max: 4,
-    texts: [
-      '🎉🔥 {count} 连胜！手感彻底热起来了，趁热再来一把',
-      '🔥🔥 {count} 连胜！已经可以开始挑对手了',
-      '✨🔥 {count} 连胜！今天这手感建议别停',
-      '🎯 {count} 连胜！稳住这个节奏就行',
-      '🔥 {count} 连胜！开局就顺，接着来',
-      '😎 {count} 连胜！看着是准备干票大的',
-      '⚡ {count} 连胜！热身结束了是吧',
-      '🎉 {count} 连胜！这波状态在线'
-    ]
-  },
-  {
-    max: 6,
-    texts: [
-      '⚡ {count} 连胜！对面要开始查战绩了',
-      '⚡🔥 {count} 连胜！一个人把全队胜率抬起来了',
-      '🔥⚡ {count} 连胜！这手感有点烫手',
-      '🌟 {count} 连胜！赢得有点习惯了',
-      '💪 {count} 连胜！这一串开始有分量了',
-      '⚔️ {count} 连胜！谁遇上谁倒霉',
-      '📈 {count} 连胜！分数一路往上走',
-      '😏 {count} 连胜！对面大概不太想再碰到'
-    ]
-  },
-  {
-    max: 9,
-    texts: [
-      '🚀 {count} 连胜！这是要打穿一整个赛季',
-      '🚀✨ {count} 连胜！排到一队的都在偷偷道谢',
-      '🔥🚀 {count} 连胜！刹车是坏了吗',
-      '🌠 {count} 连胜！这势头有点收不住',
-      '🛡️ {count} 连胜！队友只要跟着走就行',
-      '🎢 {count} 连胜！这一串越滚越大',
-      '💥 {count} 连胜！打谁都像打训练营',
-      '😤 {count} 连胜！这会儿谁劝退都不好使'
-    ]
-  },
-  {
-    max: 12,
-    texts: [
-      '👑🎉 {count} 连胜达成！建议直接开个直播',
-      '🏆 {count} 连胜！已经开始不讲道理了',
-      '🏆🔥 {count} 连胜！对面选人阶段看到就想投',
-      '💯 {count} 连胜！两位数了，这数字自己都不敢信',
-      '👑 {count} 连胜！峡谷今天姓你了',
-      '🎇 {count} 连胜！赢到有点找不到对手',
-      '🥇 {count} 连胜！这一串够吹一整周了',
-      '🔮 {count} 连胜！开局就知道结果那种'
-    ]
-  },
-  {
-    max: 16,
-    texts: [
-      '💫 {count} 连胜！这把要是输了都算大新闻',
-      '💫👑 {count} 连胜！峡谷公告栏该挂个名了',
-      '🌟 {count} 连胜！已经是本群传说了',
-      '🌟🔥 {count} 连胜！胜率曲线开始垂直向上',
-      '🎆 {count} 连胜！这战绩截图出去没人信',
-      '⚜️ {count} 连胜！对面是排队来送的吗',
-      '🧨 {count} 连胜！这串数字看着都发烫',
-      '🗿 {count} 连胜！稳得让人怀疑是不是本人'
-    ]
-  },
-  {
-    max: 20,
-    texts: [
-      '🐉 {count} 连胜！这已经不是上分，是搬家',
-      '🐉✨ {count} 连胜！再来两把该被写进史书了',
-      '🎖️👑 {count} 连胜！不是在打游戏，是在巡视领地',
-      '🌟 {count} 连胜！这一串已经不像人类战绩了',
-      '🏅 {count} 连胜！峡谷该给发个荣誉证书',
-      '⛩️ {count} 连胜！对面已经放弃抵抗了',
-      '🎇 {count} 连胜！这数字群里能吹一整个赛季',
-      '🚩 {count} 连胜！这块地方算是插旗了'
-    ]
-  },
-  {
-    max: Infinity,
-    texts: [
-      '🔱 {count} 连胜！还在赢，已经没人拦得住了',
-      '🔱🔥 {count} 连胜！这对局记录看着像假的',
-      '🌌 {count} 连胜！给对面留一条活路吧',
-      '🌌👑 {count} 连胜！这一串到底什么时候能到头',
-      '🛸 {count} 连胜！这已经超出正常范围了',
-      '🗻 {count} 连胜！这数字看着都得仰头',
-      '♾️ {count} 连胜！赢的次数比歇的次数都多',
-      '🎺 {count} 连胜！峡谷该奏乐了'
-    ]
-  }
-]
+const WIN_STREAK_POOLS = [{
+  max: 4,
+  texts: ['🎉🔥 {count} 连胜！手感彻底热起来了，趁热再来一把', '🔥🔥 {count} 连胜！已经可以开始挑对手了', '✨🔥 {count} 连胜！今天这手感建议别停', '🎯 {count} 连胜！稳住这个节奏就行', '🔥 {count} 连胜！开局就顺，接着来', '😎 {count} 连胜！看着是准备干票大的', '⚡ {count} 连胜！热身结束了是吧', '🎉 {count} 连胜！这波状态在线']
+}, {
+  max: 6,
+  texts: ['⚡ {count} 连胜！对面要开始查战绩了', '⚡🔥 {count} 连胜！一个人把全队胜率抬起来了', '🔥⚡ {count} 连胜！这手感有点烫手', '🌟 {count} 连胜！赢得有点习惯了', '💪 {count} 连胜！这一串开始有分量了', '⚔️ {count} 连胜！谁遇上谁倒霉', '📈 {count} 连胜！分数一路往上走', '😏 {count} 连胜！对面大概不太想再碰到']
+}, {
+  max: 9,
+  texts: ['🚀 {count} 连胜！这是要打穿一整个赛季', '🚀✨ {count} 连胜！排到一队的都在偷偷道谢', '🔥🚀 {count} 连胜！刹车是坏了吗', '🌠 {count} 连胜！这势头有点收不住', '🛡️ {count} 连胜！队友只要跟着走就行', '🎢 {count} 连胜！这一串越滚越大', '💥 {count} 连胜！打谁都像打训练营', '😤 {count} 连胜！这会儿谁劝退都不好使']
+}, {
+  max: 12,
+  texts: ['👑🎉 {count} 连胜达成！建议直接开个直播', '🏆 {count} 连胜！已经开始不讲道理了', '🏆🔥 {count} 连胜！对面选人阶段看到就想投', '💯 {count} 连胜！两位数了，这数字自己都不敢信', '👑 {count} 连胜！峡谷今天姓你了', '🎇 {count} 连胜！赢到有点找不到对手', '🥇 {count} 连胜！这一串够吹一整周了', '🔮 {count} 连胜！开局就知道结果那种']
+}, {
+  max: 16,
+  texts: ['💫 {count} 连胜！这把要是输了都算大新闻', '💫👑 {count} 连胜！峡谷公告栏该挂个名了', '🌟 {count} 连胜！已经是本群传说了', '🌟🔥 {count} 连胜！胜率曲线开始垂直向上', '🎆 {count} 连胜！这战绩截图出去没人信', '⚜️ {count} 连胜！对面是排队来送的吗', '🧨 {count} 连胜！这串数字看着都发烫', '🗿 {count} 连胜！稳得让人怀疑是不是本人']
+}, {
+  max: 20,
+  texts: ['🐉 {count} 连胜！这已经不是上分，是搬家', '🐉✨ {count} 连胜！再来两把该被写进史书了', '🎖️👑 {count} 连胜！不是在打游戏，是在巡视领地', '🌟 {count} 连胜！这一串已经不像人类战绩了', '🏅 {count} 连胜！峡谷该给发个荣誉证书', '⛩️ {count} 连胜！对面已经放弃抵抗了', '🎇 {count} 连胜！这数字群里能吹一整个赛季', '🚩 {count} 连胜！这块地方算是插旗了']
+}, {
+  max: Infinity,
+  texts: ['🔱 {count} 连胜！还在赢，已经没人拦得住了', '🔱🔥 {count} 连胜！这对局记录看着像假的', '🌌 {count} 连胜！给对面留一条活路吧', '🌌👑 {count} 连胜！这一串到底什么时候能到头', '🛸 {count} 连胜！这已经超出正常范围了', '🗻 {count} 连胜！这数字看着都得仰头', '♾️ {count} 连胜！赢的次数比歇的次数都多', '🎺 {count} 连胜！峡谷该奏乐了']
+}];
 
 /** 连败文案池，分段规则同上（不写名字、不写模式名、不写死数字）。语气要泄气但不能真扎人，群里被推的是本人 */
-const LOSE_STREAK_POOLS = [
-  {
-    max: 4,
-    texts: [
-      '😮‍💨🧊 {count} 连败，先去喝口水，下一把稳住',
-      '🧊🧊 {count} 连败，换个英雄试试运气',
-      '😮‍💨 {count} 连败，节奏乱了，缓一把',
-      '🧊 {count} 连败，这几局队友是抽到什么了',
-      '💧 {count} 连败，不慌，翻回来不难',
-      '🌀 {count} 连败，先深呼吸，别急着再开',
-      '🍵 {count} 连败，喝口茶再战',
-      '🙃 {count} 连败，运气也该轮到你了'
-    ]
-  },
-  {
-    max: 6,
-    texts: [
-      '☕ {count} 连败，认真的，歇一把再打',
-      '☕😵 {count} 连败，今天大概不是上分的日子',
-      '🌧️ {count} 连败，这雨下得有点久',
-      '😵‍💫 {count} 连败，手感是不是不在身上',
-      '🧊😮‍💨 {count} 连败，越急越乱，停一会儿',
-      '🎧 {count} 连败，听两首歌再回来',
-      '🍜 {count} 连败，先去吃点东西',
-      '🙈 {count} 连败，这几把就当没打'
-    ]
-  },
-  {
-    max: 9,
-    texts: [
-      '🌧️ {count} 连败，峡谷欠一个正式道歉',
-      '🌧️😮‍💨 {count} 连败，系统怕是安排了一路扶贫',
-      '🛌 {count} 连败，下线睡觉才是最优解',
-      '😩 {count} 连败，这运气该被投诉了',
-      '🧊🧊 {count} 连败，真的该停手了',
-      '🕯️ {count} 连败，给今天的手感点根蜡',
-      '🪫 {count} 连败，电量见底了，充会儿',
-      '🤝 {count} 连败，不是你的问题，是今天的问题'
-    ]
-  },
-  {
-    max: 12,
-    texts: [
-      '🛌💤 {count} 连败达成，明天再战一点都不丢人',
-      '🕳️ {count} 连败，分数正在自由落体',
-      '🕳️😭 {count} 连败，这是在挖隧道吗',
-      '🧊💔 {count} 连败，两位数了，今天到此为止吧',
-      '😔 {count} 连败，这串数字看着都心疼',
-      '🚧 {count} 连败，前面全是坑，绕个路',
-      '📉 {count} 连败，曲线已经不忍直视',
-      '🫂 {count} 连败，群里给个抱抱'
-    ]
-  },
-  {
-    max: 16,
-    texts: [
-      '🆘 {count} 连败，群里有人愿意来救一下吗',
-      '🆘🧊 {count} 连败，强烈建议今天到此为止',
-      '⚰️ {count} 连败，峡谷已经降半旗了',
-      '⚰️😵 {count} 连败，还在坚持，这份毅力值得敬礼',
-      '🥶 {count} 连败，手感冻成冰了',
-      '🧱 {count} 连败，撞墙撞了这么久，绕一下吧',
-      '😭 {count} 连败，真的别再点开始了',
-      '🛑 {count} 连败，这里插个牌子：请停'
-    ]
-  },
-  {
-    max: 20,
-    texts: [
-      '🌑 {count} 连败，运气应该已经见底了',
-      '🌑😔 {count} 连败，真的不用再证明什么了',
-      '🧯 {count} 连败，谁去把手机没收一下',
-      '🧯🪦 {count} 连败，今天这一串就当没发生过',
-      '🌚 {count} 连败，今晚的运气全被吃掉了',
-      '💤 {count} 连败，睡一觉比什么都管用',
-      '🫥 {count} 连败，建议原地消失一会儿',
-      '🙏 {count} 连败，明天重新开始，真的'
-    ]
-  },
-  {
-    max: Infinity,
-    texts: [
-      '🥀 {count} 连败，已经打出了一种境界',
-      '🥀😵‍💫 {count} 连败，胜率需要考古修复了',
-      '🫠 {count} 连败，明天一定会赢的（大概）',
-      '🫠🧊 {count} 连败，这一串再长下去要立碑了',
-      '🕸️ {count} 连败，这一串能进博物馆了',
-      '😶‍🌫️ {count} 连败，已经打到没有情绪了',
-      '🔚 {count} 连败，今天该收摊了',
-      '🌪️ {count} 连败，这阵风什么时候能过去'
-    ]
-  }
-]
+const LOSE_STREAK_POOLS = [{
+  max: 4,
+  texts: ['😮‍💨🧊 {count} 连败，先去喝口水，下一把稳住', '🧊🧊 {count} 连败，换个英雄试试运气', '😮‍💨 {count} 连败，节奏乱了，缓一把', '🧊 {count} 连败，这几局队友是抽到什么了', '💧 {count} 连败，不慌，翻回来不难', '🌀 {count} 连败，先深呼吸，别急着再开', '🍵 {count} 连败，喝口茶再战', '🙃 {count} 连败，运气也该轮到你了']
+}, {
+  max: 6,
+  texts: ['☕ {count} 连败，认真的，歇一把再打', '☕😵 {count} 连败，今天大概不是上分的日子', '🌧️ {count} 连败，这雨下得有点久', '😵‍💫 {count} 连败，手感是不是不在身上', '🧊😮‍💨 {count} 连败，越急越乱，停一会儿', '🎧 {count} 连败，听两首歌再回来', '🍜 {count} 连败，先去吃点东西', '🙈 {count} 连败，这几把就当没打']
+}, {
+  max: 9,
+  texts: ['🌧️ {count} 连败，峡谷欠一个正式道歉', '🌧️😮‍💨 {count} 连败，系统怕是安排了一路扶贫', '🛌 {count} 连败，下线睡觉才是最优解', '😩 {count} 连败，这运气该被投诉了', '🧊🧊 {count} 连败，真的该停手了', '🕯️ {count} 连败，给今天的手感点根蜡', '🪫 {count} 连败，电量见底了，充会儿', '🤝 {count} 连败，不是你的问题，是今天的问题']
+}, {
+  max: 12,
+  texts: ['🛌💤 {count} 连败达成，明天再战一点都不丢人', '🕳️ {count} 连败，分数正在自由落体', '🕳️😭 {count} 连败，这是在挖隧道吗', '🧊💔 {count} 连败，两位数了，今天到此为止吧', '😔 {count} 连败，这串数字看着都心疼', '🚧 {count} 连败，前面全是坑，绕个路', '📉 {count} 连败，曲线已经不忍直视', '🫂 {count} 连败，群里给个抱抱']
+}, {
+  max: 16,
+  texts: ['🆘 {count} 连败，群里有人愿意来救一下吗', '🆘🧊 {count} 连败，强烈建议今天到此为止', '⚰️ {count} 连败，峡谷已经降半旗了', '⚰️😵 {count} 连败，还在坚持，这份毅力值得敬礼', '🥶 {count} 连败，手感冻成冰了', '🧱 {count} 连败，撞墙撞了这么久，绕一下吧', '😭 {count} 连败，真的别再点开始了', '🛑 {count} 连败，这里插个牌子：请停']
+}, {
+  max: 20,
+  texts: ['🌑 {count} 连败，运气应该已经见底了', '🌑😔 {count} 连败，真的不用再证明什么了', '🧯 {count} 连败，谁去把手机没收一下', '🧯🪦 {count} 连败，今天这一串就当没发生过', '🌚 {count} 连败，今晚的运气全被吃掉了', '💤 {count} 连败，睡一觉比什么都管用', '🫥 {count} 连败，建议原地消失一会儿', '🙏 {count} 连败，明天重新开始，真的']
+}, {
+  max: Infinity,
+  texts: ['🥀 {count} 连败，已经打出了一种境界', '🥀😵‍💫 {count} 连败，胜率需要考古修复了', '🫠 {count} 连败，明天一定会赢的（大概）', '🫠🧊 {count} 连败，这一串再长下去要立碑了', '🕸️ {count} 连败，这一串能进博物馆了', '😶‍🌫️ {count} 连败，已经打到没有情绪了', '🔚 {count} 连败，今天该收摊了', '🌪️ {count} 连败，这阵风什么时候能过去']
+}];
 
 /** 上一条抽到的文案，同一池连着播两次时避开它，免得刚说过的话又来一遍。只放内存，重启忘掉无所谓 */
-const lastStreakText = new Map()
+const lastStreakText = new Map();
 
 /** 按场次找到所在那一段的文案池 */
-function streakPool (type, count) {
-  const pools = type === 'win' ? WIN_STREAK_POOLS : LOSE_STREAK_POOLS
-  const at = pools.findIndex(p => count <= p.max)
-  const idx = at < 0 ? pools.length - 1 : at
-  return { key: `${type}:${idx}`, texts: pools[idx].texts }
+function streakPool(type, count) {
+  const pools = type === 'win' ? WIN_STREAK_POOLS : LOSE_STREAK_POOLS;
+  const at = pools.findIndex(p => count <= p.max);
+  const idx = at < 0 ? pools.length - 1 : at;
+  return {
+    key: `${type}:${idx}`,
+    texts: pools[idx].texts
+  };
 }
 
 /**
  * 挑出这一段的文案并填好场次。
  * `{who}` 仍然支持替换，但现在所有文案都不用它（名字由消息开头那段负责，见 WIN_STREAK_POOLS 注释）。
  */
-function streakText (type, count, who) {
-  const { key, texts } = streakPool(type, count)
-  const last = lastStreakText.get(key)
-  const pool = texts.length > 1 ? texts.filter(t => t !== last) : texts
-  const tpl = pool[Math.floor(Math.random() * pool.length)] || texts[0] || ''
-  lastStreakText.set(key, tpl)
-  return tpl.replace(/\{who\}/g, who).replace(/\{count\}/g, String(count))
+function streakText(type, count, who) {
+  const {
+    key,
+    texts
+  } = streakPool(type, count);
+  const last = lastStreakText.get(key);
+  const pool = texts.length > 1 ? texts.filter(t => t !== last) : texts;
+  const tpl = pool[Math.floor(Math.random() * pool.length)] || texts[0] || '';
+  lastStreakText.set(key, tpl);
+  return tpl.replace(/\{who\}/g, who).replace(/\{count\}/g, String(count));
 }
 
 /**
@@ -687,18 +765,24 @@ function streakText (type, count, who) {
  * @param {string} [name] 玩家名，写进文案
  * @returns {{text:string, key:string}} text 为空表示这局不用额外播报；key 一律写回订阅项
  */
-export function streakMilestone (streak, notifiedKey = '', name = '') {
-  const type = streak?.type
-  const count = toInt(streak?.count)
-
-  if ((type !== 'win' && type !== 'lose') || count < STREAK_MIN) {
-    return { text: '', key: '' }
+export function streakMilestone(streak, notifiedKey = '', name = '') {
+  const type = streak?.type;
+  const count = toInt(streak?.count);
+  if (type !== 'win' && type !== 'lose' || count < STREAK_MIN) {
+    return {
+      text: '',
+      key: ''
+    };
   }
-
-  const key = `${type}:${count}`
-  if (key === String(notifiedKey || '')) return { text: '', key }
-
-  return { text: streakText(type, count, name ? normalizeName(name) : '这位召唤师'), key }
+  const key = `${type}:${count}`;
+  if (key === String(notifiedKey || '')) return {
+    text: '',
+    key
+  };
+  return {
+    text: streakText(type, count, name ? normalizeName(name) : '这位召唤师'),
+    key
+  };
 }
 
 /* ------------------------------------------------------------------ 拉取 */
@@ -713,20 +797,38 @@ export function streakMilestone (streak, notifiedKey = '', name = '') {
  * @param {string} campId 营地ID
  * @param {string} qq 属主QQ，必传——authStore 按属主取鉴权候选，传空会直接报「未找到登录态」
  */
-export async function fetchLatest (campId, qq) {
+export async function fetchLatest(campId, qq) {
   try {
-    const res = await ApiService.getMoreBattleList(String(campId), String(qq), { option: 0, lastTime: 0 })
-    const code = Number(res?.returnCode || 0)
+    const res = await ApiService.getMoreBattleList(String(campId), String(qq), {
+      option: 0,
+      lastTime: 0
+    });
+    const code = Number(res?.returnCode || 0);
 
-    if (code === CODE_PROFILE_HIDDEN) return FETCH_HIDDEN
-
+    /**
+     * ⚠️⚠️ 「这个营地号在营地侧取不到数据」有两个码，**必须都认**（2026-10-05 修）。
+     *
+     * 实测同一时刻：`getProfile` 回 `-10107 隐藏主页`，`getMoreBattleList` 却回
+     * `-30032 用户不存在` —— 两个端点给的码不一样，说的却是同一件事。
+     * 原来这里只判 -10107，于是 -30032 掉进下面的 `code !== 0` → `return null`
+     * （= 当成**临时失败**）→ 轮询每轮照发请求、每轮都失败、**永远不收敛**，
+     * 而且因为 null 被当成「这轮没拿到数据」，订阅表里连个错都看不出来。
+     * 主人实测就撞在这个上：推送用的营地号被隐藏，20 小时一条推送都没有，
+     * 而任何地方都说不出为什么。
+     *
+     * 两个码统一按「拿不到」处理（`FETCH_HIDDEN`），让上层能把这件事记进订阅项、进日志。
+     */
+    if (code === CODE_PROFILE_HIDDEN || code === CODE_USER_NOT_EXIST) {
+      logger.debug(`[王者推送] ${campId} 营地侧取不到数据（${code}: ${res?.returnMsg || ''}）`);
+      return FETCH_HIDDEN;
+    }
     if (code !== 0) {
-      logger.debug(`[王者推送] ${campId} 返回异常码 ${code}: ${res?.returnMsg || ''}`)
-      return null
+      logger.debug(`[王者推送] ${campId} 返回异常码 ${code}: ${res?.returnMsg || ''}`);
+      return null;
     }
 
     // 隐藏战绩时 returnCode 是 0，靠 invisible 标记判断
-    if (res?.data?.invisible) return FETCH_HIDDEN
+    if (res?.data?.invisible) return FETCH_HIDDEN;
 
     // 顺手归档，喂日报/周报。挂在这里而不是各调用方：轮询、#开启战绩推送 初始化游标、
     // 日报补页全都走 fetchLatest，一处就覆盖所有入口。
@@ -734,17 +836,16 @@ export async function fetchLatest (campId, qq) {
     // 不用为了「本周」现翻十几页（第二页起每页只有 10 场，详见 battleArchive 文件头）
     if (res?.data?.list?.length) {
       try {
-        archiveBattles(campId, res.data.list)
+        archiveBattles(campId, res.data.list);
       } catch (error) {
         // 归档失败绝不能影响推送本身
-        logger.debug(`[王者推送] ${campId} 归档失败: ${error.message}`)
+        logger.debug(`[王者推送] ${campId} 归档失败: ${error.message}`);
       }
     }
-
-    return res?.data || null
+    return res?.data || null;
   } catch (error) {
-    logger.debug(`[王者推送] 拉取 ${campId} 失败: ${error.message}`)
-    return null
+    logger.debug(`[王者推送] 拉取 ${campId} 失败: ${error.message}`);
+    return null;
   }
 }
 
@@ -757,25 +858,22 @@ export async function fetchLatest (campId, qq) {
  * 拉失败返回空对象，文案会退化成「英雄519」，不影响推送本身。
  * @returns {Promise<Record<string, string>>}
  */
-export async function getHeroNameMap () {
-  const cached = cache.get(HERO_MAP_CACHE_KEY)
-  if (cached) return cached
-
+export async function getHeroNameMap() {
+  const cached = cache.get(HERO_MAP_CACHE_KEY);
+  if (cached) return cached;
   try {
-    const list = await ApiService.getHeroList()
-    if (!Array.isArray(list) || !list.length) return {}
-
-    const map = {}
+    const list = await ApiService.getHeroList();
+    if (!Array.isArray(list) || !list.length) return {};
+    const map = {};
     for (const hero of list) {
-      if (hero?.ename == null) continue
-      map[String(hero.ename)] = String(hero.cname || '')
+      if (hero?.ename == null) continue;
+      map[String(hero.ename)] = String(hero.cname || '');
     }
-
-    cache.set(HERO_MAP_CACHE_KEY, map, HERO_MAP_TTL)
-    return map
+    cache.set(HERO_MAP_CACHE_KEY, map, HERO_MAP_TTL);
+    return map;
   } catch (error) {
-    logger.debug(`[王者推送] 拉取英雄总表失败: ${error.message}`)
-    return {}
+    logger.debug(`[王者推送] 拉取英雄总表失败: ${error.message}`);
+    return {};
   }
 }
 
@@ -803,31 +901,30 @@ export async function getHeroNameMap () {
  *
  * @returns {Promise<{gameOnline:number, onlineTime:number, offlineTime:number, roleName:string}|null|symbol>}
  */
-export async function fetchOnlineState (campId, qq) {
+export async function fetchOnlineState(campId, qq) {
   try {
-    const res = await ApiService.getProfile(String(campId), String(qq))
-    const code = Number(res?.returnCode || 0)
+    const res = await ApiService.getProfile(String(campId), String(qq));
+    const code = Number(res?.returnCode || 0);
 
-    if (code === CODE_PROFILE_HIDDEN) return FETCH_HIDDEN
-
-    if (code !== 0) return null
-
-    const data = res?.data || {}
-    const roles = data.roleList || []
+    // ⚠️ 和 fetchLatest 同一口径：两个码都表示「这个号在营地侧取不到数据」
+    //    （实测 profile 端点回 -10107、战绩端点回 -30032，是同一件事）
+    if (code === CODE_PROFILE_HIDDEN || code === CODE_USER_NOT_EXIST) return FETCH_HIDDEN;
+    if (code !== 0) return null;
+    const data = res?.data || {};
+    const roles = data.roleList || [];
     // 主角色认 targetRoleId，取不到就退回第一个（多角色账号只跟主角色的状态）
-    const role = roles.find(r => r.roleId === data.targetRoleId) || roles[0]
-    if (!role) return null
-
+    const role = roles.find(r => r.roleId === data.targetRoleId) || roles[0];
+    if (!role) return null;
     return {
       gameOnline: toInt(role.gameOnline),
       onlineTime: toInt(role.onlineTime),
       offlineTime: toInt(role.offlineTime),
       roleName: String(role.roleName || '')
-    }
+    };
   } catch (error) {
     // 频控同 fetchLatest：api.js 按账号冷却并换号，全池限流才抛到这里，跳过本轮即可
-    logger.debug(`[王者推送] 拉取 ${campId} 在线状态失败: ${error.message}`)
-    return null
+    logger.debug(`[王者推送] 拉取 ${campId} 在线状态失败: ${error.message}`);
+    return null;
   }
 }
 
@@ -840,20 +937,24 @@ export async function fetchOnlineState (campId, qq) {
  * @param {Array<object>} list 战绩列表，服务端按时间倒序，list[0] 最新
  * @returns {{ type: 'win'|'lose'|'', count: number }}
  */
-export function calcStreak (list = []) {
-  const first = list[0]
-  if (!first || (first.gameresult !== 1 && first.gameresult !== 2)) {
-    return { type: '', count: 0 }
+export function calcStreak(list = []) {
+  const first = list[0];
+  if (!first || first.gameresult !== 1 && first.gameresult !== 2) {
+    return {
+      type: '',
+      count: 0
+    };
   }
-
-  const target = first.gameresult
-  let count = 0
+  const target = first.gameresult;
+  let count = 0;
   for (const item of list) {
-    if (item?.gameresult !== target) break
-    count += 1
+    if (item?.gameresult !== target) break;
+    count += 1;
   }
-
-  return { type: target === 1 ? 'win' : 'lose', count }
+  return {
+    type: target === 1 ? 'win' : 'lose',
+    count
+  };
 }
 
 /**
@@ -867,24 +968,318 @@ export function calcStreak (list = []) {
  * @param {object} sub 订阅项，用 lastGameSeq / lastGameTime 做游标
  * @returns {Array<object>} 新场次，从旧到新
  */
-export function pickNewBattles (list = [], sub = {}) {
-  if (!Array.isArray(list) || !list.length) return []
-
-  const lastSeq = String(sub.lastGameSeq || '')
-  const lastTime = toInt(sub.lastGameTime)
+export function pickNewBattles(list = [], sub = {}) {
+  if (!Array.isArray(list) || !list.length) return [];
+  const lastSeq = String(sub.lastGameSeq || '');
+  const lastTime = toInt(sub.lastGameTime);
 
   // 游标为空 = 刚订阅还没初始化，此时不该把历史战绩当新的推出来
-  if (!lastSeq && !lastTime) return []
+  if (!lastSeq && !lastTime) return [];
 
   // 最新一场就是上次推过的那场，没有新战绩，最常见的情况，直接短路
-  if (lastSeq && String(list[0]?.gameSeq || '') === lastSeq) return []
+  if (lastSeq && String(list[0]?.gameSeq || '') === lastSeq) return [];
 
+  // ⚠️⚠️ `lastGameTime` 缺失时**不能只靠时间条件**（2026-10-06 修）。
+  //    `toInt('')` 得 0，而 `dtEventTime > 0` 恒真 —— 去重只剩 gameSeq 一条，
+  //    于是只要游标指向的不是最新那场（比如指向中间某场），**整页 30 场**都会被
+  //    当成新战绩推出去（刷屏）。实测：`{lastGameSeq:'1010', lastGameTime:''}`
+  //    → `fresh.length = 30`（期望 10）。
+  //
+  //    缺口来自 `toggleOnline`（只写在线字段、不写战绩游标）和手工编辑存档，
+  //    所以这种记录是可能存在的。时间条件失效时退回**按 seq 定位**：
+  //    找到游标那一场，只取它**之前**（更新）的场次，语义与时间条件一致。
+  const bySeqFallback = () => {
+    if (!lastSeq) return null;
+    const idx = list.findIndex(item => String(item?.gameSeq || '') === lastSeq);
+    // 游标那场已经翻出列表了（列表太短）：保守地认为「都是新的」，
+    // 不能返回 [] —— 那会把真新战绩也吞掉，比多推更糟
+    if (idx < 0) return list.slice();
+    return list.slice(0, idx);
+  };
+  if (!lastTime) {
+    const fallback = bySeqFallback();
+    // 定位不到游标（lastSeq 为空，但前面已保证 lastSeq/lastTime 至少有一个）
+    // 或列表里没有它时，返回整页是唯一不丢数据的选择
+    if (fallback === null) return list.slice().reverse();
+    return fallback.reverse();
+  }
   const fresh = list.filter(item => {
-    if (String(item?.gameSeq || '') === lastSeq) return false
-    return toInt(item?.dtEventTime) > lastTime
-  })
+    if (String(item?.gameSeq || '') === lastSeq) return false;
+    return toInt(item?.dtEventTime) > lastTime;
+  });
+  return fresh.reverse();
+}
 
-  return fresh.reverse()
+/** 小段罗马数字：下标 0 是 I（该大段最高），往后依次降低，与 roleJob 编号同向递增 */
+const SMALL_RANK_ROMAN = ['I', 'II', 'III', 'IV', 'V'];
+
+/**
+ * 由「终点段位名 + 编号变化」反推**变化前**那一段的段位名。
+ *
+ * ⚠️ 为什么非要反推（2026-10-15 主人报「升段文案读着像掉星」时查出来的）：
+ * 营地对**历史对局**返回的 `roleJobName` 是「查询那一刻玩家的当前段位」，**不是该局结束时的段位**。
+ * 实测主人号 campId 1580886057：13:08 那局在归档里是「至尊星耀II」（刚打完那轮记下的），
+ * 两小时后的收工推送里同一局已经变成「至尊星耀I」（当轮查询时的新段位）。
+ * 后果是**同一批请求里所有历史局的名字全都相同**，`jobFrom` 恒等于 `jobTo`，
+ * `formatScoreChange`/`formatStarChange` 里「段位 A → B」那条分支永远走不到，
+ * 起点段位名凭空丢失 —— 收工文案变成「至尊星耀I 3 → 0星（升段）」，
+ * 读起来像「掉了 3 星」。全量归档复算（1974 对相邻同段记录，编号变化 69 对）：
+ * 编号差 ±1（正好差一小段）42 次，其余 27 次都是 ±5 以上的大跳（跨大段/赛季重置）。
+ *
+ * 可靠的只有 `roleJob` 小编号：**同一大段内编号连续且与段位高度同向**
+ * （实测星耀 V/IV/III/II/I = 22/23/24/25/26，永恒钻石 I = 15）。
+ * 所以只差一小段时（|diff| === 1）可以由终点名进退一格拿到起点名；
+ * 差得更远就不敢猜了 —— 跨大段的编号根本不连续（钻石 I 是 15、星耀 V 是 22），
+ * 而「星耀 I(26) → 王者(16)」这种升大段编号反而是降的，
+ * 硬推必然编出一个假段位。返回空串让调用方保持原样，宁可不写名字也不写错名字。
+ *
+ * @param {string} jobTo 终点段位名（当前段位，可信）
+ * @param {number} jobNumFrom 起点 roleJob 编号
+ * @param {number} jobNumTo 终点 roleJob 编号
+ * @returns {string} 起点段位名，推不出来时返回空串
+ */
+export function resolvePrevRankName(jobTo, jobNumFrom, jobNumTo) {
+  const diff = toInt(jobNumTo) - toInt(jobNumFrom);
+  if (Math.abs(diff) !== 1) return '';
+
+  // 「至尊星耀II」拆成前缀「至尊星耀」+ 小段「II」；「最强王者」这类没有小段的直接放弃
+  const m = String(jobTo || '').trim().match(/^(.*?)(I{1,3}|IV|V)$/);
+  if (!m) return '';
+  const idx = SMALL_RANK_ROMAN.indexOf(m[2]);
+  if (idx < 0) return '';
+
+  // 编号涨 = 段位升 = 起点比终点低一档（罗马数字更大）；编号跌则反过来
+  const prevIdx = idx + diff;
+  if (prevIdx < 0 || prevIdx >= SMALL_RANK_ROMAN.length) return '';
+  return m[1] + SMALL_RANK_ROMAN[prevIdx];
+}
+
+/** 当前赛季王者段的 roleJob 编号：最强/非凡/无双/绝世/至圣/荣耀王者统一是 16 */
+const KING_ROLE_JOB = 16;
+/** 刚升到王者、名字还滞后的那几颗星，称号固定是「最强王者」 */
+const KING_LOW_STAR_TITLE = '最强王者';
+const KING_LOW_STAR_MAX = 8;
+
+/**
+ * 单场战绩的段位名，修掉营地「名字比编号慢一拍」的滞后。
+ *
+ * 实测（2026-10-22，主人号 campId 1580886057）：22:03 那局赢了、从星耀I 4星升到王者1星，
+ * 接口返回的却是 `{ roleJobName: '至尊星耀I', roleJob: 16, stars: 1 }` ——
+ * 编号和星数已经是新段位，名字还停在上一段；同一局下一轮轮询才变成「最强王者」。
+ * 而归档只增不改（battleArchive.mergeIntoCache 遇到同 gameSeq 直接跳过），
+ * 所以推送和收工文案读到的永远是那个滞后名。
+ *
+ * 判据是「赢了 + 名字没变 + 星数反而少了」：段内星数不会因为赢而减少，
+ * 只可能是升段（段内星重置）。这时 roleJob 已经换成新段位编号，16 是王者段；
+ * 刚升上去星数很小，称号按赛季固定是「最强王者」。
+ *
+ * ⚠️ 不能无条件把 roleJob=16 都当王者：归档里还有「永恒钻石IV + 编号 16 + 11~14 星」
+ * 的样本（切角色混桶/名字长期不对），所以只认上面那组升段信号；
+ * 星数超过 KING_LOW_STAR_MAX（升段后跨了小称号）就不猜，保持原样。
+ *
+ * @param {object} item 场次
+ * @param {object} [prev] 时间上更早的一场
+ * @returns {string} 校正后的段位名，取不到或无需校正时返回原值
+ */
+export function resolveBattleRankName(item, prev) {
+  const job = String(item?.roleJobName || '').trim();
+  if (!job || rankBand(job) === 7) return job;
+  if (toInt(item?.gameresult) !== 1 || !prev) return job;
+  if (String(prev?.roleJobName || '').trim() !== job) return job;
+  if (toInt(item?.roleJob) !== KING_ROLE_JOB) return job;
+  if (toInt(item?.stars) >= toInt(prev?.stars)) return job;
+  if (toInt(item?.stars) > KING_LOW_STAR_MAX) return job;
+  return KING_LOW_STAR_TITLE;
+}
+
+/** 大段全名，下标 + 1 = rankBand（1 青铜 … 7 王者） */
+const RANK_BAND_NAMES = ['倔强青铜', '秩序白银', '荣耀黄金', '尊贵铂金', '永恒钻石', '至尊星耀', '最强王者'];
+/** 编号差多少算跨了大段。与 rankTrend.js 的 JUMP_TOLERANCE 同口径 */
+const CROSS_BAND_JOB_GAP = 3;
+
+/**
+ * 由营地带回来的那一个段位名 + 起止编号，还原跨大段的起止段位名。
+ *
+ * 营地对一批战绩只给一个名字（见 resolvePrevRankName），跨大段时另一边必然丢失。
+ * 但跨大段有固定形态：**起点一定是上一大段的 I，终点一定是下一大段的 V**
+ * （升王者除外，王者没有小段）。所以看名字停在哪一边就能把另一边补出来：
+ *
+ * - 名字是「X I」→ 名字是**起点**（该大段最高小段），终点 = 下一大段 V / 王者
+ * - 名字是「Y V」且编号跨了大段 → 名字是**终点**，起点 = 上一大段 I
+ * - 名字是王者 → 名字是**终点**（王者之上没有大段），起点 = 至尊星耀I
+ * - 名字是 II/III/IV → 不是跨大段的端点（起点必 I、终点必 V），多半是切角色/旧体系，不猜
+ *
+ * 实测样本（归档 61 对「赢 + 同名 + 星降」）：至尊星耀V | 15→22 共 9 对（钻石I→星耀V，
+ * 名字是终点）、至尊星耀I | 26→16 共 3 对（星耀I→王者，名字是起点）、最强王者 | 26→16
+ * 共 3 对（星耀I→王者，名字是终点）。编号在账号之间并不唯一（同一编号在不同号上是
+ * 不同小段），所以**不能查表**，只能靠这个形态特征反推。
+ *
+ * @param {string} job 营地给的段位名
+ * @param {number} jobNumFrom 起点 roleJob 编号
+ * @param {number} jobNumTo 终点 roleJob 编号
+ * @param {number} starTo 终点星数
+ * @returns {{from:string,to:string}|null} 推不出时返回 null，调用方保持原有保守文案
+ */
+export function describeCrossBandNames(job, jobNumFrom, jobNumTo, starTo) {
+  const name = String(job || '').trim();
+  const band = rankBand(name);
+  if (!band) return null;
+  const diff = toInt(jobNumTo) - toInt(jobNumFrom);
+  const stars = toInt(starTo);
+
+  // 王者之上没有大段，名字只能是终点；16→16 是王者内换称号/星数，
+  // 25→26 这类小差是旧体系王者段内循环，都不是跨大段
+  if (band === 7) {
+    if (Math.abs(diff) < CROSS_BAND_JOB_GAP) return null;
+    const to = stars > 0 && stars <= KING_LOW_STAR_MAX ? KING_LOW_STAR_TITLE : name;
+    return {
+      from: `${RANK_BAND_NAMES[5]}I`,
+      to
+    };
+  }
+  const m = name.match(/^(.*?)(I{1,3}|IV|V)$/);
+  if (!m) return null;
+  const idx = SMALL_RANK_ROMAN.indexOf(m[2]);
+
+  // 名字是该大段最高的 I。大跳才是「名字=起点名、跨大段升走」；
+  // 只差一小段时名字是终点名（星耀II→星耀I），交给原逻辑反推起点
+  if (idx === 0) {
+    if (Math.abs(diff) < CROSS_BAND_JOB_GAP) return null;
+    const next = band + 1;
+    if (next === 7) {
+      // 王者称号随星数变（9 星起换非凡王者），星数不小就不硬猜
+      if (stars <= 0 || stars > KING_LOW_STAR_MAX) return null;
+      return {
+        from: name,
+        to: KING_LOW_STAR_TITLE
+      };
+    }
+    return {
+      from: name,
+      to: `${RANK_BAND_NAMES[next - 1]}V`
+    };
+  }
+
+  // 名字是该大段最低的 V，且编号跨了大段：名字是终点，起点是上一大段的 I
+  if (idx === 4 && Math.abs(diff) >= CROSS_BAND_JOB_GAP && band > 1) {
+    return {
+      from: `${RANK_BAND_NAMES[band - 2]}I`,
+      to: name
+    };
+  }
+  return null;
+}
+
+/**
+ * 单场战绩里的跨大段升段文案。
+ * 判据「赢了 + 名字没变 + 星数反而变少」同 resolveBattleRankName：
+ * 段内星数不会因为赢而减少，只可能是升段（段内星重置）。
+ *
+ * @param {object} item 场次
+ * @param {object} [prev] 时间上更早的一场
+ * @returns {{text:string,tone:'up'}|null} 不是跨大段升段时返回 null
+ */
+export function describeCrossBandChange(item, prev) {
+  if (toInt(item?.gameresult) !== 1 || !prev) return null;
+  const job = String(item?.roleJobName || '').trim();
+  if (!job || String(prev?.roleJobName || '').trim() !== job) return null;
+  const stars = toInt(item?.stars);
+  if (stars >= toInt(prev?.stars)) return null;
+  const cross = describeCrossBandNames(job, prev?.roleJob, item?.roleJob, stars);
+  if (!cross || cross.from === cross.to) return null;
+  return {
+    text: `段位 ${cross.from} → ${cross.to}（${stars}星）`,
+    tone: 'up'
+  };
+}
+
+/**
+ * 掉大段时还原起止段位名，形态与升段镜像：
+ * **起点一定是该大段的 V，终点一定是上一大段的 I**（掉出王者除外）。
+ * 名字停在哪一端，就补另一端：
+ *
+ * - 名字是「X V」→ 名字是**起点**，终点 = 上一大段 I
+ * - 名字是「Y I」→ 名字是**终点**，起点 = 下一大段 V
+ * - 名字是王者 → 名字是**起点**（掉出王者），终点 = 至尊星耀V
+ * - 名字是 II/III/IV → 不是掉大段的端点（多半是同段掉小段或切角色），不猜
+ * - 名字是星耀I → 起点是王者，称号随星数变化且区间跨赛季重叠，不猜
+ *
+ * 实测样本（归档 26 对「输 + 同名 + 星数变大」）：至尊星耀V | 22→15 共 5 对
+ * （星耀V→钻石I，名字是起点）、永恒钻石I | 22→15 共 1 对（名字是终点）、
+ * 至尊星耀I | 16→26 共 1 对（掉出王者，名字是终点，起点称号不可考 → 不猜）。
+ *
+ * @param {string} job 营地给的段位名
+ * @param {number} jobNumFrom 起点 roleJob 编号
+ * @param {number} jobNumTo 终点 roleJob 编号
+ * @param {number} starTo 终点星数
+ * @returns {{from:string,to:string}|null} 推不出时返回 null
+ */
+export function describeCrossBandDropNames(job, jobNumFrom, jobNumTo, starTo) {
+  const name = String(job || '').trim();
+  const band = rankBand(name);
+  if (!band) return null;
+  const diff = toInt(jobNumTo) - toInt(jobNumFrom);
+  if (Math.abs(diff) < CROSS_BAND_JOB_GAP) return null;
+
+  // 名字是王者：掉出王者，名字是起点，终点固定星耀V
+  if (band === 7) return {
+    from: name,
+    to: `${RANK_BAND_NAMES[5]}V`
+  };
+  const m = name.match(/^(.*?)(I{1,3}|IV|V)$/);
+  if (!m) return null;
+  const idx = SMALL_RANK_ROMAN.indexOf(m[2]);
+
+  // 名字是该大段最低的 V。两种来源：
+  // - 名字是起点（X V 再掉一局 → 下一大段 I），归档里保留的旧名多半是这种
+  // - 名字是终点（从王者掉出 → 星耀V，营地名字被刷成查询时的当前段位）
+  // 王者编号恒为 16（KING_ROLE_JOB），起点编号是 16 就只可能是掉出王者
+  if (idx === 4 && band > 1) {
+    if (band === 6 && toInt(jobNumFrom) === KING_ROLE_JOB) {
+      return {
+        from: KING_LOW_STAR_TITLE,
+        to: name
+      };
+    }
+    return {
+      from: name,
+      to: `${RANK_BAND_NAMES[band - 2]}I`
+    };
+  }
+
+  // 名字是该大段最高的 I：名字是终点，起点是下一大段的 V。
+  // 星耀I 的起点是王者，具体称号随星数变化且区间跨赛季重叠、不可考，
+  // 只用大段名「王者」保住方向，不编一个假称号
+  if (idx === 0) {
+    return {
+      from: band === 6 ? '王者' : `${RANK_BAND_NAMES[band]}V`,
+      to: name
+    };
+  }
+  return null;
+}
+
+/**
+ * 单场战绩里的跨大段掉段文案。
+ * 判据「输了 + 名字没变 + 星数反而变多」：掉段后星数重置到 4/5 星，
+ * 段内正常输一局星数是变少的，只有掉段会变大。
+ *
+ * @param {object} item 场次
+ * @param {object} [prev] 时间上更早的一场
+ * @returns {{text:string,tone:'down'}|null} 不是跨大段掉段时返回 null
+ */
+export function describeCrossBandDrop(item, prev) {
+  if (toInt(item?.gameresult) !== 2 || !prev) return null;
+  const job = String(item?.roleJobName || '').trim();
+  if (!job || String(prev?.roleJobName || '').trim() !== job) return null;
+  const stars = toInt(item?.stars);
+  if (stars <= toInt(prev?.stars)) return null;
+  const cross = describeCrossBandDropNames(job, prev?.roleJob, item?.roleJob, stars);
+  if (!cross || cross.from === cross.to) return null;
+  return {
+    text: `段位 ${cross.from} → ${cross.to}（${stars}星）`,
+    tone: 'down'
+  };
 }
 
 /**
@@ -905,49 +1300,54 @@ export function pickNewBattles (list = [], sub = {}) {
  * @param {object} [prev] 时间上更早的一场（list 里紧邻的下一项），用于比段位星数
  * @returns {{text:string, tone:'up'|'down'|'flat'}|null} 连当前段位都取不到时返回 null
  */
-export function formatScoreChange (item, prev) {
-  const oldScore = toInt(item?.oldMasterMatchScore)
-  const newScore = toInt(item?.newMasterMatchScore)
-
+export function formatScoreChange(item, prev) {
+  const oldScore = toInt(item?.oldMasterMatchScore);
+  const newScore = toInt(item?.newMasterMatchScore);
   if ((oldScore > 0 || newScore > 0) && oldScore !== newScore) {
-    const diff = newScore - oldScore
-    const sign = diff > 0 ? '+' : ''
+    const diff = newScore - oldScore;
+    const sign = diff > 0 ? '+' : '';
     return {
       text: `巅峰分 ${oldScore} → ${newScore} (${sign}${diff})`,
       tone: diff > 0 ? 'up' : 'down'
-    }
+    };
   }
-
-  const job = String(item?.roleJobName || '').trim()
-  if (!job) return null
-
-  const stars = toInt(item?.stars)
+  const crossBand = describeCrossBandChange(item, prev);
+  if (crossBand) return crossBand;
+  const crossDrop = describeCrossBandDrop(item, prev);
+  if (crossDrop) return crossDrop;
+  const job = resolveBattleRankName(item, prev);
+  if (!job) return null;
+  const stars = toInt(item?.stars);
   // 比不出变化时的兜底：只报当前段位，不带方向
-  const current = { text: `${job} ${stars}星`, tone: 'flat' }
-
-  const prevJob = String(prev?.roleJobName || '').trim()
-  if (!prevJob) return current
-
-  const prevStars = toInt(prev?.stars)
-  const jobNum = toInt(item?.roleJob)
-  const prevJobNum = toInt(prev?.roleJob)
+  const current = {
+    text: `${job} ${stars}星`,
+    tone: 'flat'
+  };
+  const prevJob = String(prev?.roleJobName || '').trim();
+  if (!prevJob) return current;
+  const prevStars = toInt(prev?.stars);
+  const jobNum = toInt(item?.roleJob);
+  const prevJobNum = toInt(prev?.roleJob);
 
   // 一个营地号名下可能有多个游戏角色，而战绩列表里没有任何角色标识（详见 rankTrend.js
   // 文件头第 4 点），切了角色的两场混在一起硬减会报出「掉了 9 星」这种假结论。
   // 判据与段位趋势的断线口径共用一份 isRankJump
-  if (isRankJump(
-    { band: rankBand(prevJob), jobNum: prevJobNum },
-    { band: rankBand(job), jobNum }
-  )) return current
+  if (isRankJump({
+    band: rankBand(prevJob),
+    jobNum: prevJobNum
+  }, {
+    band: rankBand(job),
+    jobNum
+  })) return current;
 
   // 段位名变了：stars 两边不同口径，减出来的差没意义，只报段位变化。
   // 方向按大段层级判（星耀 → 王者是升），认不出段位名就不带方向
   if (prevJob !== job) {
-    const gap = rankBand(job) - rankBand(prevJob)
+    const gap = rankBand(job) - rankBand(prevJob);
     return {
       text: `段位 ${prevJob} → ${job}（${stars}星）`,
       tone: gap > 0 ? 'up' : gap < 0 ? 'down' : 'flat'
-    }
+    };
   }
 
   // 同名段下营地还有个小编号 roleJob：旧体系把王者按 5 星编成连续小段
@@ -955,37 +1355,65 @@ export function formatScoreChange (item, prev) {
   // stars 直接是累计星数。编号变了说明跨了小段，按编号判升降，不算星数差
   if (jobNum && prevJobNum && jobNum !== prevJobNum) {
     if (jobNum > prevJobNum) {
-      return { text: `${job} ${prevStars} → ${stars}星（升段）`, tone: 'up' }
+      // 起点段位名自己推（营地给的历史局名字恒等于终点名，见 resolvePrevRankName）。
+      // 推得出就把两边段位和星数写全，推不出退回旧的半截文案
+      const prevName = resolvePrevRankName(job, prevJobNum, jobNum);
+      return prevName ? {
+        text: `${prevName} ${prevStars}星 → ${job} ${stars}星（升段）`,
+        tone: 'up'
+      } : {
+        text: `${job} ${prevStars} → ${stars}星（升段）`,
+        tone: 'up'
+      };
     }
     // 赢了编号却降只可能是赛季切换/段位重置（实测 2026-07-26 26→16），不是掉段，
     // 前后星数不可比，只报当前
-    if (item?.gameresult === 1) return current
-    return { text: `${job} ${prevStars} → ${stars}星（掉段）`, tone: 'down' }
+    if (item?.gameresult === 1) return current;
+    return {
+      text: `${job} ${prevStars} → ${stars}星（掉段）`,
+      tone: 'down'
+    };
   }
-
-  const diff = stars - prevStars
+  const diff = stars - prevStars;
   if (diff > 0) {
-    return { text: `${job} ${prevStars} → ${stars}星（上了${diff}星）`, tone: 'up' }
+    // 输了星数反而变大 = 掉段（王者以下掉段直接重置到 4 星：0/1 星输一局 → 4 星）。
+    // 编号缺失或没变时会走到这里，不能按星数差报「上了 N 星」——方向正好是反的
+    if (item?.gameresult === 2) {
+      return {
+        text: `${job} ${prevStars} → ${stars}星（掉段）`,
+        tone: 'down'
+      };
+    }
+    return {
+      text: `${job} ${prevStars} → ${stars}星（上了${diff}星）`,
+      tone: 'up'
+    };
   }
   if (diff < 0) {
     // roleJob 缺失时的兜底：赢了星数却下降，只可能是旧体系的段内循环重置
     if (item?.gameresult === 1) {
-      return { text: `${job} ${prevStars} → ${stars}星（升段）`, tone: 'up' }
+      return {
+        text: `${job} ${prevStars} → ${stars}星（升段）`,
+        tone: 'up'
+      };
     }
-    return { text: `${job} ${prevStars} → ${stars}星（掉了${-diff}星）`, tone: 'down' }
+    return {
+      text: `${job} ${prevStars} → ${stars}星（掉了${-diff}星）`,
+      tone: 'down'
+    };
   }
 
   // 差值为 0：王者段输了有保星机制，星数不动是真实结果，如实只报当前星数
-  return current
+  return current;
 }
 
 /** 秒 → 「15分16秒」 */
-export function formatDuration (seconds) {
-  const total = toInt(seconds)
-  if (total <= 0) return ''
-  const min = Math.floor(total / 60)
-  const sec = total % 60
-  return min > 0 ? `${min}分${sec}秒` : `${sec}秒`
+export function formatDuration(seconds) {
+  const total = toInt(seconds);
+  if (total <= 0) return '';
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  return min > 0 ? `${min}分${sec}秒` : `${sec}秒`;
 }
 
 /**
@@ -998,37 +1426,35 @@ export function formatDuration (seconds) {
  * @param {boolean} [options.brief=false] 精简模式：省略 KDA / 评分 / 时长 / 局评价。
  *   配详情图发送时用——那些信息图里都有，文字只留图上没有的巅峰分与段位变化。
  */
-export function formatBattleText (item, prev, heroMap = {}, { brief = false } = {}) {
-  const win = item?.gameresult === 1
-  const heroName = heroMap[String(item?.heroId)] || `英雄${item?.heroId ?? '?'}`
-
-  const lines = []
-
+export function formatBattleText(item, prev, heroMap = {}, {
+  brief = false
+} = {}) {
+  const win = item?.gameresult === 1;
+  const heroName = heroMap[String(item?.heroId)] || `英雄${item?.heroId ?? '?'}`;
+  const lines = [];
   if (brief) {
-    lines.push(`${win ? '🏆 胜利' : '💧 失败'} · ${heroName}`)
+    lines.push(`${win ? '🏆 胜利' : '💧 失败'} · ${heroName}`);
   } else {
-    const kda = `${toInt(item?.killcnt)}/${toInt(item?.deadcnt)}/${toInt(item?.assistcnt)}`
-    const grade = item?.gradeGame ? ` · 评分 ${item.gradeGame}` : ''
-    lines.push(`${win ? '🏆 胜利' : '💧 失败'} · ${heroName} · ${kda}${grade}`)
+    const kda = `${toInt(item?.killcnt)}/${toInt(item?.deadcnt)}/${toInt(item?.assistcnt)}`;
+    const grade = item?.gradeGame ? ` · 评分 ${item.gradeGame}` : '';
+    lines.push(`${win ? '🏆 胜利' : '💧 失败'} · ${heroName} · ${kda}${grade}`);
   }
 
   // 图标看 tone 不看胜负：娱乐局不动段位、王者段输了还有保星，
   // 这两种「输了但一格没动」拿胜负配图标会推出「📉 至圣王者 41星」这种假掉星
-  const change = formatScoreChange(item, prev)
+  const change = formatScoreChange(item, prev);
   if (change) {
-    const icon = change.tone === 'up' ? '📈' : change.tone === 'down' ? '📉' : '⭐'
-    lines.push(`${icon} ${change.text}`)
+    const icon = change.tone === 'up' ? '📈' : change.tone === 'down' ? '📉' : '⭐';
+    lines.push(`${icon} ${change.text}`);
   }
-
   if (!brief) {
-    const parts = []
-    const duration = formatDuration(item?.usedTime)
-    if (duration) parts.push(`⏱ ${duration}`)
-    if (item?.desc) parts.push(item.desc)
-    if (parts.length) lines.push(parts.join(' · '))
+    const parts = [];
+    const duration = formatDuration(item?.usedTime);
+    if (duration) parts.push(`⏱ ${duration}`);
+    if (item?.desc) parts.push(item.desc);
+    if (parts.length) lines.push(parts.join(' · '));
   }
-
-  return lines.join('\n')
+  return lines.join('\n');
 }
 
 /**
@@ -1040,25 +1466,55 @@ export function formatBattleText (item, prev, heroMap = {}, { brief = false } = 
  * @param {string} [name] 玩家名。开局提醒不 @ 本人（是给群友看的），
  *   所以要把名字写进文案里，否则群里没人知道是谁开打了。
  */
-export function formatGamingText (gaming, heroMap = {}, name = '') {
-  const mode = String(gaming?.mapName || '').trim() || '对局'
-  const heroName = heroMap[String(gaming?.heroId)] || (gaming?.heroId ? `英雄${gaming.heroId}` : '')
-  const who = normalizeName(name)
-
-  const lines = [`${name ? `${who} · ` : ''}进入了${mode}`]
-
+export function formatGamingText(gaming, heroMap = {}, name = '') {
+  const mode = String(gaming?.mapName || '').trim() || '对局';
+  const heroName = heroMap[String(gaming?.heroId)] || (gaming?.heroId ? `英雄${gaming.heroId}` : '');
+  const who = normalizeName(name);
+  const lines = [`${name ? `${who} · ` : ''}进入了${mode}`];
   if (heroName) {
-    const stat = []
-    const gameNum = toInt(gaming?.gameNum)
-    if (gameNum > 0) stat.push(`${gameNum} 场`)
-    if (gaming?.winRate) stat.push(`胜率 ${gaming.winRate}`)
-    lines.push(`🎮 ${heroName}${stat.length ? `（${stat.join(' · ')}）` : ''}`)
+    const stat = [];
+    const gameNum = toInt(gaming?.gameNum);
+    if (gameNum > 0) stat.push(`${gameNum} 场`);
+    if (gaming?.winRate) stat.push(`胜率 ${gaming.winRate}`);
+    lines.push(`🎮 ${heroName}${stat.length ? `（${stat.join(' · ')}）` : ''}`);
   }
+  const duration = toInt(gaming?.duration);
+  if (duration > 0) lines.push(`已进行 ${duration} 分钟`);
+  return lines.join('\n');
+}
 
-  const duration = toInt(gaming?.duration)
-  if (duration > 0) lines.push(`已进行 ${duration} 分钟`)
-
-  return lines.join('\n')
+/**
+ * 开播提示文案：开局信息 + 「要不要开一路观战」**合成一条**。
+ *
+ * 来龙去脉：这两条原先由两个链路各发一次 —— `checkBattle` 的开局提醒
+ * （`formatGamingText`）和 `checkHint` 的开播提示，说的却是**同一局、同一个时长**，
+ * 连着打时同一轮就能在群里刷出两屏（实测形态：「进入了排位赛…」紧跟着
+ * 「已经开局 3 分钟了…」）。合并后满 N 分钟只发这一条。
+ *
+ * ⚠️⚠️ **第一行必须保持 `〈名字〉 已经开局 N 分钟了` 的原样开头**：
+ *    `apps/watchBattle.js` 的 `#营地开播` 靠 `/^(.+?)\s*已经开局\s*\d+\s*分钟/`
+ *    从被引用的这条提示里抠出人名，去服务端挑回「原来那一场」。改掉这句等于把
+ *    「引用精确开播」弄坏 —— 群里好几个人先后开局时会开错人。
+ *
+ * @param {object} gaming data.gaming
+ * @param {object} [heroMap] heroId -> 英雄名
+ * @param {string} [name] 玩家名。这条也不 @ 本人，名字得写进文案
+ * @param {number} minutes 已开局分钟数（满 N 分钟那条的判据值）
+ */
+export function formatGamingHintText(gaming, heroMap = {}, name = '', minutes = 0) {
+  const mode = String(gaming?.mapName || '').trim() || '对局';
+  const heroName = heroMap[String(gaming?.heroId)] || (gaming?.heroId ? `英雄${gaming.heroId}` : '');
+  const who = normalizeName(name);
+  const lines = [`${name ? `${who} ` : ''}已经开局 ${minutes} 分钟了 · 进入了${mode}`];
+  if (heroName) {
+    const stat = [];
+    const gameNum = toInt(gaming?.gameNum);
+    if (gameNum > 0) stat.push(`${gameNum} 场`);
+    if (gaming?.winRate) stat.push(`胜率 ${gaming.winRate}`);
+    lines.push(`🎮 ${heroName}${stat.length ? `（${stat.join(' · ')}）` : ''}`);
+  }
+  lines.push('要不要开一路观战？发 #营地开播');
+  return lines.join('\n');
 }
 
 /* ------------------------------------------------------- 开播提示（盯梢） */
@@ -1070,7 +1526,7 @@ export function formatGamingText (gaming, heroMap = {}, name = '') {
  * 漏改就会「列表说能看、盯梢说不能看」。现在服务端直接 import 同一份，
  * 改一处就够了 —— 别在这儿重新定义。
  */
-export { isWatchableMode }
+export { isWatchableMode };
 
 /**
  * 这一局已经打了多久（分钟）。算不出来返回 -1。
@@ -1083,12 +1539,12 @@ export { isWatchableMode }
  * @param {number} [now] 当前毫秒时间戳
  * @returns {number} 分钟数，-1 = 算不出来
  */
-export function gamingMinutes (gaming, now = Date.now()) {
-  const start = toInt(gaming?.dtEventTime) * 1000
-  if (!start) return -1
-  const ms = now - start
-  if (ms < 0 || ms > 24 * 3600 * 1000) return -1
-  return Math.floor(ms / 60000)
+export function gamingMinutes(gaming, now = Date.now()) {
+  const start = toInt(gaming?.dtEventTime) * 1000;
+  if (!start) return -1;
+  const ms = now - start;
+  if (ms < 0 || ms > 24 * 3600 * 1000) return -1;
+  return Math.floor(ms / 60000);
 }
 
 /**
@@ -1112,36 +1568,68 @@ export function gamingMinutes (gaming, now = Date.now()) {
  * @param {number} afterMin 满几分钟才提示
  * @returns {{action:'hint'|'wait'|'drop', minutes:number, reason:string}}
  */
-export function decideHint (data, afterMin = 3) {
+export function decideHint(data, afterMin = 3) {
   // ⚠️⚠️ **「明确藏了战绩」和「接口失败」必须分开**（踩过）：
   //    · `data === FETCH_HIDDEN` → 对方关了战绩隐私，**这一局确定看不了** → 放弃；
   //    · `data === null` → 接口偶发失败（网络抖动 / 频控换号 / 营地上游超时）→
   //      **不是「看不了」**，该下轮重试。早先两者都当 drop，结果一次抖动就把这局
   //      标记成「问过了」，整局再也不问（实测踩过）。
   if (data === FETCH_HIDDEN) {
-    return { action: 'drop', minutes: -1, reason: '对方关了战绩' }
+    return {
+      action: 'drop',
+      minutes: -1,
+      reason: '对方关了战绩'
+    };
   }
   if (!data) {
-    return { action: 'wait', minutes: -1, reason: '接口失败，下轮重试' }
+    return {
+      action: 'wait',
+      minutes: -1,
+      reason: '接口失败，下轮重试'
+    };
   }
-  const gaming = data.gaming
+  const gaming = data.gaming;
   if (!gaming || !data.isGaming) {
     // 没进对局 —— 也可能是有隐私（两者数据同形，见上面的注释），靠超时兜底
-    return { action: 'wait', minutes: -1, reason: '还没进对局' }
+    return {
+      action: 'wait',
+      minutes: -1,
+      reason: '还没进对局'
+    };
   }
   if (!isWatchableMode(gaming.gameType)) {
-    return { action: 'drop', minutes: -1, reason: `模式不支持（${gaming.mapName || '未知'}）` }
+    return {
+      action: 'drop',
+      minutes: -1,
+      reason: `模式不支持（${gaming.mapName || '未知'}）`
+    };
   }
-  const minutes = gamingMinutes(gaming)
-  if (minutes < 0) return { action: 'wait', minutes: -1, reason: '开局时刻算不出来' }
-  if (minutes < afterMin) return { action: 'wait', minutes, reason: `才 ${minutes} 分钟` }
-  return { action: 'hint', minutes, reason: '' }
+  const minutes = gamingMinutes(gaming);
+  if (minutes < 0) return {
+    action: 'wait',
+    minutes: -1,
+    reason: '开局时刻算不出来'
+  };
+  if (minutes < afterMin) return {
+    action: 'wait',
+    minutes,
+    reason: `才 ${minutes} 分钟`
+  };
+  return {
+    action: 'hint',
+    minutes,
+    reason: ''
+  };
 }
 
 /* ------------------------------------------------------------------ 上下线 */
 
 /** gameOnline 三态的展示名。实测只有这三个值，其它值按「在线」处理 */
-export const ONLINE_LABEL = { 0: '离线', 1: '在线', 2: '游戏中' }
+export const ONLINE_LABEL = {
+  0: '离线',
+  1: '在线',
+  2: '游戏中'
+};
 
 /**
  * 判断上下线是否发生了值得提醒的变化。
@@ -1154,28 +1642,26 @@ export const ONLINE_LABEL = { 0: '离线', 1: '在线', 2: '游戏中' }
  * @param {number|string|undefined} previous 上一轮记录的 gameOnline，首次订阅时为空
  * @returns {'online'|'offline'|''} 空串表示不用提醒
  */
-export function diffOnlineState (current, previous) {
+export function diffOnlineState(current, previous) {
   // 首次记录（订阅后第一轮）没有基准，只登记不提醒，否则一开启就收到一条
-  if (previous === undefined || previous === null || previous === '') return ''
-
-  const now = toInt(current)
-  const before = toInt(previous)
-
-  if (before === now) return ''
-  if (before === 0 && now !== 0) return 'online'
-  if (before !== 0 && now === 0) return 'offline'
+  if (previous === undefined || previous === null || previous === '') return '';
+  const now = toInt(current);
+  const before = toInt(previous);
+  if (before === now) return '';
+  if (before === 0 && now !== 0) return 'online';
+  if (before !== 0 && now === 0) return 'offline';
   // 1 <-> 2 的抖动，不提醒
-  return ''
+  return '';
 }
 
 /** 秒 -> 「2小时15分」/「45分钟」，用于在线时长 */
-export function formatOnlineDuration (seconds) {
-  const total = toInt(seconds)
-  if (total <= 0) return ''
-  const hours = Math.floor(total / 3600)
-  const mins = Math.floor((total % 3600) / 60)
-  if (hours > 0) return mins > 0 ? `${hours}小时${mins}分` : `${hours}小时`
-  return mins > 0 ? `${mins}分钟` : '不到1分钟'
+export function formatOnlineDuration(seconds) {
+  const total = toInt(seconds);
+  if (total <= 0) return '';
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor(total % 3600 / 60);
+  if (hours > 0) return mins > 0 ? `${hours}小时${mins}分` : `${hours}小时`;
+  return mins > 0 ? `${mins}分钟` : '不到1分钟';
 }
 
 /**
@@ -1183,7 +1669,7 @@ export function formatOnlineDuration (seconds) {
  * 实测账号 1630945798 明明是离线状态，onlineTime 却是四个月前的时间戳，
  * 直接拿来算时长会推出「本次在线 1427 小时」这种离谱文案。
  */
-const MAX_SESSION_SECONDS = 24 * 3600
+const MAX_SESSION_SECONDS = 24 * 3600;
 
 /**
  * 敲定「本次上线时刻」。
@@ -1198,15 +1684,13 @@ const MAX_SESSION_SECONDS = 24 * 3600
  * @param {boolean} [observed=false] 是否是我们亲眼看到的上线跨越
  * @returns {number} 上线时刻（秒）
  */
-export function resolveOnlineSince (onlineTime, nowSec, observed = false) {
-  const now = toInt(nowSec)
-  if (observed) return now
-
-  const started = toInt(onlineTime)
-  if (started <= 0 || started > now) return now
-  if (now - started > MAX_SESSION_SECONDS) return now
-
-  return started
+export function resolveOnlineSince(onlineTime, nowSec, observed = false) {
+  const now = toInt(nowSec);
+  if (observed) return now;
+  const started = toInt(onlineTime);
+  if (started <= 0 || started > now) return now;
+  if (now - started > MAX_SESSION_SECONDS) return now;
+  return started;
 }
 
 /**
@@ -1217,49 +1701,73 @@ export function resolveOnlineSince (onlineTime, nowSec, observed = false) {
  * @param {number|string} sinceTime 起始时间戳（秒），一般是本次上线时刻
  * @returns {{count:number, win:number, lose:number, scoreFrom:number, scoreTo:number,
  *            jobFrom:string, starFrom:number, jobNumFrom:number,
- *            jobTo:string, jobNumTo:number, starTo:number}}
- *   jobFrom/starFrom 与 jobTo/starTo 是本次在线前后的段位与星数，全娱乐模式（无排位场次）时 jobTo 为空
+ *            jobTo:string, jobNumTo:number, starTo:number, jobSwitchWin:number}}
+ *   jobFrom/starFrom 与 jobTo/starTo 是本次在线前后的段位与星数，全娱乐模式（无排位场次）时 jobTo 为空；
+ *   jobSwitchWin 是「编号变成终点编号那一局」的胜负（1 胜 / 2 负 / 0 取不到），
+ *   用来判升段还是掉段——只看首尾星数会被「升段后又赢几局」骗到
  */
-export function summarizeSession (list = [], sinceTime = 0) {
-  const since = toInt(sinceTime)
-  const played = since > 0
-    ? (Array.isArray(list) ? list : []).filter(item => toInt(item?.dtEventTime) >= since)
-    : []
-
-  const win = played.filter(item => item?.gameresult === 1).length
-  const lose = played.filter(item => item?.gameresult === 2).length
+export function summarizeSession(list = [], sinceTime = 0, prevSnapshot = null) {
+  const since = toInt(sinceTime);
+  const played = since > 0 ? (Array.isArray(list) ? list : []).filter(item => toInt(item?.dtEventTime) >= since) : [];
+  const win = played.filter(item => item?.gameresult === 1).length;
+  const lose = played.filter(item => item?.gameresult === 2).length;
 
   // 列表倒序：最后一项最早、第一项最新，巅峰分取这段区间的首尾
-  const withScore = played.filter(item => toInt(item?.newMasterMatchScore) > 0)
-  const earliest = withScore[withScore.length - 1]
-  const newest = withScore[0]
+  const withScore = played.filter(item => toInt(item?.newMasterMatchScore) > 0);
+  const earliest = withScore[withScore.length - 1];
+  const newest = withScore[0];
 
   // 段位星数：取本次期间最早/最新一场带段位的场次（排位局才有 roleJobName）。
   // 起点要用「最早一场之前那局」的快照才是本次开始前的星数；取不到（翻页翻没了）
   // 就退回最早一场打完后的星数，差值会少算第一局的变动，但比什么都不报强。
   // jobNumFrom/To 是 roleJob 小编号：两边相等时 starFrom→starTo 的差才可信
   // （旧体系段内星 0~5 循环，跨小段直接比星数会算出荒谬的差值）
-  const ranked = played.filter(item => String(item?.roleJobName || '').trim())
-  const firstRanked = ranked[ranked.length - 1]
-  const lastRanked = ranked[0]
-  let jobFrom = ''
-  let starFrom = 0
-  let jobNumFrom = 0
+  const ranked = played.filter(item => String(item?.roleJobName || '').trim());
+  const firstRanked = ranked[ranked.length - 1];
+  const lastRanked = ranked[0];
+  // 最新一局的名字也可能滞后（见 resolveBattleRankName），拿更早一场当判据
+  const listArr = Array.isArray(list) ? list : [];
+  const lastIdx = lastRanked ? listArr.findIndex(x => x === lastRanked) : -1;
+  const lastPrev = lastIdx >= 0 ? listArr[lastIdx + 1] : undefined;
+  let jobFrom = '';
+  let starFrom = 0;
+  let jobNumFrom = 0;
   if (firstRanked) {
-    const idx = (Array.isArray(list) ? list : []).findIndex(x => x === firstRanked)
-    const prev = idx >= 0 ? list[idx + 1] : undefined
+    const idx = (Array.isArray(list) ? list : []).findIndex(x => x === firstRanked);
+    const prev = idx >= 0 ? list[idx + 1] : undefined;
     // prev 可能是娱乐模式场次（无段位），那就没有可用的起点快照。
     // 判据只能是「有没有段位名」，不能拿 stars 真值判：**段内 0 星是真实值**
     // （实测 30 场里出现 2 次，1 星再输一局就是 0 星），用 `||` 兜会把它当成取不到，
     // 起点被顶成第一局打完后的星数，整段差值少算一颗
-    const snapshot = String(prev?.roleJobName || '').trim() ? prev : firstRanked
-    jobFrom = String(snapshot.roleJobName).trim()
-    starFrom = toInt(snapshot.stars)
+    // 起点快照优先用调用方给的「区间之前那一局」（collectBattles 会顺手带回来）：
+    // 群报/日报传进来的 list 已经按区间裁过，list[idx+1] 必然是 undefined，
+    // 不补这一条的话每个人第一局的星数变化都会漏算
+    const outside = String(prevSnapshot?.roleJobName || '').trim() ? prevSnapshot : null;
+    const snapshot = outside || (String(prev?.roleJobName || '').trim() ? prev : firstRanked);
+    jobFrom = String(snapshot.roleJobName).trim();
+    starFrom = toInt(snapshot.stars);
     // 回退到 firstRanked 时编号也要跟着取，漏了会让 jobNumFrom=0，
     // 下游「两边编号都有值才比编号」的判断短路，跨小段时直接相减算出 -4
-    jobNumFrom = toInt(snapshot.roleJob)
+    jobNumFrom = toInt(snapshot.roleJob);
   }
 
+  // 跨段方向：找窗口内「段位编号从起点变成终点」的那一局，用它的胜负判升降。
+  // 只比首尾星数会被「升段后又赢了几局、终点星数反而更大」骗到
+  // （2026-10-22 实测：星耀I 3星 → 王者 4星，被误报成「最强王者 → 至尊星耀V」掉段）
+  const endJobNum = toInt(lastRanked?.roleJob);
+  let jobSwitchWin = 0;
+  if (jobNumFrom && endJobNum && jobNumFrom !== endJobNum) {
+    let prevJob = 0;
+    for (let i = played.length - 1; i >= 0; i -= 1) {
+      const job = toInt(played[i]?.roleJob);
+      if (!job) continue;
+      if (prevJob && job !== prevJob && job === endJobNum) {
+        jobSwitchWin = toInt(played[i]?.gameresult);
+        break;
+      }
+      prevJob = job;
+    }
+  }
   return {
     count: played.length,
     win,
@@ -1269,10 +1777,11 @@ export function summarizeSession (list = [], sinceTime = 0) {
     jobFrom,
     starFrom,
     jobNumFrom,
-    jobTo: lastRanked ? String(lastRanked.roleJobName).trim() : '',
+    jobTo: lastRanked ? resolveBattleRankName(lastRanked, lastPrev) : '',
     jobNumTo: toInt(lastRanked?.roleJob),
-    starTo: toInt(lastRanked?.stars)
-  }
+    starTo: toInt(lastRanked?.stars),
+    jobSwitchWin
+  };
 }
 
 /**
@@ -1283,38 +1792,157 @@ export function summarizeSession (list = [], sinceTime = 0) {
  * 说明跨了小段（起止星数不可比）、编号下降可能是赛季重置而不是掉段。详见文件头第 3 点。
  *
  * @param {object} session summarizeSession 的返回（或同形状的对象）
- * @returns {{text:string, icon:string, tone:'up'|'down'|'flat'}|null} 没有可报的变化时返回 null
+ * @returns {{text:string, icon:string, tone:'up'|'down'|'flat', stars?:number}|null}
+ *   没有可报的变化时返回 null；stars 是净星数变化，只在同段可比时给出
  */
-export function formatStarChange (session = {}) {
-  const { jobFrom, jobTo, starFrom, starTo, jobNumFrom, jobNumTo } = session
+export function formatStarChange(session = {}) {
+  const {
+    jobFrom,
+    jobTo,
+    starFrom,
+    starTo,
+    jobNumFrom,
+    jobNumTo
+  } = session;
   // 判据用 jobFrom/jobTo 而不是星数大于 0：**0 星是真实值**，
   // 拿 starFrom > 0 当门槛会把「连输到 0 星收工」整行吞掉——那正是最该报的一次
-  if (!jobTo || !jobFrom) return null
-
+  if (!jobTo || !jobFrom) return null;
   if (jobFrom !== jobTo) {
-    return { text: `段位 ${jobFrom} → ${jobTo}（${starTo}星）`, icon: '📈', tone: 'up' }
+    // ⚠️⚠️ **必须比大段位层级，不能无条件写 `up`**（2026-10-06 修）。
+    //
+    // 段位名不同只说明「跨了大段」，**方向要另判**。原先这里把 `icon:'📈', tone:'up'`
+    // 写死，于是掉段也报「升」。真实归档全量复算（`BattleArchive.json` 22 个账号）：
+    //   daily 230 窗口 / 12 次段位变化 → 判错 2
+    //   weekly 230 / 47 → **判错 18**（全是掉大段）
+    //   monthly 230 / 75 → **判错 43**
+    // 样本：`绝世王者 → 永恒钻石II`（王者 → 钻石）输出「📈 段位 绝世王者 → 永恒钻石II」。
+    //
+    // 危害不止文案：`reportStore.js` 的 `pickProgress` 拿 `tone === 'up'` 当升段闸门，
+    // 群报的「升段之星」会**颁给掉段的人**（实测 2026-09 月报：`荣耀王者 → 至尊星耀III`
+    // 当选，真正升段的 `至尊星耀II → 最强王者` 落选）；模板按 tone 配色，
+    // 掉段还会渲染成金色喜报色。
+    const bandFrom = rankBand(jobFrom);
+    const bandTo = rankBand(jobTo);
+    if (bandTo > bandFrom) {
+      return {
+        text: `段位 ${jobFrom} → ${jobTo}（${starTo}星）`,
+        icon: '📈',
+        tone: 'up'
+      };
+    }
+    if (bandTo < bandFrom && bandTo > 0) {
+      return {
+        text: `段位 ${jobFrom} → ${jobTo}（${starTo}星）`,
+        icon: '📉',
+        tone: 'down'
+      };
+    }
+
+    // 两边层级相同（同名大段的不同写法，如「最强王者」→「荣耀王者」）或认不出来（band 0）：
+    // 方向无法判定，标 flat 让下游别把它当升段。宁可少报一次喜，不能把掉段报成升段
+    return {
+      text: `段位 ${jobFrom} → ${jobTo}（${starTo}星）`,
+      icon: '',
+      tone: 'flat'
+    };
   }
 
   // 同名段但 roleJob 小编号变了（旧体系 5 星一小段）：起止星数不可比，按编号报升降段。
-  // 编号下降不下结论——可能是掉段，也可能是期间跨了赛季重置（实测 26→16）
+  // 起点段位名靠 resolvePrevRankName 推（营地给的历史局名字恒等于终点名，见那个函数的说明）
   if (jobNumFrom && jobNumTo && jobNumFrom !== jobNumTo) {
-    return jobNumTo > jobNumFrom
-      ? { text: `${jobTo} ${starFrom} → ${starTo}星（升段）`, icon: '📈', tone: 'up' }
-      : { text: `${jobTo} ${starFrom} → ${starTo}星`, icon: '', tone: 'flat' }
-  }
+    // 方向优先看「跨段那一局的胜负」，不能只看首尾星数：
+    // 升段后继续赢几局，终点星数可能反而更大（实测 星耀I 3星 → 王者 4星，
+    // 被星数变大的判据误报成「最强王者 → 至尊星耀V」掉段）。
+    // jobSwitchWin 取不到（赛季重置/数据缺口）时才退回星数判据
+    const switchWin = toInt(session.jobSwitchWin);
+    const up = switchWin === 1 || switchWin === 0 && starTo < starFrom;
+    const down = switchWin === 2 || switchWin === 0 && starTo > starFrom;
 
+    // 升段：名字可能停在终点（已刷新）也可能停在起点（滞后），
+    // 靠 describeCrossBandNames 的端点形态补齐另一边
+    if (up) {
+      const cross = describeCrossBandNames(jobTo, jobNumFrom, jobNumTo, starTo);
+      if (cross) {
+        return {
+          text: `段位 ${cross.from} → ${cross.to}（${starTo}星）`,
+          icon: '📈',
+          tone: 'up'
+        };
+      }
+    }
+    // 掉段：名字可能停在起点（滞后）也可能停在终点（已刷新）
+    if (down) {
+      const cross = describeCrossBandDropNames(jobTo, jobNumFrom, jobNumTo, starTo);
+      if (cross) {
+        return {
+          text: `段位 ${cross.from} → ${cross.to}（${starTo}星）`,
+          icon: '📉',
+          tone: 'down'
+        };
+      }
+    }
+    const prevName = resolvePrevRankName(jobTo, jobNumFrom, jobNumTo);
+    // 推得出起点名就把两边写全（「至尊星耀II 3星 → 至尊星耀I 0星（升段）」），
+    // 推不出（跨大段/赛季重置）就退回旧的半截文案，只报当前段位
+    const full = tag => `${prevName} ${starFrom}星 → ${jobTo} ${starTo}星（${tag}）`;
+    if (up) {
+      return prevName ? {
+        text: full('升段'),
+        icon: '📈',
+        tone: 'up'
+      } : {
+        text: `${jobTo} ${starFrom} → ${starTo}星（升段）`,
+        icon: '📈',
+        tone: 'up'
+      };
+    }
+    // 正好掉一小段（编号差 -1、能推出起点名）才敢下「掉段」的结论。
+    // 掉得更多的不是掉段而是赛季重置（编号跳 7~12，实测 26→16 / 16→22），继续 flat 不下结论
+    if (down && prevName) {
+      return {
+        text: full('掉段'),
+        icon: '📉',
+        tone: 'down'
+      };
+    }
+    // 方向取不到时才用旧体系判据：编号变大表示升段
+    if (switchWin === 0 && jobNumTo > jobNumFrom) {
+      return prevName ? {
+        text: full('升段'),
+        icon: '📈',
+        tone: 'up'
+      } : {
+        text: `${jobTo} ${starFrom} → ${starTo}星（升段）`,
+        icon: '📈',
+        tone: 'up'
+      };
+    }
+    return {
+      text: `${jobTo} ${starFrom} → ${starTo}星`,
+      icon: '',
+      tone: 'flat'
+    };
+  }
   if (starTo !== starFrom) {
-    const diff = starTo - starFrom
+    const diff = starTo - starFrom;
     return {
       text: `${jobTo} ${starFrom} → ${starTo}星（${diff > 0 ? `上了${diff}` : `掉了${-diff}`}星）`,
       icon: diff > 0 ? '📈' : '📉',
-      tone: diff > 0 ? 'up' : 'down'
-    }
+      tone: diff > 0 ? 'up' : 'down',
+      // 净星数变化，供周报「上分之王」按一颗星 = 10 巅峰分折算。
+      // 只有走到这里（同名段同 jobNum）星数差才可比，其它分支不给这个字段
+      stars: diff
+    };
   }
 
   // 净变化为 0（赢几局又输几局、或全程保星）也要给个说法：一行都不显示会和
   // 「取不到数据」长得一模一样，而这条推送的意义就是「今晚上了还是掉了」
-  return { text: `${jobTo} ${starTo}星（星数没变）`, icon: '⭐', tone: 'flat' }
+  return {
+    text: `${jobTo} ${starTo}星（星数没变）`,
+    icon: '⭐',
+    tone: 'flat',
+    stars: 0
+  };
 }
 
 /**
@@ -1322,17 +1950,16 @@ export function formatStarChange (session = {}) {
  * 排位赛场次也会带上当前巅峰分，只是前后相等（详见文件头第 2 点）。
  * @returns {{text:string, icon:string, tone:'up'|'down'}|null}
  */
-export function formatScoreDelta (session = {}) {
-  const from = toInt(session.scoreFrom)
-  const to = toInt(session.scoreTo)
-  if (from <= 0 || to <= 0 || from === to) return null
-
-  const diff = to - from
+export function formatScoreDelta(session = {}) {
+  const from = toInt(session.scoreFrom);
+  const to = toInt(session.scoreTo);
+  if (from <= 0 || to <= 0 || from === to) return null;
+  const diff = to - from;
   return {
     text: `巅峰分 ${from} → ${to} (${diff > 0 ? '+' : ''}${diff})`,
     icon: diff > 0 ? '📈' : '📉',
     tone: diff > 0 ? 'up' : 'down'
-  }
+  };
 }
 
 /**
@@ -1351,32 +1978,31 @@ export function formatScoreDelta (session = {}) {
  * @param {number} [opts.durationSec] 本次在线秒数，0 表示算不出来、不显示
  * @param {object} [opts.session] summarizeSession 的返回，只在下线时用
  */
-export function formatOnlineText (kind, { name = '', gameOnline = 0, durationSec = 0, session = null } = {}) {
-  const who = name ? `${normalizeName(name)} · ` : ''
-
+export function formatOnlineText(kind, {
+  name = '',
+  gameOnline = 0,
+  durationSec = 0,
+  session = null
+} = {}) {
+  const who = name ? `${normalizeName(name)} · ` : '';
   if (kind === 'online') {
-    return `🟢 ${who}王者已上线${toInt(gameOnline) === 2 ? ' · 已进游戏' : ''}`
+    return `🟢 ${who}王者已上线${toInt(gameOnline) === 2 ? ' · 已进游戏' : ''}`;
   }
-
-  const lines = [`⚫ ${who}王者已下线`]
-
-  const duration = formatOnlineDuration(durationSec)
-  if (duration) lines[0] += ` · 本次在线 ${duration}`
-
+  const lines = [`⚫ ${who}王者已下线`];
+  const duration = formatOnlineDuration(durationSec);
+  if (duration) lines[0] += ` · 本次在线 ${duration}`;
   if (session?.count > 0) {
-    lines.push(`🎮 打了 ${session.count} 局 · ${session.win}胜${session.lose}负`)
+    lines.push(`🎮 打了 ${session.count} 局 · ${session.win}胜${session.lose}负`);
 
     // 段位星数与巅峰分变化，判据见 formatStarChange / formatScoreDelta（日报周报共用同一套）
-    const star = formatStarChange(session)
-    if (star) lines.push(`${star.icon} ${star.text}`.trim())
-
-    const score = formatScoreDelta(session)
-    if (score) lines.push(`${score.icon} ${score.text}`)
+    const star = formatStarChange(session);
+    if (star) lines.push(`${star.icon} ${star.text}`.trim());
+    const score = formatScoreDelta(session);
+    if (score) lines.push(`${score.icon} ${score.text}`);
   } else if (duration) {
-    lines.push('🎮 本次没有排位/巅峰战绩')
+    lines.push('🎮 本次没有排位/巅峰战绩');
   }
-
-  return lines.join('\n')
+  return lines.join('\n');
 }
 
 /* ------------------------------------------------------------------ 轮询节流 */
@@ -1399,9 +2025,9 @@ export function formatOnlineText (kind, { name = '', gameOnline = 0, durationSec
  * @param {object|null} state fetchOnlineState 的返回（已排除 FETCH_HIDDEN）
  * @returns {boolean} false = 这一轮没有可用的在线信号，按「没拉到 profile」处理
  */
-export function hasOnlineSignal (state) {
-  if (!state) return false
-  return toInt(state.gameOnline) !== 0 || toInt(state.onlineTime) > 0 || toInt(state.offlineTime) > 0
+export function hasOnlineSignal(state) {
+  if (!state) return false;
+  return toInt(state.gameOnline) !== 0 || toInt(state.onlineTime) > 0 || toInt(state.offlineTime) > 0;
 }
 
 /**
@@ -1425,23 +2051,24 @@ export function hasOnlineSignal (state) {
  * @param {object} opts.sub 订阅项，读 lastOnlineState 判「是不是刚下线那一轮」
  * @returns {boolean}
  */
-export function needBattleList ({ battleOn, onlineOn, state, sub = {} } = {}) {
+export function needBattleList({
+  battleOn,
+  onlineOn,
+  state,
+  sub = {}
+} = {}) {
   // 没有 profile 信号可用：只能靠战绩列表本身
-  if (!onlineOn || !hasOnlineSignal(state)) return battleOn
-
-  const online = toInt(state.gameOnline) !== 0
+  if (!onlineOn || !hasOnlineSignal(state)) return battleOn;
+  const online = toInt(state.gameOnline) !== 0;
   // 「游戏中」单独拎出来：只采集不播报的号靠它决定要不要补拉一次战绩列表。
   // 不能把 online 直接改成「含 2」——justWentOffline 复用了 online，一改「刚下线」就失灵
-  const playing = toInt(state.gameOnline) === 2
-  const wasOnline = sub.lastOnlineState !== undefined &&
-    sub.lastOnlineState !== null &&
-    String(sub.lastOnlineState) !== '' &&
-    String(sub.lastOnlineState) !== '0'
-  const justWentOffline = !online && wasOnline
+  const playing = toInt(state.gameOnline) === 2;
+  const wasOnline = sub.lastOnlineState !== undefined && sub.lastOnlineState !== null && String(sub.lastOnlineState) !== '' && String(sub.lastOnlineState) !== '0';
+  const justWentOffline = !online && wasOnline;
 
   // 只采集不播报的号在「游戏中」时也要拉一次：英雄只在战绩列表里，
   // 不拉的话 #谁在打游戏 会出现「正在对局却没有英雄」的空行
-  return battleOn ? (online || justWentOffline) : (justWentOffline || playing)
+  return battleOn ? online || justWentOffline : justWentOffline || playing;
 }
 
 /**
@@ -1459,17 +2086,14 @@ export function needBattleList ({ battleOn, onlineOn, state, sub = {} } = {}) {
  * @param {number} nowSec 当前时间戳（秒）
  * @returns {boolean}
  */
-export function isSubActive (state, data, nowSec) {
+export function isSubActive(state, data, nowSec) {
   // 三个字段全 0 的号不能当「确定离线」，否则它会一路退避到封顶，越查越少
-  if (hasOnlineSignal(state)) return toInt(state.gameOnline) !== 0
-
-  if (!data) return false
-  if (data.isGaming) return true
-
-  const latest = toInt((data.list || [])[0]?.dtEventTime)
-  if (latest <= 0) return false
-
-  return toInt(nowSec) - latest <= RECENT_BATTLE_WINDOW
+  if (hasOnlineSignal(state)) return toInt(state.gameOnline) !== 0;
+  if (!data) return false;
+  if (data.isGaming) return true;
+  const latest = toInt((data.list || [])[0]?.dtEventTime);
+  if (latest <= 0) return false;
+  return toInt(nowSec) - latest <= RECENT_BATTLE_WINDOW;
 }
 
 /**
@@ -1485,22 +2109,30 @@ export function isSubActive (state, data, nowSec) {
  * @param {number} [opts.maxMultiplier] 封顶倍数，1 = 关闭自适应（全程按 cron）
  * @returns {{skipTicks:number, idleSince:string}}
  */
-export function resolveNextCheck (sub, { active, nowMs, maxMultiplier = DEFAULT_IDLE_BACKOFF_MAX } = {}) {
-  const now = toInt(nowMs)
+export function resolveNextCheck(sub, {
+  active,
+  nowMs,
+  maxMultiplier = DEFAULT_IDLE_BACKOFF_MAX
+} = {}) {
+  const now = toInt(nowMs);
   // 封顶至少是 1（每轮都查），配置里填 0 或负数不该让轮询彻底停摆
-  const cap = Math.max(1, toInt(maxMultiplier) || DEFAULT_IDLE_BACKOFF_MAX)
-
-  if (active) return { skipTicks: 0, idleSince: '' }
+  const cap = Math.max(1, toInt(maxMultiplier) || DEFAULT_IDLE_BACKOFF_MAX);
+  if (active) return {
+    skipTicks: 0,
+    idleSince: ''
+  };
 
   // 第一次判定为不活跃：从现在开始计时，本轮之后先按最短那档退避
-  const idleSince = toInt(sub?.idleSince) > 0 ? toInt(sub.idleSince) : now
-  const idleFor = Math.max(0, now - idleSince)
-
-  const step = IDLE_BACKOFF_STEPS.find(item => idleFor >= item.afterMs)
-  const multiplier = Math.min(step?.multiplier ?? cap, cap)
+  const idleSince = toInt(sub?.idleSince) > 0 ? toInt(sub.idleSince) : now;
+  const idleFor = Math.max(0, now - idleSince);
+  const step = IDLE_BACKOFF_STEPS.find(item => idleFor >= item.afterMs);
+  const multiplier = Math.min(step?.multiplier ?? cap, cap);
 
   // multiplier 倍间隔 = 查一轮 + 跳过 (multiplier - 1) 轮
-  return { skipTicks: Math.max(0, multiplier - 1), idleSince: String(idleSince) }
+  return {
+    skipTicks: Math.max(0, multiplier - 1),
+    idleSince: String(idleSince)
+  };
 }
 
 /* ------------------------------------------------------------ 观测快照 */
@@ -1517,12 +2149,12 @@ export function resolveNextCheck (sub, { active, nowMs, maxMultiplier = DEFAULT_
  * @param {number} nowMs 观测时刻
  * @param {object} prev 上一轮的订阅项，用来判「刚打完」和「是不是还在打同一局」
  */
-function observeSnapshot (state, data, nowMs, prev = {}) {
-  if (!state && !data) return {}
-
-  const patch = { lastSeenAt: String(nowMs) }
-
-  if (state) patch.lastOnlineState = String(state.gameOnline)
+function observeSnapshot(state, data, nowMs, prev = {}) {
+  if (!state && !data) return {};
+  const patch = {
+    lastSeenAt: String(nowMs)
+  };
+  if (state) patch.lastOnlineState = String(state.gameOnline);
 
   // 游戏昵称（营地 roleName）不在这里写，由调用方单独并进来 —— 原因见 collectSnapshot
   // 里 roleNameFromState 的声明：state 可能因为「营地问不出在线状态」被判成无效整个丢弃，
@@ -1535,14 +2167,28 @@ function observeSnapshot (state, data, nowMs, prev = {}) {
   // 而 gameOnline===2 只代表「客户端开着」（大厅、匹配中、翻战绩都算 2，见
   // pushStore.fetchOnlineState 的三态注释）。两路判据必须同源，否则图上出现空行。
   // 只采集的号在「游戏中」时也会补拉一次战绩列表（见 needBattleList），英雄才有来源。
-  const gaming = data ? Boolean(data.isGaming) : false
-  const prevGaming = String(prev?.lastGaming || '') === '1'
+  const gaming = data ? Boolean(data.isGaming) : false;
+  const prevGaming = String(prev?.lastGaming || '') === '1';
 
-  patch.lastGaming = gaming ? '1' : ''
-  patch.lastGamingHero = gaming ? String(data?.gaming?.heroId || '') : ''
+  // ⚠️⚠️ `data` 为 null 有**两种截然不同**的原因，只有其中一种能断言「他不在对局」：
+  //      (a) needBattleList 判否 —— 这轮压根没拉列表 → 玩家确实不在对局，清空是对的；
+  //      (b) 拉了但失败 —— fetchLatest 返回 null（异常码 / 抛错 / 全池频控冷却）
+  //          或 FETCH_HIDDEN → 什么都没观测到，**必须保留上一轮的值**。
+  //    原先这里无条件写空，于是频控/抖动那一轮会被当成「他不在对局」落盘，两个下游立刻误判：
+  //      · apps/whoIsPlaying.js 把他从「正在对局」组挪进「在线」组，英雄格一起变空；
+  //      · apps/gameRecordPush.js 的 hintTick 挑不到他（`lastGaming === '1'` 不成立），
+  //        **开播提示漏发**，失败持续到这一局结束就彻底没了。
+  //    下面的 lastGameEndAt 早就加了 `data &&` 守卫，这里属于同源疏漏（2026-10-06 补）。
+  //    gameOnline 只用来决定「能不能下结论」，不用来判定「在对局」——判定仍只信 isGaming，
+  //    免得又回到「正在对局却没有英雄」那条老路。
+  const canJudgeIdle = Boolean(data) || toInt(state?.gameOnline) !== 2;
+  if (canJudgeIdle) {
+    patch.lastGaming = gaming ? '1' : '';
+    patch.lastGamingHero = gaming ? String(data?.gaming?.heroId || '') : '';
+  }
   // 营地给了 isGaming 却没给 heroId：没见过的组合，留一条痕迹方便回查，但不影响出图
   if (gaming && !data?.gaming?.heroId) {
-    logger.debug(`[王者推送] ${prev.campId || ''} isGaming=true 但没给 heroId，本轮英雄留空`)
+    logger.debug(`[王者推送] ${prev.campId || ''} isGaming=true 但没给 heroId，本轮英雄留空`);
   }
 
   // 「刚打完」：#谁在打游戏 要显示「X 分钟前刚结束」。
@@ -1553,31 +2199,45 @@ function observeSnapshot (state, data, nowMs, prev = {}) {
   // gaming 恒为 false（上面已收窄），不设防的话一次请求失败/频控就会被当成
   // 「刚打完」，凭空冒出一条「刚刚结束」。存量里那些 lastGaming='1' 的老快照
   // 也会在第一次读到时误入「刚打完」组，这条守卫把过渡期这一下挡掉。
-  if (data && prevGaming && !gaming) patch.lastGameEndAt = String(nowMs)
-  else if (!prevGaming && gaming) patch.lastGameEndAt = ''
-  else if (gaming) patch.lastGameEndAt = ''
+  if (data && prevGaming && !gaming) patch.lastGameEndAt = String(nowMs);else if (!prevGaming && gaming) patch.lastGameEndAt = '';else if (gaming) patch.lastGameEndAt = '';
 
   // 同一局的开始时刻：dtEventTime 一局之内恒定，是「一局」的唯一标识。
-  // 只在开局那一轮（或换了局的轮次）写，避免退避轮拿旧时间戳反复刷新。
-  const start = gaming ? String(data?.gaming?.dtEventTime || '') : ''
+  //
+  // ⚠️⚠️ **只写 `lastGamingStartSnap`，绝不写 `lastGamingStart`**（2026-10-06 修）。
+  //    `lastGamingStart` 是**战绩推送的游标**（`checkBattle` 的 `needGaming` 拿它判
+  //    「这一局提醒过没有」，只在**发送成功**后推进 —— 见那里的注释
+  //    「发送失败时一个游标都不动，下一轮整条消息重试」）。
+  //    而本函数是**纯观测**，两条路（常驻轮询 + `#谁在打游戏` 现刷）共用，
+  //    原先在这里无条件推进游标，等于把「发送失败不推进」这条规矩从背后捅穿：
+  //
+  //      连打排位时「上一局已结算 + 下一局已开局」会在**同一轮**读到
+  //      （checkBattle 的注释自己说明这「几乎总是发生」），此时若 `send` 失败：
+  //        · checkBattle 正确地一个游标都不写
+  //        · 但收尾 `mergeSubState(qq, {...patch})` 把本函数算好的游标合并进去了
+  //        · 下一轮 `pickNewBattles` 见到 `lastGameSeq` 已相等 → 直接短路
+  //        · **那一局战绩永久丢失**，且开局提醒（比的是同一个字段）一起被吞
+  //      实测复现：第 N 轮 `pickNewBattles → [1001]`（正确），
+  //      收尾合并后第 N+1 轮 `→ []`，B1 再也不出现。
+  //
+  //    拆成独立字段后两边各归各的：推送游标由 checkBattle 独占，
+  //    展示/盯梢用 `lastGamingStartSnap`（由本函数每轮照常刷新）。
+  //    `lastGameSeq` 在快照里**干脆不写** —— 没有任何展示方读它，写了只有害处。
+  const start = gaming ? String(data?.gaming?.dtEventTime || '') : '';
   if (startingNewGame(start, prev)) {
-    patch.lastGamingStart = start
-    // 换局就把「已经打了多久」的起点也一起换掉，否则会显示成上一局的时长
-    patch.lastGameSeq = String(data?.list?.[0]?.gameSeq || '')
+    patch.lastGamingStartSnap = start;
   }
 
   // 段位顺手记一份：#谁在打游戏 要显示段位徽章，而它自己不发请求。
   // 战绩列表第一场带 roleJobName/stars；只有 profile 时没有这两个字段，保留旧值。
   if (data) {
-    const latest = (data.list || [])[0] || {}
-    if (latest.roleJobName) patch.roleJobName = String(latest.roleJobName)
+    const latest = (data.list || [])[0] || {};
+    if (latest.roleJobName) patch.roleJobName = String(latest.roleJobName);
     // stars 是「这局之后的星数」，0 是真实值（1 星再输一局），不能用 || 兜底
     if (latest.stars !== undefined && latest.stars !== null && latest.stars !== '') {
-      patch.stars = String(latest.stars)
+      patch.stars = String(latest.stars);
     }
   }
-
-  return patch
+  return patch;
 }
 
 /**
@@ -1586,14 +2246,18 @@ function observeSnapshot (state, data, nowMs, prev = {}) {
  * `dtEventTime` 一局之内恒定，所以它变了就是新的一局；从没记过（历史订阅没这个字段）
  * 也算新的一局，好让第一轮就把起点写上。
  *
+ * ⚠️ 比的是 `lastGamingStartSnap`（**快照专用**字段），不是推送游标 `lastGamingStart` ——
+ *    两者语义不同，见 observeSnapshot 里的说明。历史订阅项两个都没有时也算新局，
+ *    会自然地把 `lastGamingStartSnap` 补上。
+ *
  * @param {string} start 本轮拿到的一局开始时刻（不在对局时是空串）
  * @param {object} prev 上一轮的订阅项
  * @returns {boolean}
  */
-function startingNewGame (start, prev) {
-  if (!start) return false
-  // prev.lastGamingStart 可能是数字（早期写法）或字符串，统一成字符串比
-  return String(prev?.lastGamingStart ?? '') !== start
+function startingNewGame(start, prev) {
+  if (!start) return false;
+  // 可能是数字（早期写法）或字符串，统一成字符串比
+  return String(prev?.lastGamingStartSnap ?? '') !== start;
 }
 
 /**
@@ -1619,23 +2283,31 @@ function startingNewGame (start, prev) {
  * @returns {Promise<{state: object|null, data: object|null, patch: object}>}
  *   state / data 为 null 表示这一轮没拿到；两个都空时 patch 也是空的
  */
-export async function collectSnapshot (qq, campId, sub, nowMs = Date.now(), { snapshot = false } = {}) {
-  const battleOn = sub?.battle !== false
-  const onlineOn = sub?.online === true
+export async function collectSnapshot(qq, campId, sub, nowMs = Date.now(), {
+  snapshot = false
+} = {}) {
+  const battleOn = sub?.battle !== false;
+  const onlineOn = sub?.online === true;
   // 要不要采在线状态快照。两个来源：
   //   ① 开了上下线提醒（online）—— 它本来就要拉 profile，顺手记一份不额外发请求
   //   ② 调用方显式要求（`#谁在打游戏` 的现刷，见 opts.snapshot）
-  const snapshotOn = onlineOn || snapshot === true
-
-  let state = null
-  let onlineSignalMissing = false
+  const snapshotOn = onlineOn || snapshot === true;
+  let state = null;
+  let onlineSignalMissing = false;
+  /**
+   * 营地**明确**说这个号取不到数据（-10107 隐藏主页 / -30032 用户不存在）。
+   * ⚠️ 和「这轮请求失败」是两回事：前者重试一万次也一样，必须让上层知道。
+   */
+  let unavailable = false;
   // 本轮 profile 拿到的游戏昵称，独立于 state 存活：营地可能不给在线状态，
   // 但昵称照样给（见下面的分支），所以不能挂在 state 上一起被丢弃
-  let roleNameFromState = ''
-
+  let roleNameFromState = '';
   if (snapshotOn) {
-    state = await fetchOnlineState(campId, qq)
-    if (state === FETCH_HIDDEN) state = null
+    state = await fetchOnlineState(campId, qq);
+    if (state === FETCH_HIDDEN) {
+      unavailable = true;
+      state = null;
+    }
     // 营地只关了「在线状态」授权的号，三个字段全给 0（判据见 hasOnlineSignal）。
     // 这不是离线而是「没告诉你」，当成没拿到，调用方就不会拿它报上下线、
     // observeSnapshot 也不会把 lastOnlineState 记成 0；战绩那一路照旧走
@@ -1645,35 +2317,70 @@ export async function collectSnapshot (qq, campId, sub, nowMs = Date.now(), { sn
     // 两个独立的字段，营地关掉前者不代表不给后者（实测这几个号都拿得到昵称）。
     // 早先直接把 state 整个置 null，昵称就跟着被扔了，出图上全是空名字。
     if (state && !hasOnlineSignal(state)) {
-      logger.debug(`[王者推送] ${qq} 营地未返回在线状态（三字段全 0），本轮只按战绩列表处理`)
-      roleNameFromState = state.roleName ? String(state.roleName) : ''
-      state = null
-      onlineSignalMissing = true
+      logger.debug(`[王者推送] ${qq} 营地未返回在线状态（三字段全 0），本轮只按战绩列表处理`);
+      roleNameFromState = state.roleName ? String(state.roleName) : '';
+      state = null;
+      onlineSignalMissing = true;
     } else if (state?.roleName) {
-      roleNameFromState = String(state.roleName)
+      roleNameFromState = String(state.roleName);
     }
   }
 
   // 战绩列表这一轮拉不拉，判据见 needBattleList
   // 注意传的是 battleOn 而不是 snapshotOn：只采集时不拉战绩列表，
   // profile 里的 gameOnline 已经够填快照了，省下的请求量正好抵掉扩量的开销
-  let data = null
-  if (needBattleList({ battleOn, onlineOn: snapshotOn, state, sub })) {
+  let data = null;
+  /**
+   * ⚠️⚠️ 「营地明确说这个号取不到」和「这轮请求失败」必须分开（2026-10-05 修）。
+   *
+   * 原来两条路都只写 `data = null`，上层完全分不出：
+   *   · 临时失败（网络抖动 / 频控）→ 下一轮重试就好
+   *   · 营地明确回 -10107 / -30032 → **重试一万次也一样**，该标注、该让用户知道
+   * 于是主人那个被隐藏的营地号：每轮都发请求、每轮都失败、订阅表里
+   * `lastSeenAt` 一动不动，而**任何地方都说不出为什么**（他 20 小时没收到推送）。
+   *
+   * 所以这里把 -10107/-30032 归一成 `unavailable` 带出去，让上层写进订阅项、
+   * 进日志、能被指令查到。
+   */
+  let fetched = null;
+  if (needBattleList({
+    battleOn,
+    onlineOn: snapshotOn,
+    state,
+    sub
+  })) {
     // profile 刚打过，两个端点的请求别贴在一起
-    if (snapshotOn) await sleep(REQUEST_INTERVAL)
-    data = await fetchLatest(campId, qq)
-    if (data === FETCH_HIDDEN) data = null
+    if (snapshotOn) await sleep(REQUEST_INTERVAL);
+    fetched = await fetchLatest(campId, qq);
+    if (fetched === FETCH_HIDDEN) {
+      unavailable = true;
+      fetched = null;
+    }
+    data = fetched;
   }
-
   const patch = {
     ...observeSnapshot(state, data, nowMs, sub),
     // 游戏昵称单独并进来，理由见 roleNameFromState 的声明：它不从 state 走，
     // 因为 state 可能被判成「没在线信号」而整个丢掉
-    ...(roleNameFromState ? { roleName: roleNameFromState } : {}),
+    ...(roleNameFromState ? {
+      roleName: roleNameFromState
+    } : {}),
     // 营地这轮没给在线状态：把可能留着的旧值清成空串，让 #谁在打游戏 归到
     // 「还没采集到状态」而不是谎报离线（空串和真的 '0' 语义不同）
-    ...(onlineSignalMissing ? { lastOnlineState: '' } : {})
-  }
-
-  return { state, data, patch }
+    ...(onlineSignalMissing ? {
+      lastOnlineState: ''
+    } : {}),
+    // ⭐ 把「营地明确说这个号取不到」写进订阅项 —— 这是主人排查
+    //    「我的推送怎么没了」时唯一能看到的东西
+    ...(unavailable ? {
+      lastUnavailableAt: String(nowMs),
+      lastUnavailableReason: `营地号 ${campId} 取不到数据（隐藏主页/用户不存在）`
+    } : {})
+  };
+  return {
+    state,
+    data,
+    patch,
+    unavailable
+  };
 }

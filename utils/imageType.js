@@ -17,10 +17,10 @@
  * 「文件」—— 群里收到的是 `xxx.webp` 文件卡片，不是图片。
  * 所以默认取最保险的 jpeg，想要小体积的自己按平台改。
  */
-import { Config } from '#components'
+import { Config } from '#components';
 
 /** 出图后端认的取值（见 renderers 下各后端 lib 里的 screenshot 实现） */
-const VALID = ['jpeg', 'png', 'webp']
+const VALID = ['jpeg', 'png', 'webp'];
 
 /**
  * 读配置拿出图格式。值非法 / 读不到配置一律退回 jpeg —— 出图路径上
@@ -28,13 +28,13 @@ const VALID = ['jpeg', 'png', 'webp']
  *
  * @returns {'jpeg'|'png'|'webp'}
  */
-export function getImgType () {
+export function getImgType() {
   try {
-    const raw = String(Config.getDefOrConfig('config')?.imgType ?? '').trim().toLowerCase()
+    const raw = String(Config.getDefOrConfig('config')?.imgType ?? '').trim().toLowerCase();
     // 后端只认 jpeg，顺手把 jpg 这种常见写法归一化掉
-    if (raw === 'jpg') return 'jpeg'
-    return VALID.includes(raw) ? raw : 'jpeg'
+    if (raw === 'jpg') return 'jpeg';
+    return VALID.includes(raw) ? raw : 'jpeg';
   } catch {
-    return 'jpeg'
+    return 'jpeg';
   }
 }

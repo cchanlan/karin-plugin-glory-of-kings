@@ -1,16 +1,15 @@
-import path from 'path'
-import { fileURLToPath } from 'url'
-const Path = process.cwd()
-const PluginName = 'GloryOfKings-Plugin'
-// 插件根目录按本文件位置反推（components/ 的上一级），不跟 process.cwd() 走：
-// 拿 cwd 拼的话，只要有脚本不在 Yunzai 根目录下 import 本模块（调试脚本等），
-// Config 的初始化就会在那个 cwd 底下凭空造一份 plugins/GloryOfKings-Plugin/config/，
-// 用户数据（data/ 下的 user_settings、UserData.yaml 等）也会写错地方
-const PluginPath = path.resolve(fileURLToPath(import.meta.url), '../..')
-const PluginData = path.join(PluginPath, 'data')
-export {
-  Path,
-  PluginPath,
-  PluginData,
-  PluginName
-}
+// 已在 Linux 的 Node 18/24、Karin 1.17/1.18 实测；Windows 使用官方路径 API，尚未实跑。
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { karinPathBase, karinPathRoot, karinPathTemp } from 'node-karin/root';
+const Path = karinPathRoot;
+const PluginName = 'karin-plugin-glory-of-kings';
+const PluginPath = path.resolve(fileURLToPath(import.meta.url), '../..');
+const PluginState = path.join(karinPathBase, PluginName);
+const PluginConfig = path.join(PluginState, 'config');
+const PluginData = path.join(PluginState, 'data');
+const PluginResource = path.join(PluginState, 'resources');
+const PluginTemp = path.join(karinPathTemp, PluginName);
+const ResourcePath = path.join(PluginPath, 'resources');
+const ResourceUrl = pathToFileURL(ResourcePath + path.sep).href;
+export { Path, PluginName, PluginPath, PluginState, PluginConfig, PluginData, PluginResource, PluginTemp, ResourcePath, ResourceUrl };

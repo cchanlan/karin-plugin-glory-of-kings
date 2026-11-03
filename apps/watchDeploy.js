@@ -1,3 +1,5 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { Plugin, logger } from "node-karin";
 /**
  * 营地观战服务端的**一键部署**：#营地观战接入 / #营地观战部署 / #营地观战服务。
  *
@@ -23,34 +25,55 @@
  * 代码在 `<插件>/server/` —— **两者不重叠**。加上解压时还有一道 exclude，
  * 怎么更新都碰不到数据。
  */
-import fs from 'node:fs'
-import path from 'node:path'
-import { PluginPath, PluginName, Config } from '#components'
-import { shouldQuote } from '#utils'
-import { pm2, pm2Proc, resetPm2Cache, isOurProcess } from '../utils/pm2.js'
-import {
-  installPackage, fetchPackageMeta, probeStatus, waitStatus, fmtUptime,
-  normalizeBase, STATE_FILE
-} from '../utils/deploy.js'
-import { ensureDependencies } from '../utils/dependency.js'
-import { probeRemoteStatus, reportRemoteAccounts } from '../utils/remoteAccounts.js'
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { PluginPath, PluginName, PluginState, Path, Config } from '#components';
+import { shouldQuote } from '#utils';
+import { pm2, pm2Proc, resetPm2Cache, isOurProcess, pm2ForeignProc, launcherInfo } from '../utils/pm2.js';
+import { installPackage, fetchPackageMeta, probeStatus, probeControlPort, waitControlPort, fmtUptime, normalizeBase, STATE_FILE } from '../utils/deploy.js';
+import { ensureDependencies } from '../utils/dependency.js';
+import { probeRemoteStatus, probeControl, reportRemoteAccounts } from '../utils/remoteAccounts.js';
+import { fillDefaultShareUrl, migrateLegacyShareToken } from '../utils/shareDefaults.js';
 
 /** 云崽根目录（插件住在 `<根>/plugins/<名字>`，往上两级）—— 只为把路径显示得短一点 */
-const YunzaiRoot = path.resolve(PluginPath, '../..')
+const YunzaiRoot = Path;
 
 /** 服务端代码解到这里（在插件目录里，被 .gitignore 挡着，不跟插件本体一起提交） */
-const SERVER_DIR = path.join(PluginPath, 'server')
-const ENTRY_FILE = path.join(SERVER_DIR, 'watch-server.js')
+const SERVER_DIR = path.join(PluginState, 'server');
+const ENTRY_FILE = path.join(SERVER_DIR, 'watch-server.js');
 
 /** 分发服务上的包名（对应 `watch-server` 分支） */
-const PKG_NAME = 'watch'
+const PKG_NAME = 'watch';
+const PROC_NAME = 'gok-watch';
+/**
+ * 配置里抠不到端口时的回退。默认 8899 —— 2026-10-06 起服务端在
+ * SINGLE_PORT 模式下**播放面也受理 /api/***`、`#营地观战连接 指 8899` 就能用，
+ * 不再区分播放面/控制面。控制面 8898 仍在监听（本机回环，备用），
+ * 老配置里写着 8898 的也能继续用（healApiUrl 不会反向纠正）。
+ */
+const DEFAULT_PORT = 8899;
+/** 播放面端口的历史常量。SINGLE_PORT 起插件就指这个，不再需要单独区分 */
+const PLAYBACK_PORT = 8899;
 
-const PROC_NAME = 'gok-watch'
-const DEFAULT_PORT = 8899
-
-function watchEnv () {
-  const url = String(cfg().watchCdnHttps || '').trim().replace(/\/+$/, '')
-  return { GOK_WATCH_CDN_HTTPS: url }
+/**
+ * 起服务端时注入的环境变量（2026-10-06 主人拍板）。
+ *
+ * **GOK_WATCH_SINGLE_PORT=1 默认开**：播放面（公网 8899）同时受理 /api/*，
+ * 别人 `#营地观战连接 指 8899` 就能用，不用再让对方专门开控制面。
+ * 设了 GOK_WATCH_TOKEN 时播放面仍放行，只是控制面（8898 本机回环）那层要口令。
+ * /rec DELETE 中间档：真控制面永远过；播放面 + 无口令 → 403；播放面 + 有口令 → 过。
+ *
+ * ⚠️ 控制面端口**不主动注入**：SINGLE_PORT 开的时候，8898 只在服务端自己机器上听
+ *    回环就够了，不需要对外。如果配置里写了自定义 GOK_WATCH_CTRL_PORT，由用户在
+ *    pm2 里手动注入（罕见场景，不再包办）。
+ */
+function watchEnv() {
+  const url = String(cfg().watchCdnHttps || '').trim().replace(/\/+$/, '');
+  return {
+    GOK_WATCH_CDN_HTTPS: url,
+    GOK_WATCH_SINGLE_PORT: '1'
+  };
 }
 
 /**
@@ -59,9 +82,7 @@ function watchEnv () {
  * ⚠️ 把**锅巴那条路也写上**：群里发指令要带地址和令牌，令牌是凭证、贴群里就泄了；
  * 而锅巴是网页表单，填进去更稳妥。两条路等价，写全了对方才知道可以不发指令。
  */
-const GROUP_HINT =
-  '进群 972915804 找主人要部署地址和令牌，然后发 #营地观战接入 <地址> <令牌>；' +
-  '也可以在锅巴「王者荣耀 → 服务端接入」里填「分发服务地址」和「接入令牌」，一样能接入'
+const GROUP_HINT = '进群 972915804 找主人要部署地址和令牌，然后发 #营地观战接入 <地址> <令牌>；' + '也可以在锅巴「王者荣耀 → 服务端接入」里填「分发服务地址」和「接入令牌」，一样能接入';
 
 /**
  * 装完必须齐活的文件。少一个，服务端要么起不来、要么悄悄退化成简版页
@@ -71,60 +92,79 @@ const GROUP_HINT =
  * 它们在插件本体（master）上，服务端运行时从 `../../utils/` 读。所以既要校验包解对了，
  * 也要校验插件本体的依赖在（用户只装了半个插件、或者更新把文件删了，这里会兜住）。
  */
-const NEEDED = [
-  'server/watch-server.js',
-  'server/player.html',
-  'server/player-pc.html',
-  'server/lib/camp.js',
-  'server/lib/ffmpeg.js',
-  'server/lib/friendIndex.js',
-  'utils/xxtea.js',
-  'utils/watchMode.js'
-]
+const NEEDED = ['server/watch-server.js', 'server/player.html', 'server/player-pc.html', 'server/lib/camp.js', 'server/lib/ffmpeg.js', 'server/lib/friendIndex.js', 'utils/xxtea.js', 'utils/watchMode.js'];
 
 /* ------------------------------------------------------------ 小工具 */
 
-function cfg () {
+function cfg() {
   try {
-    return Config.getDefOrConfig('config') || {}
+    return Config.getDefOrConfig('config') || {};
   } catch {
-    return {}
+    return {};
   }
 }
 
 /** 分发服务的地址 + 令牌（观战和营地消息共用同一套） */
-function distConfig () {
-  const c = cfg()
+function distConfig() {
+  const c = cfg();
   return {
     url: normalizeBase(c.distUrl),
     token: String(c.distToken || '').trim()
-  }
+  };
 }
 
-/** 服务端在哪个端口：从配置的服务地址里抠，抠不到按默认 */
-function serverPort () {
-  const m = String(cfg().watchApiUrl || '').match(/:(\d+)/)
-  return m ? Number(m[1]) : DEFAULT_PORT
+/**
+ * 服务端在哪个端口：从配置的服务地址里解析，解析不出来按默认。
+ *
+ * ⚠️⚠️ 必须走 URL 解析，**不能用 `/: (\d+)/` 抠**（2026-10-06 修）：那个正则取的是整串里
+ *    第一个「冒号+数字」，而 IPv6 字面量本身就带冒号 —— `'http://[::1]:8898'` 会被抠成 **1**。
+ *    而本文件的 `healApiUrl()` 明确把 `[::1]` 当作合法的本机回环地址（承认用户可以这么填）。
+ *    一旦抠成 1，`watchEnv()` 就会把 `GOK_WATCH_CTRL_PORT=1` 注入给 pm2（非 root 绑特权端口
+ *    直接起不来、root 则真的绑到 1），健康检查再去探配置里的 8898 必然超时，报出「进程起了但
+ *    控制面接口没通」这种指向错误方向的假失败；重启路径上更会把一个本来正常的服务主动踢走。
+ */
+function serverPort() {
+  const raw = String(cfg().watchApiUrl || '').trim();
+  if (raw) {
+    try {
+      // 容错：用户可能只写了 `127.0.0.1:8899` 这种没协议的（normalizeBase 会补 http://）
+      const port = Number(new URL(/^[a-z]+:\/\//i.test(raw) ? raw : `http://${raw}`).port);
+      if (port >= 1 && port <= 65535) return port;
+    } catch {}
+  }
+  return DEFAULT_PORT;
+}
+
+/**
+ * ⭐ **旧「指向播放面」的遗留配置的清理函数**（2026-10-06 弱化）。
+ *
+ * 现在拆端口的历史包袱已经反过来：SINGLE_PORT 起插件**默认就该指 8899**，
+ * 老配置写着 8898 也能用（控制面仍监听），所以**不再反向纠正**，
+ * 留着这个函数只是为了不炸其它地方的调用 —— 直接返回「不用改」。
+ *
+ * 历史：2026-10-05 服务端拆「播放面 8899 / 控制面 8898」时，
+ *      写死 8899 的旧配置会变成「自检全绿、接口全 404」，于是当时要把它掰回 8898；
+ *      2026-10-06 主人拍板单端口放开后，8899 反而又是正确形态了，掰回去反而是错。
+ */
+async function healApiUrl() {
+  return {
+    migrated: false
+  };
 }
 
 /** 「对外地址没配」是部署后最常见的坑：本机能开、群友点了是空的 */
-function publicUrlHintLines () {
-  if (String(cfg().watchPublicUrl || '').trim()) return []
-  return [
-    '',
-    '⚠️ 直播间对外地址还没配 —— 现在发出去的链接只有本机能开，群友点了是白屏。',
-    '去锅巴面板把「直播间对外地址」填成外网能访问的（域名或公网 IP + 端口），',
-    `比如 http://你的域名:${serverPort()}`
-  ]
+function publicUrlHintLines() {
+  if (String(cfg().watchPublicUrl || '').trim()) return [];
+  return ['', '⚠️ 直播间对外地址还没配 —— 现在发出去的链接只有本机能开，群友点了是白屏。', '去锅巴面板把「直播间对外地址」填成外网能访问的（域名或公网 IP + 端口），', `⚠️ 填的就是群友发链接能点开的那个端口（默认 ${PLAYBACK_PORT}）`];
 }
 
 /* ------------------------------------------------------------ 插件 */
 
-export class WatchDeploy extends plugin {
-  constructor () {
+export class WatchDeploy extends Plugin {
+  constructor() {
     super({
       name: '王者营地观战运维',
-      dsc: '部署 / 查看营地观战服务端',
+      desc: '部署 / 查看营地观战服务端',
       event: 'message',
       // ⚠️ 必须是负的：apps/watchBattle.js 那条宽匹配是 `#(?:营地)?观战\s*(.*)$`，
       //    `#营地观战接入 …` 也会被它吃掉、掉进序号解析里报一句「编号不对」。
@@ -132,18 +172,31 @@ export class WatchDeploy extends plugin {
       //    它就不会再跑。（watchBattle 那边另有一道放行兜底，防 priority 语义变化。）
       priority: -1,
       rule: [
-        // 一步到位：写配置 + 立刻部署。主人和群友用的是同一条
-        // （群友装了这个插件之后，在他自己那台机器人上就是主人）
-        { reg: '^#营地观战接入\\s+(\\S+)\\s+(\\S+)$', fnc: 'connect', permission: 'master' },
-        // ⭐ 连**别人已经部署好的**观战服务：只填地址，本机不下载、不部署。
-        //    ⚠️ 和上面那条是两条完全不同的路，别混：
-        //      · 接入 = 在自己机器上装一套（地址是**分发服务**）
-        //      · 连接 = 用别人跑着的那一套（地址是**观战服务**本身）
-        { reg: '^#营地观战连接\\s+(\\S+)$', fnc: 'connectRemote', permission: 'master' },
-        { reg: '^#营地观战部署$', fnc: 'deploy', permission: 'master' },
-        { reg: '^#营地观战服务$', fnc: 'status', permission: 'master' }
-      ]
-    })
+      // 一步到位：写配置 + 立刻部署。主人和群友用的是同一条
+      // （群友装了这个插件之后，在他自己那台机器人上就是主人）
+      {
+        reg: '^#营地观战接入\\s+(\\S+)\\s+(\\S+)$',
+        fnc: 'connect',
+        permission: 'master'
+      },
+      // ⭐ 连**别人已经部署好的**观战服务：只填地址，本机不下载、不部署。
+      //    ⚠️ 和上面那条是两条完全不同的路，别混：
+      //      · 接入 = 在自己机器上装一套（地址是**分发服务**）
+      //      · 连接 = 用别人跑着的那一套（地址是**观战服务**本身）
+      {
+        reg: '^#营地观战连接\\s+(\\S+)$',
+        fnc: 'connectRemote',
+        permission: 'master'
+      }, {
+        reg: '^#营地观战部署$',
+        fnc: 'deploy',
+        permission: 'master'
+      }, {
+        reg: '^#营地观战服务$',
+        fnc: 'status',
+        permission: 'master'
+      }]
+    });
   }
 
   /* -------------------------------------------------------- 接入 */
@@ -154,36 +207,51 @@ export class WatchDeploy extends plugin {
    * **先试连再落盘** —— 地址或令牌写错了要当场知道，而不是等发部署指令时才报错
    * （这条经验是从 shareBind 的 masterEnable 带过来的）。
    */
-  async connect (e) {
-    const m = /^#营地观战接入\s+(\S+)\s+(\S+)$/.exec(String(e.msg || '').trim())
-    if (!m) return e.reply('格式：#营地观战接入 <地址> <令牌>', shouldQuote())
-
-    const url = normalizeBase(m[1])
-    const token = m[2].trim()
-
+  async connect(e) {
+    if (isBlockedEvent(e)) return true;
+    const m = /^#营地观战接入\s+(\S+)\s+(\S+)$/.exec(String(e.msg || '').trim());
+    if (!m) return e.reply('格式：#营地观战接入 <地址> <令牌>', {
+      reply: shouldQuote()
+    });
+    const url = normalizeBase(m[1]);
+    const token = m[2].trim();
     if (!/^https?:\/\//i.test(url)) {
-      return e.reply('地址要以 http:// 或 https:// 开头', shouldQuote())
+      return e.reply('地址要以 http:// 或 https:// 开头', {
+        reply: shouldQuote()
+      });
     }
     if (token.length < 20) {
-      return e.reply('令牌看着不对（太短了）。' + GROUP_HINT, shouldQuote())
+      return e.reply('令牌看着不对（太短了）。' + GROUP_HINT, {
+        reply: shouldQuote()
+      });
     }
 
     // 试连：问一次版本。失败就不写配置
-    const probe = await fetchPackageMeta({ name: PKG_NAME, url, token })
+    const probe = await fetchPackageMeta({
+      name: PKG_NAME,
+      url,
+      token,
+      logger
+    });
     if (!probe.ok) {
-      return e.reply(
-        `连不上分发服务：${probe.message}\n` +
-        '地址和令牌都没错的话，' + GROUP_HINT,
-        shouldQuote()
-      )
+      // ⚠️ 别再加「连不上分发服务：」前缀 —— probe.message 自己就带具体病因
+      return e.reply(`${probe.message}\n还搞不定就${GROUP_HINT}`, {
+        reply: shouldQuote()
+      });
     }
-
-    Config.modify('config', 'distUrl', url)
-    Config.modify('config', 'distToken', token)
-    logger.mark(`[${PluginName}] 已接入分发服务：${url}`)
+    Config.modify('config', 'distUrl', url);
+    Config.modify('config', 'distToken', token);
+    // ⭐ 令牌是主人**代共享库签**的（观战 / 消息 / 共享库三套共用一个），所以接入这一刻
+    //    共享库其实已经能用了，只差锅巴那格地址 —— 顺手补上，用户打开面板就是齐的。
+    //    老配置的令牌可能还躺在 `shareToken` 里（合并前写的那个字段，面板不认），一并搬过来。
+    fillDefaultShareUrl();
+    migrateLegacyShareToken();
+    logger.mark(`[${PluginName}] 已接入分发服务：${url}`);
 
     // 落盘成功 → 直接接着部署，群友不用再发一条
-    return this.deploy(e, { adopted: true })
+    return this.deploy(e, {
+      adopted: true
+    });
   }
 
   /* -------------------------------------------------------- 连远端 */
@@ -199,116 +267,139 @@ export class WatchDeploy extends plugin {
    *    取流、轮询、转码全在对方那台机器上跑（代价是画面要经对方中转，且对方能看到
    *    你的营地账号 —— 只连信得过的部署方）。
    *
+   * ⚠️ 填的就是**群友点链接那个地址**（默认 8899）。2026-10-06 起服务端在
+   *    SINGLE_PORT 模式下 8899 同时受理 /api/*，不再区分播放面/控制面 ——
+   *    不需要对方专门开第二扇窗，也**不要**填对方本机回环的 8898（那个只在他自己机器上）。
+   *
    * ⚠️ 对方的服务端必须能**收下你的账号**：观战取流认的是「加了这个好友的那个号」，
    *    而登录态只在**你这台机器**上（对方的 AuthPool.json 里没有）。
    *    所以这里会把你的全局账号递过去（只进对方内存、**不在对方落盘**）。
    *    对方要是老版本、没这个口子，这里会明确提示要更新。
    */
-  async connectRemote (e) {
-    const m = /^#营地观战连接\s+(\S+)$/.exec(String(e.msg || '').trim())
-    if (!m) return e.reply('格式：#营地观战连接 <地址>', shouldQuote())
-
-    const url = normalizeBase(m[1])
-
+  async connectRemote(e) {
+    if (isBlockedEvent(e)) return true;
+    const m = /^#营地观战连接\s+(\S+)$/.exec(String(e.msg || '').trim());
+    if (!m) return e.reply('格式：#营地观战连接 <地址>', {
+      reply: shouldQuote()
+    });
+    const url = normalizeBase(m[1]);
     if (!/^https?:\/\//i.test(url)) {
-      return e.reply('地址要以 http:// 或 https:// 开头', shouldQuote())
+      return e.reply('地址要以 http:// 或 https:// 开头', {
+        reply: shouldQuote()
+      });
     }
 
-    // 先试连再落盘 —— 地址写错了要当场知道
-    const probe = await probeRemoteStatus(url)
+    // ⚠️ 为什么不能只看 /api/status：那接口两个面都通，证明不了能不能指挥。
+    //    probeControl 会打 /api/rooms —— 这是指挥接口，对方是 2026-10-06 之后的
+    //    服务端（SINGLE_PORT）或者把控制面开到了这个地址，returns 200 就算能指挥；
+    //    老版本只放行播放页的会拿到 404，明确提示「你填的是播放面（老版本）」。
+    const probe = await probeControl(url);
     if (!probe.ok) {
-      return e.reply(`${probe.message}\n地址核对一下再发一次`, shouldQuote())
+      return e.reply(`${probe.message}\n地址核对一下再发一次`, {
+        reply: shouldQuote()
+      });
     }
-
-    Config.modify('config', 'watchApiUrl', url)
-    // ⚠️ 「直播间对外地址」也得跟着指过去 —— 它才是拼给群友点的那个链接
-    //    （见 watchBattle.js 的 publicBase，空时回退到服务地址）。
-    //    不一起改的话，链接还指着本机/上一个服务：本机根本没在播对方那台机器上的那一场，
-    //    群友点开就是白屏。这是「切了服务端但链接没跟过去」最容易踩的一个坑。
-    Config.modify('config', 'watchPublicUrl', url)
-    logger.mark(`[${PluginName}] 已连接远端观战服务：${url}`)
+    Config.modify('config', 'watchApiUrl', url);
+    // 2026-10-06 起对端就是 SINGLE_PORT —— 同一个 8899 既是指挥口也是播放口，
+    // 「直播间对外地址」就写这个。如果对方还是老版本拆端口形态，probeRemoteStatus
+    // 探不通 /api/status 时（理论上不会，但兜底）就留空让他自己填。
+    const playback = await probeRemoteStatus(url);
+    if (playback.ok) Config.modify('config', 'watchPublicUrl', url);else Config.modify('config', 'watchPublicUrl', '');
+    logger.mark(`[${PluginName}] 已连接远端观战服务：${url}`);
 
     // 把自己的账号递过去：对方池子里还没有它们，不递就是「登录成功却查不到好友」
-    const report = await reportRemoteAccounts(url, { force: true })
-
-    const lines = ['✅ 已连接这个观战服务', '', `对方池子里的账号：${probe.accounts} 个`]
+    const report = await reportRemoteAccounts(url, {
+      force: true
+    });
+    const lines = ['✅ 已连接这个观战服务', '', `对方池子里的账号：${probe.accounts} 个`];
     if (!report.ok) {
-      lines.push(
-        '',
-        '⚠️ 你的登录态没送过去 —— 对方的服务端可能还没更新。',
-        '让那台机器的主人发一次 #营地观战部署 更新后，再发一遍本条指令'
-      )
+      lines.push('', '⚠️ 你的登录态没送过去 —— 对方的服务端可能还没更新。', '让那台机器的主人发一次 #营地观战部署 更新后，再发一遍本条指令');
     }
-    lines.push(
-      '',
-      '⚠️ 直播间链接也跟着指到这个地址了。群友点不开的话，让对方给一个外网能访问的地址，',
-      '填进锅巴「王者荣耀 → 营地观战」里的「直播间对外地址」'
-    )
-    lines.push('', '看谁在打：发 #营地观战')
-    return e.reply(lines.join('\n'), shouldQuote())
+    if (!playback.ok) {
+      lines.push('', '⚠️ 对方的播放页探不通（但指挥接口通的）。', '去锅巴「王者荣耀 → 营地观战」把「直播间对外地址」填成群友能点开的那个，', `通常也是 http://<对方域名或公网IP>:${PLAYBACK_PORT}`);
+    }
+    lines.push('', '看谁在打：发 #营地观战');
+    return e.reply(lines.join('\n'), {
+      reply: shouldQuote()
+    });
   }
 
   /* -------------------------------------------------------- 部署 */
 
-  async deploy (e, { adopted = false } = {}) {
-    const { url, token } = distConfig()
+  async deploy(e, {
+    adopted = false
+  } = {}) {
+    if (isBlockedEvent(e)) return true;
+    const {
+      url,
+      token
+    } = distConfig();
     if (!url || !token) {
-      return e.reply(
-        adopted
-          ? '配置没写进去，重发一次试试'
-          : `还没接入分发服务。${GROUP_HINT}`,
-        shouldQuote()
-      )
+      return e.reply(adopted ? '配置没写进去，重发一次试试' : `还没接入分发服务。${GROUP_HINT}`, {
+        reply: shouldQuote()
+      });
     }
-
-    await e.reply('正在检查部署依赖（pm2 / ffmpeg），缺少时会自动安装…', shouldQuote())
-    const dependency = await ensureDependencies({ needFfmpeg: true, cfg: cfg(), logger })
+    await e.reply('正在检查部署依赖（pm2 / ffmpeg），缺少时会自动安装…', {
+      reply: shouldQuote()
+    });
+    const dependency = await ensureDependencies({
+      needFfmpeg: true,
+      cfg: cfg(),
+      logger
+    });
     if (!dependency.ok) {
-      return e.reply(
-        `依赖环境没准备好：${dependency.messages.join('；')}\n` +
-        '也可以在锅巴「王者荣耀 → 服务端接入」里配置依赖镜像/代理后重试',
-        shouldQuote()
-      )
+      return e.reply(`依赖环境没准备好：${dependency.messages.join('；')}\n` + '也可以在锅巴「王者荣耀 → 服务端接入」里配置依赖镜像/代理后重试', {
+        reply: shouldQuote()
+      });
     }
 
     // 同名进程但不是我们起的 —— 别去碰它，只说清楚（见文件头第 1 条规矩）
-    const running = pm2Proc(PROC_NAME)
+    const running = pm2Proc(PROC_NAME);
     if (running && !isOurProcess(running, SERVER_DIR)) {
-      return e.reply([
-        `有个叫 ${PROC_NAME} 的 pm2 进程，但跑的不是本插件的观战服务，没有动它。`,
-        `（它的目录是 ${running.pm2_env?.pm_cwd || '未知'}）`
-      ].join('\n'), shouldQuote())
+      return e.reply([`有个叫 ${PROC_NAME} 的 pm2 进程，但跑的不是本插件的观战服务，没有动它。`, `（它的目录是 ${running.pm2_env?.pm_cwd || '未知'}）`].join('\n'), {
+        reply: shouldQuote()
+      });
+    }
+
+    // 老版本部署的进程可能还挂在**机器原本的 pm2** 上（本插件现在跑自己的，见 utils/pm2.js）。
+    // 直接起新的会撞端口（8899/8898 都被它占着、新进程起来就退出），所以先认出来、让主人切一下，
+    // 不静默去停它 —— 它这会儿可能正在给人看观战。
+    const outside = pm2ForeignProc(PROC_NAME);
+    if (!running && outside && isOurProcess(outside, SERVER_DIR)) {
+      return e.reply(['先停掉旧的那个观战进程（它还挂在系统 pm2 上）：', '', `在机器人所在设备执行：pm2 delete ${PROC_NAME}`, '执行完再发一次 #营地观战部署'].join('\n'), {
+        reply: shouldQuote()
+      });
     }
 
     // 认不出是我们的目录 → 拒绝动它（见文件头第 2 条规矩）
-    const hasState = fs.existsSync(path.join(SERVER_DIR, STATE_FILE))
+    const hasState = fs.existsSync(path.join(SERVER_DIR, STATE_FILE));
     if (fs.existsSync(SERVER_DIR) && !fs.existsSync(ENTRY_FILE) && !hasState) {
-      return e.reply([
-        `${path.relative(YunzaiRoot, SERVER_DIR)} 已经存在，但里面没有 watch-server.js —— `,
-        '看不出是本插件的目录，不敢动它。确认没用了就手动删掉再部署'
-      ].join(''), shouldQuote())
+      return e.reply([`${path.relative(YunzaiRoot, SERVER_DIR)} 已经存在，但里面没有 watch-server.js —— `, '看不出是本插件的目录，不敢动它。确认没用了就手动删掉再部署'].join(''), {
+        reply: shouldQuote()
+      });
     }
+    const restarting = Boolean(running);
+    await e.reply(restarting ? '正在更新观战服务…' : '正在部署观战服务（要从分发服务下载代码），几十秒就好…', {
+      reply: shouldQuote()
+    });
 
-    const restarting = Boolean(running)
-    await e.reply(
-      restarting
-        ? '正在更新观战服务…'
-        : '正在部署观战服务（要从分发服务下载代码），几十秒就好…',
-      shouldQuote()
-    )
-
+    // ⭐ 先纠正「指向播放面」的旧配置（老用户升级上来的那种），
+    //    否则下面 serverPort() 会去探播放面、waitStatus 照样通过，部署报成功却指挥不动。
+    const healed = await healApiUrl();
     try {
       // 老布局遗留：以前是 git 浅克隆，现在不用 git 了，把 .git 清掉免得困惑
-      const oldGit = path.join(SERVER_DIR, '.git')
+      const oldGit = path.join(SERVER_DIR, '.git');
       if (fs.existsSync(oldGit)) {
         try {
-          fs.rmSync(oldGit, { recursive: true, force: true })
-          logger.mark(`[${PluginName}] 清掉旧的 .git（服务端代码现在从分发服务下载）`)
+          fs.rmSync(oldGit, {
+            recursive: true,
+            force: true
+          });
+          logger.mark(`[${PluginName}] 清掉旧的 .git（服务端代码现在从分发服务下载）`);
         } catch (error) {
-          logger.warn(`[${PluginName}] 清旧 .git 失败（不影响部署）：${error?.message || error}`)
+          logger.warn(`[${PluginName}] 清旧 .git 失败（不影响部署）：${error?.message || error}`);
         }
       }
-
       const installed = await installPackage({
         name: PKG_NAME,
         url,
@@ -316,114 +407,173 @@ export class WatchDeploy extends plugin {
         destDir: SERVER_DIR,
         entry: 'watch-server.js',
         logger
-      })
+      });
       if (!installed.ok) {
-        throw new Error(`${installed.message}\n如果地址令牌没问题，${GROUP_HINT}`)
+        // installed.message 已经是具体病因，别再套「如果地址令牌没问题」
+        throw new Error(`${installed.message}\n还搞不定就${GROUP_HINT}`);
       }
 
       // 解完再校验一遍：文件不齐就别硬起，免得半死不活
-      const missing = NEEDED.filter(f => !fs.existsSync(path.join(PluginPath, f)))
+      const missing = NEEDED.filter(f => !fs.existsSync(path.join(PluginState, f)));
       if (missing.length) {
-        throw new Error(`服务端文件不齐，缺：${missing.join('、')}`)
+        throw new Error(`服务端文件不齐，缺：${missing.join('、')}`);
       }
 
       // 已经在跑 = 大概率是更新完代码要重启才生效，所以这里是 restart 而不是拒绝
-      const startup = restarting
-        ? pm2(['restart', PROC_NAME, '--update-env'], { timeout: 60000, env: { ...watchEnv(), GOK_FFMPEG: dependency.ffmpeg } })
-        : pm2([
-            'start', ENTRY_FILE,
-            '--name', PROC_NAME,
-            '--interpreter', 'node',
-            '--cwd', SERVER_DIR
-          ], { timeout: 60000, env: { ...watchEnv(), GOK_FFMPEG: dependency.ffmpeg } })
-
+      const startup = restarting ? pm2(['restart', PROC_NAME, '--update-env'], {
+        timeout: 60000,
+        env: {
+          ...watchEnv(),
+          GOK_FFMPEG: dependency.ffmpeg
+        }
+      }) : pm2(['start', ENTRY_FILE, '--name', PROC_NAME, '--interpreter', 'node', '--cwd', SERVER_DIR], {
+        timeout: 60000,
+        env: {
+          ...watchEnv(),
+          GOK_FFMPEG: dependency.ffmpeg
+        }
+      });
       if (!startup.ok) {
-        throw new Error(`pm2 ${restarting ? '重启' : '启动'}失败：${startup.err || startup.out || '未知原因'}`)
+        throw new Error(`pm2 ${restarting ? '重启' : '启动'}失败：${startup.err || startup.out || '未知原因'}`);
       }
 
       // ⚠️ 不 save 的话，pm2 自己重启（或机器重启）时这个服务不会跟着起来。
       //    失败只记日志、不当成部署失败 —— 服务这会儿已经跑起来了，别因为这一步回滚整套。
-      const saved = pm2(['save'], { timeout: 30000 })
-      if (!saved.ok) logger.warn(`[${PluginName}] pm2 save 失败，开机自启可能没生效：${saved.err || saved.out}`)
+      const saved = pm2(['save'], {
+        timeout: 30000
+      });
+      if (!saved.ok) logger.warn(`[${PluginName}] pm2 save 失败，开机自启可能没生效：${saved.err || saved.out}`);
 
-      const port = serverPort()
-      const status = await waitStatus(port)
+      // ⚠️ pm2 save 只管「daemon 记得起哪些进程」，**机器重启后要真起来**还得 systemd 里的
+      //    pm2-<用户> 单元是 enabled —— 那是 `pm2 startup` 装的，两条是独立的东西。
+      //    没装的话服务器一重启观战服务就静默没了，群里的现象是「观战服务没在跑」。
+      //    只在 Linux 上查（Windows 没有 systemd；lpm2 那边也用不到这层）。
+      if (process.platform !== 'win32') {
+        try {
+          const user = String(process.env.USER || process.env.LOGNAME || 'root');
+          const r = spawnSync('systemctl', ['is-enabled', `pm2-${user}`], {
+            encoding: 'utf-8',
+            timeout: 10000
+          });
+          const out = String(r.stdout || '').trim();
+          if (out !== 'enabled') {
+            logger.warn(`[${PluginName}] systemctl is-enabled pm2-${user} = ${out || r.stderr || '查不到'}，` + '服务器重启后观战服务不会自启 —— 请在服务器执行 pm2 startup，并按提示粘贴它给出的那条 sudo 命令');
+          }
+        } catch (error) {
+          logger.debug(`[${PluginName}] 查 pm2 开机自启状态失败（不影响部署）：${error?.message || error}`);
+        }
+      }
+      const port = serverPort();
+      // ⚠️ 探的必须是**控制面独有**的接口：/api/status 两个面都有，拿它当健康检查
+      //    会在「配置指向播放面」时假阳性通过（见 probeControlPort 的注释）
+      const status = await waitControlPort(port);
       if (!status) {
-        const logs = pm2(['logs', PROC_NAME, '--lines', '15', '--nostream'], { timeout: 20000 })
-        logger.error(`[${PluginName}] 观战服务起了但状态接口不通：${logs.out || logs.err}`)
-        throw new Error('进程起了但状态接口没通，日志在 pm2 里，先发 #营地观战服务 看看')
+        const logs = pm2(['logs', PROC_NAME, '--lines', '15', '--nostream'], {
+          timeout: 20000
+        });
+        logger.error(`[${PluginName}] 观战服务起了但控制面接口不通：${logs.out || logs.err}`);
+        throw new Error('进程起了但控制面接口没通，日志在 pm2 里，先发 #营地观战服务 看看');
       }
-
-      resetPm2Cache()
-      logger.mark(
-        `[${PluginName}] 观战服务已${restarting ? '重启' : '部署'}：127.0.0.1:${port}` +
-        `（${SERVER_DIR}，版本 ${String(installed.sha).slice(0, 8)}${installed.updated ? '' : '，已是最新'}）`
-      )
-
-      const lines = [
-        `✅ 观战服务${restarting ? '已更新' : '部署好了'}`,
-        '',
-        `进程：${PROC_NAME}（pm2 托管，开机自启）`,
-        `端口：${port}`,
-        `账号：${status.accounts ?? 0} 个，还能开 ${status.free ?? 0} 路`
-      ]
-
+      resetPm2Cache();
+      logger.mark(`[${PluginName}] 观战服务已${restarting ? '重启' : '部署'}：127.0.0.1:${port}` + `（${SERVER_DIR}，版本 ${String(installed.sha).slice(0, 8)}${installed.updated ? '' : '，已是最新'}）`);
+      const lines = [`✅ 观战服务${restarting ? '已更新' : '部署好了'}`, '', `进程：${PROC_NAME}（pm2 托管，开机自启）`, `端口：默认 8899 公网全量（播放页+开播/好友名单同口），另有 127.0.0.1:8898 本机备用`, `账号：${status.accounts ?? 0} 个，还能开 ${status.free ?? 0} 路`];
       if (!installed.updated && restarting) {
-        lines.push('', '代码本来就是最新的，只重启了一遍。')
+        lines.push('', '代码本来就是最新的，只重启了一遍。');
       }
 
-      if (!status.ffmpeg) {
-        lines.push('', '⚠️ 这台机器上没找到 ffmpeg，取流会失败。装好之后发一次 #营地观战部署')
+      // ⚠️ 2026-10-06 起 healApiUrl 永远返回 migrated: false（地址不再反向纠正）；
+      //    留着这段只是为了万一以后又加了纠正逻辑，提示文案也得写出来。
+      if (healed.migrated) {
+        lines.push('', `⚠️ 顺手把「观战服务地址」从 ${healed.from} 改成了 ${healed.to}`);
       }
 
-      lines.push(...publicUrlHintLines())
-      lines.push('', '看谁在打：发 #营地观战')
-
-      return e.reply(lines.join('\n'), shouldQuote())
+      // ⚠️ 只在**明确拿到 false** 时才提示 —— `!status.ffmpeg` 会把
+      //    「服务端没回这个字段」（undefined）也当成没找到，就是 2026-10-06
+      //    那次误报（见 status() 里的同一处注释）
+      if (status.ffmpeg === false) {
+        lines.push('', '⚠️ 这台机器上没找到 ffmpeg，取流会失败。', '终端执行 ffmpeg -version 有版本号的话，说明只是插件没找到它 ——', '去锅巴「王者荣耀 → 服务端接入」把「ffmpeg 路径」填成它的完整路径，再发一次本指令');
+      } else if (dependency.ffmpeg) {
+        // 找到了就报出来：以后换机器/重装，这句话直接告诉用户该填什么
+        lines.push('', `ffmpeg：${dependency.ffmpeg}`);
+      }
+      lines.push(...publicUrlHintLines());
+      lines.push('', '看谁在打：发 #营地观战');
+      return e.reply(lines.join('\n'), {
+        reply: shouldQuote()
+      });
     } catch (error) {
-      logger.error(`[${PluginName}] 部署观战服务失败：${error?.stack || error}`)
-      return e.reply(`❌ 部署失败：${error?.message || error}`, shouldQuote())
+      logger.error(`[${PluginName}] 部署观战服务失败：${error?.stack || error}`);
+      return e.reply(`❌ 部署失败：${error?.message || error}`, {
+        reply: shouldQuote()
+      });
     }
   }
 
   /* -------------------------------------------------------- 状态 */
 
-  async status (e) {
-    const proc = pm2Proc(PROC_NAME)
-    const port = serverPort()
-    const lines = ['🛰 营地观战服务']
-
+  async status(e) {
+    if (isBlockedEvent(e)) return true;
+    // ⭐ 查状态先顺手纠一次配置：用户遇到「拿不到好友列表」时第一反应就是发这条，
+    //    自愈要发生在**他看到「运行中」之前**，否则面板一切正常、他却什么都干不了。
+    const healed = await healApiUrl();
+    const proc = pm2Proc(PROC_NAME);
+    const port = serverPort();
+    const launcher = launcherInfo();
+    const lines = ['🛰 营地观战服务'];
+    if (healed.migrated) {
+      lines.push(`⚠️ 服务地址已从 ${healed.from} 纠正为 ${healed.to}（原来填的是播放面，指挥不动）`);
+    }
     if (!proc) {
-      lines.push('进程：没在跑', '', `发 #营地观战部署 装一个（${GROUP_HINT}）`)
-      return e.reply(lines.join('\n'), shouldQuote())
+      // 本插件管的进程里没有，但旧进程可能还在系统 pm2 上跑着 —— 说清楚怎么切
+      const outside = pm2ForeignProc(PROC_NAME);
+      if (outside && isOurProcess(outside, SERVER_DIR)) {
+        return e.reply(['🛰 营地观战服务', '进程：没在跑（本插件管的进程里没有）', '', `旧进程还挂在系统 pm2 上，先执行：pm2 delete ${PROC_NAME}`, '再发一次 #营地观战部署'].join('\n'), {
+          reply: shouldQuote()
+        });
+      }
+      lines.push('进程：没在跑', '', `发 #营地观战部署 装一个（${GROUP_HINT}）`);
+      return e.reply(lines.join('\n'), {
+        reply: shouldQuote()
+      });
     }
-
     if (!isOurProcess(proc, SERVER_DIR)) {
-      lines.push('进程：有个同名的，但不是本插件起的，没有动它')
-      lines.push(`（它的目录是 ${proc.pm2_env?.pm_cwd || '未知'}）`)
-      return e.reply(lines.join('\n'), shouldQuote())
+      lines.push('进程：有个同名的，但不是本插件起的，没有动它');
+      lines.push(`（它的目录是 ${proc.pm2_env?.pm_cwd || '未知'}）`);
+      return e.reply(lines.join('\n'), {
+        reply: shouldQuote()
+      });
     }
+    const state = proc.pm2_env?.status || 'unknown';
+    const uptime = state === 'online' ? Date.now() - Number(proc.pm2_env?.pm_uptime || 0) : 0;
+    lines.push(`进程：${state === 'online' ? '运行中' : state}${uptime ? `（已跑 ${fmtUptime(uptime)}）` : ''}`);
+    lines.push(`进程管理：${launcher.kind === 'lpm2' ? 'lpm2（独立运行，不占系统 pm2）' : '系统 pm2'}`);
+    lines.push(`端口：控制面 127.0.0.1:${port}（公网播放面默认 8899）`);
+    const restarts = Number(proc.pm2_env?.restart_time || 0);
+    if (restarts > 0) lines.push(`重启次数：${restarts}${restarts > 5 ? '（有点多，看看 pm2 日志）' : ''}`);
 
-    const state = proc.pm2_env?.status || 'unknown'
-    const uptime = state === 'online' ? Date.now() - Number(proc.pm2_env?.pm_uptime || 0) : 0
-    lines.push(`进程：${state === 'online' ? '运行中' : state}${uptime ? `（已跑 ${fmtUptime(uptime)}）` : ''}`)
-    lines.push(`端口：${port}`)
-
-    const restarts = Number(proc.pm2_env?.restart_time || 0)
-    if (restarts > 0) lines.push(`重启次数：${restarts}${restarts > 5 ? '（有点多，看看 pm2 日志）' : ''}`)
-
-    const status = await probeStatus(port)
+    // ⚠️ 探控制面独有接口（/api/rooms），别用 /api/status —— 那个在播放面上也通，
+    //    配置指错面时会假阳性通过，面板显示「运行中」可实际指挥不动（2026-10-05 修）
+    const status = await probeControlPort(port);
     if (!status) {
-      lines.push('状态接口：没响应（进程在但连不上，日志在 pm2 里）')
-      return e.reply(lines.join('\n'), shouldQuote())
+      const byStatus = await probeStatus(port);
+      lines.push(byStatus ? `状态接口：${port} 端口上有服务，但它**不接控制接口**（多半是播放面端口）—— 服务地址要填控制面（默认 ${DEFAULT_PORT}）` : '状态接口：没响应（进程在但连不上，日志在 pm2 里）');
+      return e.reply(lines.join('\n'), {
+        reply: shouldQuote()
+      });
     }
 
-    lines.push(`ffmpeg：${status.ffmpeg ? '就绪' : '没找到（装好再发 #营地观战部署）'}`)
-    lines.push(`账号：${status.accounts ?? 0} 个，还能开 ${status.free ?? 0} 路`)
-    lines.push(`在播：${(status.rooms || []).length} 路${status.recording ? '（有在录）' : ''}`)
-
-    lines.push(...publicUrlHintLines())
-
-    return e.reply(lines.join('\n'), shouldQuote())
+    // ⚠️⚠️ `ffmpeg` / `accounts` 来自 `/api/status`，**不是** `/api/rooms`
+    //    （后者只有 4 个字段）。probeControlPort 现在会把两份合并起来返回，
+    //    所以这里有值。但字段真缺失时要说「查不到」而不是「没找到」——
+    //    2026-10-06 那次误报（面板说没找到 ffmpeg、服务端日志明明写着找到了）
+    //    就是取数来源不对 + `?:` 兜底把「字段不存在」冒充成「真的没有」。
+    const hasFfmpegField = typeof status.ffmpeg === 'boolean';
+    lines.push(`ffmpeg：${hasFfmpegField ? status.ffmpeg ? '就绪' : '没找到（装好再发 #营地观战部署）' : '查不到（服务端没回这个字段，可能版本较旧）'}`);
+    lines.push(`账号：${status.accounts ?? 0} 个，还能开 ${status.free ?? 0} 路`);
+    lines.push(`在播：${(status.rooms || []).length} 路${status.recording ? '（有在录）' : ''}`);
+    lines.push(...publicUrlHintLines());
+    return e.reply(lines.join('\n'), {
+      reply: shouldQuote()
+    });
   }
 }

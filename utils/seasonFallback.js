@@ -16,7 +16,7 @@
  *   · 段位趋势要 totalRankStar 才能跨段可比，列表项只有段内 stars（且 roleJob 语义分新旧体系）。
  */
 
-import { resolveMode, rankHeroes, heroIconUrl } from './reportStore.js'
+import { resolveMode, rankHeroes, heroIconUrl } from './reportStore.js';
 
 /**
  * 隐私类业务错误码 → 对方关掉的是哪个开关。
@@ -27,28 +27,26 @@ const PRIVACY_SCOPES = {
   '-30408': '赛季表现',
   '-10110': '赛季表现',
   '-10107': '主页'
-}
-
+};
 const toInt = value => {
-  const num = Number(value)
-  return Number.isFinite(num) ? Math.trunc(num) : 0
-}
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : 0;
+};
 
 /** 是不是「对方设了隐私」而不是「接口坏了」 */
-export function privacyScope (returnCode) {
-  return PRIVACY_SCOPES[String(toInt(returnCode))] || ''
+export function privacyScope(returnCode) {
+  return PRIVACY_SCOPES[String(toInt(returnCode))] || '';
 }
 
 /** 最长连胜（列表是从新到旧，只数长度不看方向） */
-function maxWinStreak (battles) {
-  let best = 0
-  let run = 0
+function maxWinStreak(battles) {
+  let best = 0;
+  let run = 0;
   for (const item of battles) {
-    if (toInt(item.gameresult) === 1) run += 1
-    else run = 0
-    if (run > best) best = run
+    if (toInt(item.gameresult) === 1) run += 1;else run = 0;
+    if (run > best) best = run;
   }
-  return best
+  return best;
 }
 
 /**
@@ -61,34 +59,44 @@ function maxWinStreak (battles) {
  * @param {string} [params.scope] 对方隐藏的是哪一项，写进副标题
  * @returns {object|null} 一场排位都没有时返回 null（这时确实无从降级）
  */
-export function buildSeasonFallback ({ summary, battles = [], heroMap = {}, scope = '' }) {
-  const ranked = battles.filter(item => resolveMode(item.mapName) === '排位赛')
-  if (!ranked.length) return null
-
-  const win = ranked.filter(item => toInt(item.gameresult) === 1).length
-  const lose = ranked.filter(item => toInt(item.gameresult) === 2).length
-  const decided = win + lose
-  const graded = ranked.filter(item => Number(item.gradeGame) > 0)
-  const avgGrade = graded.length
-    ? (graded.reduce((sum, item) => sum + Number(item.gradeGame), 0) / graded.length).toFixed(1)
-    : 0
-
+export function buildSeasonFallback({
+  summary,
+  battles = [],
+  heroMap = {},
+  scope = ''
+}) {
+  const ranked = battles.filter(item => resolveMode(item.mapName) === '排位赛');
+  if (!ranked.length) return null;
+  const win = ranked.filter(item => toInt(item.gameresult) === 1).length;
+  const lose = ranked.filter(item => toInt(item.gameresult) === 2).length;
+  const decided = win + lose;
+  const graded = ranked.filter(item => Number(item.gradeGame) > 0);
+  const avgGrade = graded.length ? (graded.reduce((sum, item) => sum + Number(item.gradeGame), 0) / graded.length).toFixed(1) : 0;
   const heros = rankHeroes(ranked, heroMap).slice(0, 3).map(hero => ({
     heroName: hero.name,
     heroIcon: heroIconUrl(hero.heroId),
     winRate: `${hero.winRate}%`,
     gameCnt: hero.count
-  }))
-
-  const honor = [
-    { val: win, key: '胜场' },
-    { val: lose, key: '负场' },
-    { val: maxWinStreak(ranked), key: '最高连胜' },
-    { val: ranked.reduce((sum, item) => sum + toInt(item.mvpcnt), 0), key: '全场最佳' },
-    { val: ranked.reduce((sum, item) => sum + toInt(item.losemvp), 0), key: '败方最佳' },
-    { val: avgGrade, key: '场均评分' }
-  ]
-
+  }));
+  const honor = [{
+    val: win,
+    key: '胜场'
+  }, {
+    val: lose,
+    key: '负场'
+  }, {
+    val: maxWinStreak(ranked),
+    key: '最高连胜'
+  }, {
+    val: ranked.reduce((sum, item) => sum + toInt(item.mvpcnt), 0),
+    key: '全场最佳'
+  }, {
+    val: ranked.reduce((sum, item) => sum + toInt(item.losemvp), 0),
+    key: '败方最佳'
+  }, {
+    val: avgGrade,
+    key: '场均评分'
+  }];
   return {
     roleName: summary?.roleName || '',
     roleIcon: summary?.roleIcon || '',
@@ -100,7 +108,7 @@ export function buildSeasonFallback ({ summary, battles = [], heroMap = {}, scop
     masterScore: summary?.peak || 0,
     masterRank: '',
     score: '',
-    winRate: decided ? `${Math.round((win / decided) * 100)}%` : '0%',
+    winRate: decided ? `${Math.round(win / decided * 100)}%` : '0%',
     gameCnt: ranked.length,
     branch: '—',
     seasonName: '近期',
@@ -120,5 +128,5 @@ export function buildSeasonFallback ({ summary, battles = [], heroMap = {}, scop
     lanes: [],
     hasLanes: false,
     lanesJson: '[]'
-  }
+  };
 }

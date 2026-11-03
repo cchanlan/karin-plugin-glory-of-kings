@@ -1,3 +1,8 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import path from "node:path";
+import { ResourcePath, ResourceUrl } from "#components";
+import { Plugin, render, segment, logger } from "node-karin";
 /**
  * #缺皮肤 —— 反查还差哪些皮肤。
  *
@@ -20,119 +25,128 @@
  * 渲染失败回落到纯文字：缺失动辄七八百条，文字版给「概况 + 高价值 TOP + 逐英雄」三层。
  * 品质口径（tierRank / pickTierText / QUALITY_STATS）与皮肤墙共用一份。
  */
-import puppeteer from '#puppeteer'
-import path from 'path'
-import {
-  getImgType,
-  ApiService, resolveCurrentId, readYamlFile, Button, shouldQuote,
-  AT_HEAD, stripAtText, resolveTargetUserId, resolveMemberName, getUserAvatar,
-  isClassicSkin, SZ_ORDER, tierRank, pickTierText, QUALITY_STATS
-} from '#utils'
-import { PluginData } from '#components'
-import { loadPushList } from '../utils/pushStore.js'
+
+import { getImgType, ApiService, resolveCurrentId, getBoundIds, Button, shouldQuote, AT_HEAD, stripAtText, resolveTargetUserId, resolveMemberName, getUserAvatar, isClassicSkin, SZ_ORDER, normalizeSzClass, tierRank, pickTierText, QUALITY_STATS } from '#utils';
+import { loadPushList } from '../utils/pushStore.js';
 
 /** 概况里「高价值缺失」列几条 */
-const TOP_MISSING = 12
+const TOP_MISSING = 12;
 /** 概况里「缺得最多的英雄」列几个 */
-const TOP_HERO = 6
+const TOP_HERO = 6;
 /** 单个英雄的皮肤最多列几条，够覆盖目前皮肤最多的英雄（20 出头） */
-const MAX_HERO_SKINS = 30
-
-export class SkinMissing extends plugin {
-  constructor () {
+const MAX_HERO_SKINS = 30;
+export class SkinMissing extends Plugin {
+  constructor() {
     super({
       name: '王者皮肤缺失',
-      dsc: '反查还差哪些皮肤',
+      desc: '反查还差哪些皮肤',
       event: 'message',
       // 和其它新指令一致：抢在 queryGameStats 的宽匹配之前
       priority: 0,
-      rule: [
-        { reg: `${AT_HEAD}#(缺皮肤|皮肤缺失|还差(什么|哪些)皮肤|缺哪些皮肤)\\s*(.*)$`, fnc: 'query' }
-      ]
-    })
+      rule: [{
+        reg: `${AT_HEAD}#(缺皮肤|皮肤缺失|还差(什么|哪些)皮肤|缺哪些皮肤)\\s*(.*)$`,
+        fnc: 'query'
+      }]
+    });
+    this.priority = 0;
   }
-
-  async query (e) {
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint, shouldQuote())
-
-    const input = stripAtText(e.msg)
-      .replace(/^#(缺皮肤|皮肤缺失|还差(什么|哪些)皮肤|缺哪些皮肤)\s*/, '')
-      .trim()
-    const args = parseArgs(input)
-
-    let campId = args.campId
+  async query(e) {
+    if (isBlockedEvent(e)) return true;
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint, {
+      reply: shouldQuote()
+    });
+    const input = stripAtText(e.msg).replace(/^#(缺皮肤|皮肤缺失|还差(什么|哪些)皮肤|缺哪些皮肤)\s*/, '').trim();
+    const args = parseArgs(input);
+    let campId = args.campId;
     if (!campId && args.index) {
-      const ids = (readYamlFile(path.join(PluginData, 'UserData.yaml')) || {})[userId]?.ids || []
-      campId = ids[args.index - 1] || ''
+      // ⚠️ 走 getBoundIds 而不是裸读 YAML（2026-10-06 修）：readYamlFile 的契约是
+      //    「文件不存在 / 内容坏了**原样抛错**」，`|| {}` 拦不住 throw —— 手工编辑坏
+      //    UserData.yaml 之后 `#缺皮肤 1` 会整条抛异常，而异常被 loader 的 catch 吃掉，
+      //    用户**一句提示都收不到**。getBoundIds 读的就是同一个文件（带指纹缓存），
+      //    读失败按空表处理。同族修复见 apps/battleReport.js 的 `#王者日报 2` 分支。
+      const ids = getBoundIds(userId);
+      campId = ids[args.index - 1] || '';
       if (!campId) {
-        return e.reply(`你没有第 ${args.index} 个绑定的营地ID，发送 #营地ID 看看列表`, shouldQuote())
+        return e.reply(`你没有第 ${args.index} 个绑定的营地ID，发送 #营地ID 看看列表`, {
+          reply: shouldQuote()
+        });
       }
     }
     // 本机没绑就问共享库（用户在别的机器人上绑过也能直接用）
     if (!campId) {
-      const resolved = await resolveCurrentId(userId)
-      campId = resolved.campId
+      const resolved = await resolveCurrentId(userId);
+      campId = resolved.campId;
       if (!campId) {
-        return e.reply([resolved.hint, Button.bind()], shouldQuote())
+        return e.reply([resolved.hint, Button.bind()], {
+          reply: shouldQuote()
+        });
       }
     }
-
-    let data
+    let data;
     try {
-      const res = await ApiService.getSkinList(String(campId), String(userId))
-      data = res?.data || res
+      const res = await ApiService.getSkinList(String(campId), String(e.userId));
+      data = res?.data || res;
     } catch (error) {
-      logger.error(`[王者缺皮肤] ${campId} 取皮肤列表失败: ${error.message}`)
-      return e.reply(`查询失败：${error.message}`, shouldQuote())
+      // ⚠️ 不能把 error.message 原样甩给用户（2026-10-06 修）：getSkinList 走的是
+      //    `gameFormWithCandidates`（营地鉴权接口），鉴权类错误的消息里带账号/令牌字段，
+      //    而且非主人用户看到「令牌过期」这类文案也不知道该做什么。
+      //    同批 skinWall / heroList / heroTierList / heroDetail 都走 formatUserFacingError。
+      logger.error(`[王者缺皮肤] ${campId} 取皮肤列表失败: ${error.message}`);
+      return e.reply(ApiService.formatUserFacingError(error, {
+        isMaster: Boolean(e.isMaster),
+        scene: '缺皮肤查询异常'
+      }), {
+        reply: shouldQuote()
+      });
     }
-
-    const conf = Object.values(data?.heroSkinConfList || {}).filter(item => !isClassicSkin(item))
+    const conf = Object.values(data?.heroSkinConfList || {}).filter(item => !isClassicSkin(item));
     if (!conf.length) {
-      return e.reply('营地没返回皮肤配置表，稍后再试试', shouldQuote())
+      return e.reply('营地没返回皮肤配置表，稍后再试试', {
+        reply: shouldQuote()
+      });
     }
-
-    const owned = ownedSkinIds(data?.heroSkinList)
-    const name = await displayName(e, userId)
-
+    const owned = ownedSkinIds(data?.heroSkinList);
+    const name = await displayName(e, userId);
     if (args.heroName) {
-      const matched = matchHero(conf, args.heroName)
+      const matched = matchHero(conf, args.heroName);
       if (!matched.list.length) {
-        return e.reply([
-          matched.candidates.length
-            ? `没找到「${args.heroName}」，你是想查：${matched.candidates.join('、')}`
-            : `没找到英雄「${args.heroName}」，英雄名要写全，比如 #缺皮肤 妲己`,
-          Button.skinMissing('', campId)
-        ], shouldQuote())
+        return e.reply([matched.candidates.length ? `没找到「${args.heroName}」，你是想查：${matched.candidates.join('、')}` : `没找到英雄「${args.heroName}」，英雄名要写全，比如 #缺皮肤 妲己`, Button.skinMissing('', campId)], {
+          reply: shouldQuote()
+        });
       }
-      return e.reply([
-        await this.shot(e, userId, buildHeroView(matched.hero, matched.list, owned, name)) ||
-          renderHero(matched.hero, matched.list, owned, name),
-        Button.skinMissing(matched.hero, campId)
-      ], shouldQuote())
+      return e.reply([(await this.shot(e, userId, buildHeroView(matched.hero, matched.list, owned, name))) || renderHero(matched.hero, matched.list, owned, name), Button.skinMissing(matched.hero, campId)], {
+        reply: shouldQuote()
+      });
     }
-
-    return e.reply([
-      await this.shot(e, userId, buildOverviewView(conf, owned, data?.skinCountInfo, name)) ||
-        renderOverview(conf, owned, data?.skinCountInfo, name, campId),
-      Button.skinMissing('', campId)
-    ], shouldQuote())
+    return e.reply([(await this.shot(e, userId, buildOverviewView(conf, owned, data?.skinCountInfo, name))) || renderOverview(conf, owned, data?.skinCountInfo, name, campId), Button.skinMissing('', campId)], {
+      reply: shouldQuote()
+    });
   }
 
   /** 出图。失败返回 null，由调用方回落到文字版 */
-  async shot (e, userId, view) {
+  async shot(e, userId, view) {
     try {
-      return await puppeteer.screenshot('SkinMissing', {
-        imgType: getImgType(),
-        tplFile: 'plugins/GloryOfKings-Plugin/resources/html/SkinMissing.html',
-        // 模板的 CSS / 字体都靠 {{_res_path}} 拼相对路径，漏了这项样式表 404，出的是纯文字图
-        _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-        avatar: await getUserAvatar(e, userId, 100).catch(() => ''),
-        ...view
-      })
+      return segment.image(resourceUrl("base64://" + (await render.render({
+        name: 'SkinMissing',
+        type: getImgType(),
+        file: path.join(ResourcePath, "html", "SkinMissing.html"),
+        data: {
+          avatar: await getUserAvatar(e, userId, 100).catch(() => ''),
+          ...view,
+          _res_path: ResourceUrl
+        },
+        pageGotoParams: {
+          waitUntil: "networkidle2",
+          timeout: 60000
+        }
+      }))));
     } catch (error) {
-      logger.error(`[王者缺皮肤] 渲染失败: ${error.message}`)
-      return null
+      logger.error(`[王者缺皮肤] 渲染失败: ${error.message}`);
+      return null;
     }
   }
 }
@@ -140,94 +154,131 @@ export class SkinMissing extends plugin {
 /* ---------------------------------------------------------- 解析与口径 */
 
 /** `#缺皮肤 妲己 1580886057` / `#缺皮肤2` 都能认：5 位以上数字是营地ID，4 位以内是绑定序号，其余当英雄名 */
-function parseArgs (input = '') {
-  const out = { campId: '', index: null, heroName: '' }
-  const rest = []
+function parseArgs(input = '') {
+  const out = {
+    campId: '',
+    index: null,
+    heroName: ''
+  };
+  const rest = [];
   for (const tok of String(input).split(/[\s,，、]+/).filter(Boolean)) {
     if (/^\d+$/.test(tok)) {
-      if (tok.length >= 5) { out.campId = tok; continue }
-      if (out.index === null) { out.index = Number(tok); continue }
+      if (tok.length >= 5) {
+        out.campId = tok;
+        continue;
+      }
+      if (out.index === null) {
+        out.index = Number(tok);
+        continue;
+      }
     }
-    rest.push(tok)
+    rest.push(tok);
   }
-  out.heroName = rest.join('')
-  return out
+  out.heroName = rest.join('');
+  return out;
 }
 
 /**
  * 已拥有的皮肤ID集合。判据不是「出现在 heroSkinList 里」——那份列表混了展示项，
  * 见文件头注释第 1 条。
  */
-function ownedSkinIds (heroSkinList) {
-  const out = new Set()
+function ownedSkinIds(heroSkinList) {
+  const out = new Set();
   for (const skin of Array.isArray(heroSkinList) ? heroSkinList : []) {
-    if ('iBuy' in skin && skin.szClass != null) out.add(String(skin.skinId))
+    if ('iBuy' in skin && skin.szClass != null) out.add(String(skin.skinId));
   }
-  return out
+  return out;
 }
 
 // 营地的 szHeroTitle 与用户手输的名字常差括号或空格（元流之子(法师)），比对前统一去掉
-const norm = name => String(name ?? '').replace(/[\s（）()]/g, '')
+const norm = name => String(name ?? '').replace(/[\s（）()]/g, '');
 
 // 元流之子的 5 个分身沿用 #查皮肤 的缩写：元法/元射/元辅/元坦/元刺
-const YUAN_ABBR = { 法: '法师', 射: '射手', 辅: '辅助', 坦: '坦克', 刺: '刺客' }
+const YUAN_ABBR = {
+  法: '法师',
+  射: '射手',
+  辅: '辅助',
+  坦: '坦克',
+  刺: '刺客'
+};
 
 /**
  * 从配置表里认英雄名。先精确匹配，不中再按包含关系给候选——
  * 直接在配置表里找而不去拉官网 herolist，是为了守住「整条指令只 1 次请求」。
  */
-function matchHero (conf, input) {
-  const abbr = String(input).match(/^元(.)$/)
-  const want = norm(abbr && YUAN_ABBR[abbr[1]] ? `元流之子(${YUAN_ABBR[abbr[1]]})` : input)
-
-  const exact = conf.filter(item => norm(item.szHeroTitle) === want)
+function matchHero(conf, input) {
+  const abbr = String(input).match(/^元(.)$/);
+  const want = norm(abbr && YUAN_ABBR[abbr[1]] ? `元流之子(${YUAN_ABBR[abbr[1]]})` : input);
+  const exact = conf.filter(item => norm(item.szHeroTitle) === want);
   if (exact.length) {
-    return { hero: exact[0].szHeroTitle, list: sortSkins(exact), candidates: [] }
+    return {
+      hero: exact[0].szHeroTitle,
+      list: sortSkins(exact),
+      candidates: []
+    };
   }
-
-  const names = []
+  const names = [];
   for (const item of conf) {
-    const title = String(item.szHeroTitle || '')
-    if (title && norm(title).includes(want) && !names.includes(title)) names.push(title)
+    const title = String(item.szHeroTitle || '');
+    if (title && norm(title).includes(want) && !names.includes(title)) names.push(title);
   }
   if (names.length === 1) {
-    const list = conf.filter(item => item.szHeroTitle === names[0])
-    return { hero: names[0], list: sortSkins(list), candidates: [] }
+    const list = conf.filter(item => item.szHeroTitle === names[0]);
+    return {
+      hero: names[0],
+      list: sortSkins(list),
+      candidates: []
+    };
   }
-  return { hero: '', list: [], candidates: names.slice(0, 8) }
+  return {
+    hero: '',
+    list: [],
+    candidates: names.slice(0, 8)
+  };
 }
 
 /** 皮肤ID升序：末两位就是皮肤序号，按它排出来的顺序和游戏里一致 */
-function sortSkins (list) {
-  return [...list].sort((a, b) => Number(a.iSkinId) - Number(b.iSkinId))
+function sortSkins(list) {
+  return [...list].sort((a, b) => Number(a.iSkinId) - Number(b.iSkinId));
 }
 
 /** 价值序：先按高价值品质档，再按营地评级，最后按标价 */
-function valueRank (a, b) {
-  const ta = tierRank(a.classTypeName)
-  const tb = tierRank(b.classTypeName)
-  if (ta !== tb) return ta - tb
-  const sa = SZ_ORDER.includes(a.szClass) ? SZ_ORDER.indexOf(a.szClass) : SZ_ORDER.length
-  const sb = SZ_ORDER.includes(b.szClass) ? SZ_ORDER.indexOf(b.szClass) : SZ_ORDER.length
-  if (sa !== sb) return sa - sb
-  return Number(b.iPrice || 0) - Number(a.iPrice || 0)
+function valueRank(a, b) {
+  const ta = tierRank(a.classTypeName);
+  const tb = tierRank(b.classTypeName);
+  if (ta !== tb) return ta - tb;
+  // ⚠️ 评级先归一化再查序：营地会返回 `" A"`（前导空格）这类写法，
+  //    不归一化就查不到 → 掉到最后（见 utils/skinCatalog.js 的说明）
+  const sa = szLevel(a.szClass);
+  const sb = szLevel(b.szClass);
+  if (sa !== sb) return sa - sb;
+  return Number(b.iPrice || 0) - Number(a.iPrice || 0);
+}
+
+/** 评级 → 价值序下标；认不出排到所有已知评级之后 */
+function szLevel(value) {
+  const cls = normalizeSzClass(value);
+  return SZ_ORDER.includes(cls) ? SZ_ORDER.indexOf(cls) : SZ_ORDER.length;
 }
 
 /** 展示名：推送轮询顺手缓存的营地昵称优先，其次群名片，都没有就用 QQ 号。都不额外发请求 */
-async function displayName (e, userId) {
-  const cached = String(loadPushList()[String(userId)]?.roleName || '').trim()
-  if (cached) return cached
+async function displayName(e, userId) {
+  const cached = String(loadPushList()[String(userId)]?.roleName || '').trim();
+  if (cached) return cached;
   try {
-    return await resolveMemberName(e, userId) || String(userId)
+    // ⚠️ 第一个形参是**群对象**（2026-10-06 修）：resolveMemberName 内部走
+    //    `group?.pickMember?.(uid)`，而 `e` 上没有 pickMember → 可选链静默跳过，
+    //    群名片永远取不到，一路退化成裸 QQ 号（openid 场景是「召唤师」）。
+    return (await resolveMemberName(e.bot, e.groupId, userId)) || String(userId);
   } catch {
-    return String(userId)
+    return String(userId);
   }
 }
 
 /* ---------------------------------------------------------- 出图 */
 
 /** 一款皮肤的卡片。卡面用配置表自带的 bigCover(180x280)，缺了退 szSmallIcon，都没有就靠 onerror 隐藏 */
-function skinCard (conf, owned, sub) {
+function skinCard(conf, owned, sub) {
   return {
     name: String(conf.szTitle || `皮肤${conf.iSkinId}`),
     sub: sub || pickTierText(conf.classTypeName) || '',
@@ -235,35 +286,36 @@ function skinCard (conf, owned, sub) {
     price: Number(conf.iPrice || 0) > 0 ? `${Number(conf.iPrice)}点券` : '',
     cover: conf.bigCover || conf.szSmallIcon || '',
     owned
-  }
+  };
 }
-
-function buildOverviewView (conf, owned, countInfo, name) {
-  const miss = conf.filter(item => !owned.has(String(item.iSkinId)))
-  const total = conf.length
-  const has = total - miss.length
+function buildOverviewView(conf, owned, countInfo, name) {
+  const miss = conf.filter(item => !owned.has(String(item.iSkinId)));
+  const total = conf.length;
+  const has = total - miss.length;
 
   // 品质分档：统计品质名而不是营地评级，两者口径不同（评级里 SR 会盖过荣耀典藏）
-  const tiers = []
+  const tiers = [];
   for (const stat of QUALITY_STATS) {
-    const hit = item => (Array.isArray(item.classTypeName) ? item.classTypeName : [])
-      .some(n => stat.aliases.includes(String(n).trim()))
-    const all = conf.filter(hit).length
-    if (!all) continue
-    const lack = miss.filter(hit).length
-    tiers.push({ label: stat.label, has: all - lack, lack, pct: Math.round(((all - lack) / all) * 100) })
+    const hit = item => (Array.isArray(item.classTypeName) ? item.classTypeName : []).some(n => stat.aliases.includes(String(n).trim()));
+    const all = conf.filter(hit).length;
+    if (!all) continue;
+    const lack = miss.filter(hit).length;
+    tiers.push({
+      label: stat.label,
+      has: all - lack,
+      lack,
+      pct: Math.round((all - lack) / all * 100)
+    });
   }
-
-  const byHero = new Map()
+  const byHero = new Map();
   for (const item of miss) {
-    const hero = String(item.szHeroTitle || '未知')
-    byHero.set(hero, (byHero.get(hero) || 0) + 1)
+    const hero = String(item.szHeroTitle || '未知');
+    byHero.set(hero, (byHero.get(hero) || 0) + 1);
   }
 
   // 官方口径的估值和绝版数，自己算不出来，直接引用
-  const worth = Number(countInfo?.totalValue || 0)
-  const notForSell = Number(countInfo?.notForSell || 0)
-
+  const worth = Number(countInfo?.totalValue || 0);
+  const notForSell = Number(countInfo?.notForSell || 0);
   return {
     title: '皮肤缺失',
     subText: '不含经典皮肤',
@@ -274,25 +326,24 @@ function buildOverviewView (conf, owned, countInfo, name) {
     missing: miss.length,
     total,
     totalKey: '全部皮肤',
-    pct: total ? Number(((has / total) * 100).toFixed(1)) : 0,
+    pct: total ? Number((has / total * 100).toFixed(1)) : 0,
     tiers,
     // 概况只画最值钱的那一批：七八百条全画出来图会长到没人看
     skinTitle: `最值钱的缺失（前 ${Math.min(miss.length, TOP_MISSING)}）`,
     skinTip: '先按品质档，再按营地评级和标价',
-    skins: [...miss].sort(valueRank).slice(0, TOP_MISSING)
-      .map(item => skinCard(item, false, String(item.szHeroTitle || ''))),
+    skins: [...miss].sort(valueRank).slice(0, TOP_MISSING).map(item => skinCard(item, false, String(item.szHeroTitle || ''))),
     more: 0,
-    heroTop: [...byHero.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_HERO)
-      .map(([hero, num]) => ({ hero, num })),
+    heroTop: [...byHero.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_HERO).map(([hero, num]) => ({
+      hero,
+      num
+    })),
     fullText: '全部皮肤都到手了',
     footText: '不含经典皮肤（原皮人人都有）\n#缺皮肤 妲己 能看单个英雄缺哪几款'
-  }
+  };
 }
-
-function buildHeroView (hero, list, owned, name) {
-  const has = list.filter(item => owned.has(String(item.iSkinId))).length
-  const shown = list.slice(0, MAX_HERO_SKINS)
-
+function buildHeroView(hero, list, owned, name) {
+  const has = list.filter(item => owned.has(String(item.iSkinId))).length;
+  const shown = list.slice(0, MAX_HERO_SKINS);
   return {
     title: '皮肤缺失',
     subText: hero,
@@ -303,7 +354,7 @@ function buildHeroView (hero, list, owned, name) {
     missing: list.length - has,
     total: list.length,
     totalKey: '该英雄皮肤',
-    pct: list.length ? Number(((has / list.length) * 100).toFixed(1)) : 0,
+    pct: list.length ? Number((has / list.length * 100).toFixed(1)) : 0,
     tiers: [],
     skinTitle: `${hero} 的皮肤（${list.length}）`,
     // 皮肤ID升序和游戏里的顺序一致，别按价值重排，用户是照着游戏里的列表看的
@@ -313,87 +364,67 @@ function buildHeroView (hero, list, owned, name) {
     heroTop: [],
     fullText: `「${hero}」的皮肤全齐了`,
     footText: '不含经典皮肤（原皮人人都有，列出来没意义）'
-  }
+  };
 }
 
 /* ---------------------------------------------------------- 文案（出图失败时的兜底） */
 
 /** 一条皮肤的展示片段：`魅力维加斯[史诗品质] 888点券` */
-function skinLine (conf) {
-  const tier = pickTierText(conf.classTypeName)
-  const price = Number(conf.iPrice || 0)
-  return [
-    String(conf.szTitle || `皮肤${conf.iSkinId}`),
-    tier ? `[${tier}]` : '',
-    // 限定皮肤大多不标价（iPrice 为 0），标价只在有值时给，别写成「0 点券」误导人
-    price > 0 ? ` ${price}点券` : ''
-  ].join('')
+function skinLine(conf) {
+  const tier = pickTierText(conf.classTypeName);
+  const price = Number(conf.iPrice || 0);
+  return [String(conf.szTitle || `皮肤${conf.iSkinId}`), tier ? `[${tier}]` : '',
+  // 限定皮肤大多不标价（iPrice 为 0），标价只在有值时给，别写成「0 点券」误导人
+  price > 0 ? ` ${price}点券` : ''].join('');
 }
-
-function renderHero (hero, list, owned, name) {
-  const has = list.filter(item => owned.has(String(item.iSkinId)))
-  const miss = list.filter(item => !owned.has(String(item.iSkinId)))
-
-  const lines = [
-    `🎨 ${name} 的「${hero}」皮肤`,
-    `共 ${list.length} 款，已有 ${has.length}，还缺 ${miss.length}`,
-    ''
-  ]
-
+function renderHero(hero, list, owned, name) {
+  const has = list.filter(item => owned.has(String(item.iSkinId)));
+  const miss = list.filter(item => !owned.has(String(item.iSkinId)));
+  const lines = [`🎨 ${name} 的「${hero}」皮肤`, `共 ${list.length} 款，已有 ${has.length}，还缺 ${miss.length}`, ''];
   for (const item of list.slice(0, MAX_HERO_SKINS)) {
-    lines.push(`${owned.has(String(item.iSkinId)) ? '✅' : '❌'} ${skinLine(item)}`)
+    lines.push(`${owned.has(String(item.iSkinId)) ? '✅' : '❌'} ${skinLine(item)}`);
   }
-  if (list.length > MAX_HERO_SKINS) lines.push(`…… 还有 ${list.length - MAX_HERO_SKINS} 款`)
-
-  lines.push('', '不含经典皮肤（原皮人人都有，列出来没意义）')
-  return lines.join('\n')
+  if (list.length > MAX_HERO_SKINS) lines.push(`…… 还有 ${list.length - MAX_HERO_SKINS} 款`);
+  lines.push('', '不含经典皮肤（原皮人人都有，列出来没意义）');
+  return lines.join('\n');
 }
-
-function renderOverview (conf, owned, countInfo, name, campId) {
-  const miss = conf.filter(item => !owned.has(String(item.iSkinId)))
-  const total = conf.length
-  const has = total - miss.length
-  const pct = total ? ((has / total) * 100).toFixed(1) : '0.0'
-
-  const lines = [
-    `🎨 ${name} 的皮肤收集进度`,
-    `已有 ${has} / ${total} 款（${pct}%），还缺 ${miss.length} 款`
-  ]
+function renderOverview(conf, owned, countInfo, name, campId) {
+  const miss = conf.filter(item => !owned.has(String(item.iSkinId)));
+  const total = conf.length;
+  const has = total - miss.length;
+  const pct = total ? (has / total * 100).toFixed(1) : '0.0';
+  const lines = [`🎨 ${name} 的皮肤收集进度`, `已有 ${has} / ${total} 款（${pct}%），还缺 ${miss.length} 款`];
 
   // 官方口径的两个数字：估值和绝版数，自己算不出来，直接引用
-  const worth = Number(countInfo?.totalValue || 0)
-  const notForSell = Number(countInfo?.notForSell || 0)
-  if (worth > 0) lines.push(`已有皮肤估值 ${worth} 点券${notForSell > 0 ? `，其中绝版 ${notForSell} 款` : ''}`)
+  const worth = Number(countInfo?.totalValue || 0);
+  const notForSell = Number(countInfo?.notForSell || 0);
+  if (worth > 0) lines.push(`已有皮肤估值 ${worth} 点券${notForSell > 0 ? `，其中绝版 ${notForSell} 款` : ''}`);
 
   // 品质分档：统计品质名而不是营地评级，两者口径不同（评级里 SR 会盖过荣耀典藏）
-  lines.push('', '📦 按品质')
+  lines.push('', '📦 按品质');
   for (const stat of QUALITY_STATS) {
-    const hit = item => (Array.isArray(item.classTypeName) ? item.classTypeName : [])
-      .some(n => stat.aliases.includes(String(n).trim()))
-    const all = conf.filter(hit).length
-    if (!all) continue
-    const lack = miss.filter(hit).length
-    lines.push(`· ${stat.label}：有 ${all - lack} / 缺 ${lack}`)
+    const hit = item => (Array.isArray(item.classTypeName) ? item.classTypeName : []).some(n => stat.aliases.includes(String(n).trim()));
+    const all = conf.filter(hit).length;
+    if (!all) continue;
+    const lack = miss.filter(hit).length;
+    lines.push(`· ${stat.label}：有 ${all - lack} / 缺 ${lack}`);
   }
-
-  const top = [...miss].sort(valueRank).slice(0, TOP_MISSING)
+  const top = [...miss].sort(valueRank).slice(0, TOP_MISSING);
   if (top.length) {
-    lines.push('', `🔥 最值钱的缺失（前 ${top.length}）`)
-    for (const item of top) lines.push(`· ${item.szHeroTitle} —— ${skinLine(item)}`)
+    lines.push('', `🔥 最值钱的缺失（前 ${top.length}）`);
+    for (const item of top) lines.push(`· ${item.szHeroTitle} —— ${skinLine(item)}`);
   }
-
-  const byHero = new Map()
+  const byHero = new Map();
   for (const item of miss) {
-    const hero = String(item.szHeroTitle || '未知')
-    byHero.set(hero, (byHero.get(hero) || 0) + 1)
+    const hero = String(item.szHeroTitle || '未知');
+    byHero.set(hero, (byHero.get(hero) || 0) + 1);
   }
-  const heroTop = [...byHero.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_HERO)
+  const heroTop = [...byHero.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_HERO);
   if (heroTop.length) {
-    lines.push('', '🕳️ 缺得最多的英雄')
-    lines.push(heroTop.map(([hero, num]) => `${hero} ${num}`).join(' · '))
+    lines.push('', '🕳️ 缺得最多的英雄');
+    lines.push(heroTop.map(([hero, num]) => `${hero} ${num}`).join(' · '));
   }
-
-  lines.push('', '发送 #缺皮肤 妲己 看单个英雄缺哪几款')
-  lines.push('总数按营地全量配置表算，不含经典皮肤')
-  return lines.join('\n')
+  lines.push('', '发送 #缺皮肤 妲己 看单个英雄缺哪几款');
+  lines.push('总数按营地全量配置表算，不含经典皮肤');
+  return lines.join('\n');
 }

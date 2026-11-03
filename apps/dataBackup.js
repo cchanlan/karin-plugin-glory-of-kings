@@ -1,3 +1,7 @@
+import { isPrivateEvent } from '../utils/message.js';
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import { Plugin, logger, contactFriend, sendMsg, segment } from "node-karin";
 /**
  * 数据备份指令（限主人）。
  *
@@ -10,112 +14,91 @@
  * file:// 在「Bot 和 Yunzai 不在同一容器」的部署里读不到宿主路径，base64 是那种情况的兜底；
  * 三条都失败也不算白干，包已经落盘，最后一句会把服务器路径报给主人自己去取。
  */
-import fs from 'node:fs'
-import { createBackup, listBackups, formatBytes, BACKUP_DIR, BACKUP_KEEP } from '../utils/backup.js'
-import { shouldQuote } from '#utils'
-
+import fs from 'node:fs';
+import { createBackup, listBackups, formatBytes, BACKUP_DIR, BACKUP_KEEP } from '../utils/backup.js';
+import { shouldQuote } from '#utils';
 const fmtTime = ms => {
-  const d = new Date(ms)
-  const pad = n => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
+  const d = new Date(ms);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
 
 /** 私聊上下文：群里发备份等于把凭证甩在公屏上 */
-function isPrivate (e) {
-  return !e.isGroup && !e.group_id && !e.group
-}
 
-async function sendBackupFile (e, file, name) {
-  const errors = []
-  const seg = { type: 'file', data: { file: `file://${file}`, name } }
-
-  const attempts = [
-    ['file 消息段', async () => e.bot.sendApi('send_msg', {
-      message_type: 'private', user_id: e.user_id, message: [seg]
-    })],
-    ['适配器 sendFile', async () => {
-      const target = e.friend || e.bot?.pickFriend?.(e.user_id)
-      if (!target?.sendFile) throw new Error('适配器没有 sendFile')
-      return target.sendFile(file, name)
-    }],
-    ['base64', async () => {
-      const data = await fs.promises.readFile(file)
-      return e.bot.sendApi('send_msg', {
-        message_type: 'private',
-        user_id: e.user_id,
-        message: [{ type: 'file', data: { file: `base64://${data.toString('base64')}`, name } }]
-      })
-    }]
-  ]
-
-  for (const [via, run] of attempts) {
-    try {
-      await run()
-      return { ok: true, via, errors }
-    } catch (err) {
-      errors.push(`${via}: ${err?.message || err}`)
-    }
+async function sendBackupFile(e, file, name) {
+  const contact = contactFriend(e.userId);
+  const errors = [];
+  try {
+    await e.bot.uploadFile(contact, file, name);
+    return { ok: true, via: '文件上传', errors };
+  } catch (error) {
+    errors.push(error.message);
+    logger.debug('[王者文件] 上传失败，尝试文件消息：' + error.message);
   }
-  return { ok: false, via: '', errors }
+  try {
+    const result = await sendMsg(e.selfId, contact, segment.file(resourceUrl(await fs.promises.readFile(file)), name));
+    return { ok: Boolean(result?.messageId), via: '文件消息', errors };
+  } catch (error) {
+    errors.push(error.message);
+    logger.error('[王者文件] 发送失败：' + error.message);
+    return { ok: false, via: '', errors };
+  }
 }
-
-export class DataBackup extends plugin {
-  constructor () {
+export class DataBackup extends Plugin {
+  constructor() {
     super({
       name: '王者数据备份',
-      dsc: '打包插件数据与配置私发给主人',
+      desc: '打包插件数据与配置私发给主人',
       event: 'message',
       // 和插件其他新指令一致用 0：战绩查询那条正则是宽匹配，抢在它前面更稳
       priority: 0,
-      rule: [
-        { reg: '^#王者(数据)?备份$', fnc: 'backup', permission: 'master' },
-        { reg: '^#王者备份列表$', fnc: 'list', permission: 'master' }
-      ]
-    })
+      rule: [{
+        reg: '^#王者(数据)?备份$',
+        fnc: 'backup',
+        permission: 'master'
+      }, {
+        reg: '^#王者备份列表$',
+        fnc: 'list',
+        permission: 'master'
+      }]
+    });
+    this.priority = 0;
   }
-
-  async backup (e) {
-    if (!isPrivate(e)) {
-      return e.reply('备份包里有营地登录凭证，不在群里发。请私聊我发「#王者数据备份」', shouldQuote())
+  async backup(e) {
+    if (isBlockedEvent(e)) return true;
+    if (!isPrivateEvent(e)) {
+      return e.reply('请私聊发送 #王者数据备份', {
+        reply: shouldQuote()
+      });
     }
-
-    await e.reply('📦 正在打包插件数据…', shouldQuote())
-
-    let result
+    await e.reply('📦 正在打包插件数据…', {
+      reply: shouldQuote()
+    });
+    let result;
     try {
-      result = await createBackup()
+      result = await createBackup();
     } catch (err) {
-      logger.error(`[王者插件] 备份打包失败：${err?.stack || err}`)
-      return e.reply(`❌ 打包失败：${err?.message || err}`)
+      logger.error(`[王者插件] 备份打包失败：${err?.stack || err}`);
+      // ⚠️ 补 shouldQuote()（2026-10-06 修）：同文件 79/82/112/119 行都传了，只有这条漏了，
+      //    于是「正在打包…」引用而「打包失败…」不引用，同一功能的观感断裂。
+      return e.reply('打包失败，请稍后再试', {
+        reply: shouldQuote()
+      });
     }
-
-    const sent = await sendBackupFile(e, result.file, result.name)
-    if (!sent.ok) logger.error(`[王者插件] 备份发送失败：${sent.errors.join(' / ')}`)
-
-    const lines = [
-      '📦 王者插件数据备份',
-      `文件：${result.name}`,
-      `体积：${formatBytes(result.size)}（原始 ${formatBytes(result.rawSize)} / ${result.names.length} 个文件）`,
-      result.skipped.length ? `⚠️ 跳过 ${result.skipped.length} 个：${result.skipped.map(s => s.name).join('、')}` : '',
-      sent.ok
-        ? `已通过「${sent.via}」发送，注意这份包含登录凭证，别转发`
-        : `⚠️ 文件发送失败，包已落在服务器：${result.file}`,
-      `保留最近 ${BACKUP_KEEP} 份${result.pruned.length ? `，本次清掉 ${result.pruned.length} 份旧的` : ''}`,
-      '恢复方式：解压后把 data/ 和 config/config/ 覆盖回插件目录，再重启'
-    ].filter(Boolean)
-
-    return e.reply(lines.join('\n'))
+    const sent = await sendBackupFile(e, result.file, result.name);
+    if (!sent.ok) logger.error(`[王者插件] 备份发送失败：${sent.errors.join(' / ')}`);
+    const lines = ['📦 王者插件数据备份', `文件：${result.name}`, `体积：${formatBytes(result.size)}（原始 ${formatBytes(result.rawSize)} / ${result.names.length} 个文件）`, result.skipped.length ? `⚠️ 跳过 ${result.skipped.length} 个：${result.skipped.map(s => s.name).join('、')}` : '', sent.ok ? `已通过「${sent.via}」发送，注意这份包含登录凭证，别转发` : `⚠️ 文件发送失败，包已落在服务器：${result.file}`, `保留最近 ${BACKUP_KEEP} 份${result.pruned.length ? `，本次清掉 ${result.pruned.length} 份旧的` : ''}`, '恢复方式：解压后把 data/ 和 config/ 覆盖到 Karin 根目录下的 @karinjs/karin-plugin-glory-of-kings/，再重启 Karin'].filter(Boolean);
+    return e.reply(lines.join('\n'));
   }
-
-  async list (e) {
-    const items = listBackups()
-    if (!items.length) return e.reply('还没有备份，发「#王者数据备份」打一份', shouldQuote())
-
-    const lines = [
-      `📦 已有 ${items.length} 份备份（最多留 ${BACKUP_KEEP} 份）`,
-      ...items.map((item, i) => `${i + 1}. ${fmtTime(item.mtime)} · ${formatBytes(item.size)}`),
-      `目录：${BACKUP_DIR}`
-    ]
-    return e.reply(lines.join('\n'), shouldQuote())
+  async list(e) {
+    if (isBlockedEvent(e)) return true;
+    const items = listBackups();
+    if (!items.length) return e.reply('还没有备份，发「#王者数据备份」打一份', {
+      reply: shouldQuote()
+    });
+    const lines = [`📦 已有 ${items.length} 份备份（最多留 ${BACKUP_KEEP} 份）`, ...items.map((item, i) => `${i + 1}. ${fmtTime(item.mtime)} · ${formatBytes(item.size)}`), `目录：${BACKUP_DIR}`];
+    return e.reply(lines.join('\n'), {
+      reply: shouldQuote()
+    });
   }
 }

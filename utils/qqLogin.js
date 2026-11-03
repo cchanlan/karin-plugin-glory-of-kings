@@ -1,7 +1,12 @@
-import crypto from 'node:crypto'
-import fetch from 'node-fetch'
-import puppeteer from '#puppeteer'
-import { buildSpecialEncodeParam, decodeEncodeResUserKey } from './wechatLogin.js'
+import fs from 'node:fs';
+import path from 'node:path';
+import { karinPathBase } from 'node-karin/root';
+import browserDriver from 'puppeteer-core';
+import { browserFinder } from '@snapka/browser-finder';
+import { logger } from "node-karin";
+import crypto from 'node:crypto';
+import fetch from 'node-fetch';
+import { buildSpecialEncodeParam, decodeEncodeResUserKey } from './wechatLogin.js';
 
 /**
  * 王者营地 QQ 扫码登录。
@@ -17,96 +22,79 @@ import { buildSpecialEncodeParam, decodeEncodeResUserKey } from './wechatLogin.j
  *   3. 二维码从【页面里】截，不能另开一个会话单独生成
  */
 
-const CAMP_QQ_APPID = '1105200115'
-const LOGIN_PAGE = `https://openmobile.qq.com/oauth2.0/m_authorize?client_id=${CAMP_QQ_APPID}&scope=all&redirect_uri=auth://tauth.qq.com/&style=qr&response_type=code`
-const PC_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+const CAMP_QQ_APPID = '1105200115';
+const LOGIN_PAGE = `https://openmobile.qq.com/oauth2.0/m_authorize?client_id=${CAMP_QQ_APPID}&scope=all&redirect_uri=auth://tauth.qq.com/&style=qr&response_type=code`;
+const PC_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // 扫码页在手机 UA 下才给二维码版式
-const QR_UA = 'Mozilla/5.0 (Linux; Android 15; V2366GA Build/V417IR; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/110.0.5481.154 Safari/537.36 tencent_game_emulator'
+const QR_UA = 'Mozilla/5.0 (Linux; Android 15; V2366GA Build/V417IR; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/110.0.5481.154 Safari/537.36 tencent_game_emulator';
 
 // 外置渲染（puppeteerWS 连远程 chromium）时页面往返更慢，超时都放宽一些
-const PAGE_TIMEOUT_MS = 90 * 1000
-const QR_WAIT_TIMEOUT_MS = 60 * 1000
-const SCAN_TIMEOUT_MS = 3 * 60 * 1000
+const PAGE_TIMEOUT_MS = 90 * 1000;
+const QR_WAIT_TIMEOUT_MS = 60 * 1000;
+const SCAN_TIMEOUT_MS = 3 * 60 * 1000;
 
 /**
- * 取宿主渲染器。
- * ⚠️ 必须返回 null 而不是空对象 —— `lib/renderer/loader.js` 的 getRenderer() 在
- * 「配置的渲染后端不是 puppeteer」时返回 `{}`，直接拿它会在 browserInit 上炸成
- * 「renderer.browserInit is not a function」。这种环境下得走自己 launch 的兜底。
+ * 登录接口的 fetch 超时。这两个请求（ysdk 换三件套、营地 /user/login）不带
+ * AbortSignal：对端一旦「连得上但一直不回包」，await 会永远挂起，「登录任务进行中」
+ * 就再也解不开（api.js 的 REQUEST_TIMEOUT_MS 处理的是同一类坑，这个是登录链路版）。
  */
-function resolveRenderer(e) {
-  for (const candidate of [e?.runtime?.puppeteer, puppeteer]) {
-    if (candidate && typeof candidate.browserInit === 'function') {
-      return candidate
+const REQUEST_TIMEOUT_MS = 15000;
+
+/** 读取 Karin 浏览器插件的配置；不借用或替换 render 管理器。 */
+function readBrowserConfig() {
+  for (const file of [path.join(karinPathBase, '@karinjs-plugin-puppeteer', 'config', 'config.json'), path.join(karinPathBase, '@karinjs', 'plugin-puppeteer', 'config', 'config.json')]) {
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (error) {
+      if (error.code !== 'ENOENT') logger.warn('[营地QQ登录] 浏览器配置读取失败：' + error.message);
     }
   }
-  return null
+  return {
+    headless: true,
+    findBrowser: true,
+    args: process.platform === 'linux' ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] : []
+  };
 }
 
-/**
- * 兜底：自己起一个浏览器。
- * 宿主的渲染后端不是 puppeteer 时（换成外置/别的渲染器），借不到实例，只能自己来。
- * 这样拿到的实例归本流程所有，用完必须 close，别留给下次（会变孤儿进程）。
- */
-export async function launchOwnBrowser() {
-  let puppeteerPkg = null
-  try {
-    puppeteerPkg = (await import('puppeteer')).default
-  } catch (error) {
-    logger.error(`[营地QQ登录] 未能加载 puppeteer 包: ${error.message}`)
-    return null
-  }
-
-  const browser = await puppeteerPkg.launch({
-    headless: 'new',
-    args: [
-      '--disable-gpu',
-      '--disable-setuid-sandbox',
-      '--no-sandbox',
-      '--no-zygote',
-      '--disable-dev-shm-usage'
-    ],
-    timeout: 60 * 1000
-  }).catch(error => {
-    logger.error(`[营地QQ登录] 浏览器启动失败: ${error.message}`)
-    return null
-  })
-
-  if (browser) {
-    logger.info('[营地QQ登录] 宿主渲染后端不是 puppeteer，已自行启动浏览器')
-  }
-  return browser
+/** QQ 授权使用独立浏览器会话，用完关闭；不影响其它插件出图。 */
+export async function launchLoginBrowser() {
+  const config = readBrowserConfig();
+  const configured = typeof config.executablePath === 'string' && fs.existsSync(config.executablePath) ? config.executablePath : '';
+  const detected = configured ? null : await browserFinder.findFirstChromiumCore();
+  const executablePath = configured || detected?.executablePath;
+  if (!executablePath) throw new Error('未找到浏览器，请在 Karin 插件管理安装并配置 @karinjs/plugin-puppeteer');
+  const args = Array.isArray(config.args) ? config.args.slice() : [];
+  if (process.platform === 'linux') for (const flag of ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']) if (!args.includes(flag)) args.push(flag);
+  const browser = await browserDriver.launch({
+    executablePath,
+    headless: true,
+    args,
+    timeout: 60000,
+    ...(config.userDataDir ? {
+      userDataDir: undefined
+    } : {})
+  });
+  return {
+    browser,
+    owned: true
+  };
 }
 
 /**
  * 拿浏览器实例。
  * @returns {Promise<{browser, owned}|null>} owned=true 表示是自己起的，close 时要负责关掉
  */
-async function acquireBrowser(renderer, { retries = 4, intervalMs = 700 } = {}) {
-  if (renderer) {
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      const browser = await renderer.browserInit().catch(error => {
-        logger.error(`[营地QQ登录] 浏览器初始化失败: ${error.message}`)
-        return null
-      })
-      if (browser) {
-        return { browser, owned: false }
-      }
-      if (attempt < retries) {
-        // browserInit() 在并发（别人正在出图）时会直接返回 false，等一下再试
-        await sleep(intervalMs)
-      }
-    }
-    logger.warn('[营地QQ登录] 宿主浏览器多次获取失败，改为自己启动')
+async function acquireBrowser() {
+  try {
+    return await launchLoginBrowser();
+  } catch (error) {
+    logger.error('[营地QQ登录] 启动浏览器失败：' + error.message);
+    return null;
   }
-
-  const browser = await launchOwnBrowser()
-  return browser ? { browser, owned: true } : null
 }
-
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
@@ -114,14 +102,13 @@ function sleep(ms) {
  * 走的是腾讯 YSDK 的 QQCodeLogin，签名方式是社区逆向出来的固定协议。
  */
 async function exchangeCodeForTokens(code) {
-  const timestamp = String(Math.floor(Date.now() / 1000))
-  const body = JSON.stringify({ appID: CAMP_QQ_APPID, loginCode: code })
-  const signStr = `POST\n/cmd/QQCodeLogin\njson\nysdk\n${timestamp}\n${body}`
-  const digest = crypto
-    .createHmac('sha256', 'yyb@cloud_game:CQ8FA#')
-    .update(signStr)
-    .digest('base64')
-
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const body = JSON.stringify({
+    appID: CAMP_QQ_APPID,
+    loginCode: code
+  });
+  const signStr = `POST\n/cmd/QQCodeLogin\njson\nysdk\n${timestamp}\n${body}`;
+  const digest = crypto.createHmac('sha256', 'yyb@cloud_game:CQ8FA#').update(signStr).digest('base64');
   const response = await fetch('https://ysdk.qq.com/cmd/QQCodeLogin?', {
     method: 'POST',
     headers: {
@@ -130,22 +117,21 @@ async function exchangeCodeForTokens(code) {
       'Auth-Secret-Digest': digest,
       'Auth-Request-Time': timestamp
     },
-    body
-  })
-  const result = await response.json().catch(() => null)
-
+    body,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  });
+  const result = await response.json().catch(() => null);
   if (!response.ok || result?.code !== 0 || result?.data?.ret !== 0) {
-    throw new Error(result?.errmsg || result?.data?.errmsg || `换取登录凭证失败（${response.status}）`)
+    throw new Error(result?.errmsg || result?.data?.errmsg || `换取登录凭证失败（${response.status}）`);
   }
-
-  const data = result.data
+  const data = result.data;
   return {
     accessToken: String(data.accessToken || ''),
     openId: String(data.openID || ''),
     payToken: String(data.payToken || ''),
     refreshToken: String(data.refreshToken || ''),
     expiresIn: Number(data.expiresIn || 0)
-  }
+  };
 }
 
 /**
@@ -177,8 +163,7 @@ async function loginCampByOpenSdk(tokens) {
     accessToken: tokens.accessToken,
     openId: tokens.openId,
     payToken: tokens.payToken
-  })
-
+  });
   const response = await fetch('https://ssl.kohsocialapp.qq.com:10001/user/login', {
     method: 'POST',
     headers: {
@@ -190,15 +175,14 @@ async function loginCampByOpenSdk(tokens) {
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'x-log-uid': crypto.randomUUID().toUpperCase()
     },
-    body: form.toString()
-  })
-
-  const data = await response.json().catch(() => null)
+    body: form.toString(),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  });
+  const data = await response.json().catch(() => null);
   if (!response.ok || data?.returnCode !== 0 || !data?.data?.userId || !data?.data?.token) {
-    throw new Error(data?.returnMsg || `营地登录失败（${response.status}）`)
+    throw new Error(data?.returnMsg || `营地登录失败（${response.status}）`);
   }
-
-  const userKey = decodeEncodeResUserKey(data.data.encodeRes)
+  const userKey = decodeEncodeResUserKey(data.data.encodeRes);
   return {
     userId: String(data.data.userId || ''),
     token: String(data.data.token || ''),
@@ -220,45 +204,7 @@ async function loginCampByOpenSdk(tokens) {
     realRegisterTime: String(data.data.realRegisterTime || ''),
     loginPlatform: 'qq',
     lastLoginAt: new Date().toISOString()
-  }
-}
-
-/**
- * ⭐ **免扫码续期**：拿账号池里存着的三件套重新登录一次，换一份新的营地登录态。
- *
- * ## 为什么可行
- *
- * 营地的 `/user/login` 的 `openSdk` 分支**只吃三件套**（accessToken + openId + payToken），
- * 全程不需要 `code`。而三件套是 YSDK 签发的、**有效期 60 天**，比营地自己的 token（约 30 天）长 ——
- * 所以营地 token 到期时，拿三件套重登一次就能续上，**用户完全不用再扫码**。
- *
- * 2026-09-18 实测：`payToken` 传空串照样 `returnCode=0`（营地不校验它），
- * 所以**连 payToken 都不用存**，光靠 `accessToken + appOpenid` 就能续。
- *
- * ## ⚠️ 两条必须守住的规矩
- *
- * 1. **重登会顶掉旧 token**（实测：重放成功后旧 token 立刻变 `-30003`）。
- *    所以调用方拿到新凭证后**必须立刻写回账号池**，中间不能失败 ——
- *    否则旧票被作废、新票又没存，那个号就彻底废了。
- * 2. **别在请求热路径里调**：每次重登都要打营地接口，且会换掉 token（正在飞的请求可能刚好用旧票）。
- *    交给定时任务提前续（见 apps/campRenew.js）。
- *
- * @param {object} account 账号池里的一条账号记录（要带 accessToken / appOpenid）
- * @returns {Promise<object>} 新的账号数据（交给 authStore.upsertAccount 写回）
- */
-export async function reloginQQAccount (account) {
-  const accessToken = String(account?.accessToken || '')
-  const openId = String(account?.appOpenid || account?.openId || '')
-  if (!accessToken || !openId) {
-    throw new Error('这个号没存三件套（accessToken / openId），续不了，得重新扫码一次')
-  }
-
-  return await loginCampByOpenSdk({
-    accessToken,
-    openId,
-    payToken: String(account?.payToken || ''),
-    refreshToken: String(account?.refreshToken || '')
-  })
+  };
 }
 
 /**
@@ -267,132 +213,157 @@ export async function reloginQQAccount (account) {
  * @returns {Promise<{browser, page, qrcodeBuffer, waitForCode, close}>}
  */
 export async function createQQLoginSession(e) {
-  const renderer = resolveRenderer(e)
-  const acquired = await acquireBrowser(renderer)
+  const acquired = await acquireBrowser();
   if (!acquired) {
-    throw new Error('浏览器不可用，无法发起 QQ 扫码登录')
+    throw new Error('浏览器不可用，无法发起 QQ 扫码登录');
   }
-  const { browser, owned: ownBrowser } = acquired
+  const {
+    browser,
+    owned: ownBrowser
+  } = acquired;
 
-  const page = await browser.newPage()
-  let closed = false
-  let codeValue = ''
-  let codeResolve = null
+  // ⚠️ newPage 必须纳入 owned 浏览器的清理范围（2026-10-06 修）：下面的 close() 是唯一的
+  //    清理入口，而它只在 314 行开始的 try/catch 里被调用；newPage 在这个 try 之外，
+  //    一旦它抛错（浏览器刚起来就崩、连接断开、进程数不足），异常直接冒泡出去，
+  //    close() 永远不执行 —— 而 ownBrowser 为 true 时（配置的渲染后端不是 puppeteer，
+  //    resolveRenderer 返回 null → acquireBrowser 走 launchOwnBrowser）每次重试都会漏一个
+  //    chromium 进程，吃满内存。第 305 行的注释正是要防这个。
+  let page;
+  try {
+    page = await browser.newPage();
+  } catch (error) {
+    if (ownBrowser) {
+      try {
+        await browser.close();
+      } catch {}
+    }
+    logger.error(`[营地QQ登录] 创建页面失败: ${error.message}`);
+    throw error;
+  }
+  let closed = false;
+  let codeValue = '';
+  let codeResolve = null;
   const codePromise = new Promise(resolve => {
-    codeResolve = resolve
-  })
-
+    codeResolve = resolve;
+  });
   const close = async () => {
     if (closed) {
-      return
+      return;
     }
-    closed = true
+    closed = true;
     try {
-      await page.close()
+      await page.close();
     } catch (error) {
-      logger.debug(`[营地QQ登录] 关闭页面失败: ${error.message}`)
+      logger.debug(`[营地QQ登录] 关闭页面失败: ${error.message}`);
     }
     if (ownBrowser) {
       // 自己起的浏览器必须关掉，否则会变成常驻孤儿进程
       try {
-        await browser.close()
+        await browser.close();
       } catch (error) {
-        logger.warn(`[营地QQ登录] 关闭自启浏览器失败: ${error.message}`)
+        logger.warn(`[营地QQ登录] 关闭自启浏览器失败: ${error.message}`);
       }
     }
-  }
-
+  };
   try {
-    await page.setUserAgent(QR_UA)
-    await page.setViewport({ width: 420, height: 760, isMobile: true })
+    await page.setUserAgent(QR_UA);
+    await page.setViewport({
+      width: 420,
+      height: 760,
+      isMobile: true
+    });
 
     // 拦截最后那一下 auth:// 回调 —— code 只在 query 里出现
     page.on('request', request => {
-      const url = request.url()
+      const url = request.url();
       if (!url.startsWith('auth://') && !url.includes('tauth.qq.com')) {
-        return
+        return;
       }
-      const matched = /[?&]code=([0-9A-Za-z]+)/.exec(url)
+      const matched = /[?&]code=([0-9A-Za-z]+)/.exec(url);
       if (matched && !codeValue) {
-        codeValue = matched[1]
-        logger.info(`[营地QQ登录] 已获取授权码（${codeValue.slice(0, 8)}…）`)
-        codeResolve?.(codeValue)
+        codeValue = matched[1];
+        logger.info(`[营地QQ登录] 已获取授权码（${codeValue.slice(0, 8)}…）`);
+        codeResolve?.(codeValue);
       }
-    })
-
-    logger.info(`[营地QQ登录] 发起登录（${renderer ? '借宿主浏览器' : '自备浏览器'}）`)
+    });
+    logger.info(`[营地QQ登录] 发起登录（原生浏览器会话）`);
     try {
-      await page.goto(LOGIN_PAGE, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS })
+      await page.goto(LOGIN_PAGE, {
+        waitUntil: 'domcontentloaded',
+        timeout: PAGE_TIMEOUT_MS
+      });
     } catch (error) {
       // 外置渲染的机器若访问不了 QQ 登录页，会卡在这里 —— 日志里说清楚，别让它看起来像随机失败
-      logger.error(`[营地QQ登录] 打开登录页失败: ${error.message}`)
-      throw new Error('打开 QQ 登录页失败，请稍后重试')
+      logger.error(`[营地QQ登录] 打开登录页失败: ${error.message}`);
+      throw new Error('打开 QQ 登录页失败，请稍后重试');
     }
 
     // 等页面把二维码渲染出来（在 iframe / 各版式下找一找）
-    const deadline = Date.now() + QR_WAIT_TIMEOUT_MS
-    let box = null
+    const deadline = Date.now() + QR_WAIT_TIMEOUT_MS;
+    let box = null;
     while (Date.now() < deadline) {
       box = await page.evaluate(() => {
-        const selectors = [
-          '#qrlogin_img', '.qrlogin_img', 'img[src*="ptqrshow"]',
-          'img[src*="qrcode"]', 'canvas#qrlogin_canvas', '.qrlogin canvas'
-        ]
+        const selectors = ['#qrlogin_img', '.qrlogin_img', 'img[src*="ptqrshow"]', 'img[src*="qrcode"]', 'canvas#qrlogin_canvas', '.qrlogin canvas'];
         for (const selector of selectors) {
-          const el = document.querySelector(selector)
+          const el = document.querySelector(selector);
           if (el) {
-            const rect = el.getBoundingClientRect()
+            const rect = el.getBoundingClientRect();
             if (rect.width > 40 && rect.height > 40) {
-              return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+              return {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height
+              };
             }
           }
         }
-        return null
-      }).catch(() => null)
+        return null;
+      }).catch(() => null);
       if (box) {
-        break
+        break;
       }
-      await sleep(800)
+      await sleep(800);
     }
-
     if (!box) {
-      throw new Error('未能获取登录二维码，请稍后重试')
+      throw new Error('未能获取登录二维码，请稍后重试');
     }
 
     // 优先在页面内把二维码读成 base64 —— 不走截图。
     // 截图依赖渲染后端（外置渲染/远程 chromium 上 clip、deviceScaleFactor 都可能不靠谱），
     // 而页面内的图片本来就是同源请求，直接 fetch 回来最稳，体积也更小。
     let qrcodeBuffer = await page.evaluate(async () => {
-      const el = document.querySelector('#qrlogin_img, .qrlogin_img, img[src*="ptqrshow"], img[src*="qrcode"], canvas#qrlogin_canvas, .qrlogin canvas')
+      const el = document.querySelector('#qrlogin_img, .qrlogin_img, img[src*="ptqrshow"], img[src*="qrcode"], canvas#qrlogin_canvas, .qrlogin canvas');
       if (!el) {
-        return null
+        return null;
       }
       try {
         if (el.tagName === 'CANVAS') {
-          return el.toDataURL('image/png')
+          return el.toDataURL('image/png');
         }
-        const src = el.currentSrc || el.src || el.getAttribute('data-src')
+        const src = el.currentSrc || el.src || el.getAttribute('data-src');
         if (!src) {
-          return null
+          return null;
         }
-        const response = await fetch(src, { credentials: 'include' })
-        const blob = await response.blob()
+        const response = await fetch(src, {
+          credentials: 'include'
+        });
+        const blob = await response.blob();
         return await new Promise(resolve => {
-          const reader = new FileReader()
-          reader.onload = () => resolve(reader.result)
-          reader.onerror = () => resolve(null)
-          reader.readAsDataURL(blob)
-        })
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        });
       } catch (error) {
-        return null
+        return null;
       }
-    }).catch(() => null)
-
+    }).catch(() => null);
     if (typeof qrcodeBuffer === 'string' && qrcodeBuffer.startsWith('data:')) {
-      qrcodeBuffer = Buffer.from(qrcodeBuffer.slice(qrcodeBuffer.indexOf(',') + 1), 'base64')
+      qrcodeBuffer = Buffer.from(qrcodeBuffer.slice(qrcodeBuffer.indexOf(',') + 1), 'base64');
     } else {
       // 兜底：页面里读不到（版式特殊）才截图；区域截图失败再退整页
-      logger.warn('[营地QQ登录] 页面内未读到二维码图片，改用截图')
+      logger.warn('[营地QQ登录] 页面内未读到二维码图片，改用截图');
       qrcodeBuffer = await page.screenshot({
         clip: {
           x: Math.max(0, box.x - 12),
@@ -401,70 +372,77 @@ export async function createQQLoginSession(e) {
           height: box.height + 24
         }
       }).catch(async error => {
-        logger.warn(`[营地QQ登录] 二维码区域截图失败，改用整页截图: ${error.message}`)
-        return page.screenshot().catch(() => null)
-      })
+        logger.warn(`[营地QQ登录] 二维码区域截图失败，改用整页截图: ${error.message}`);
+        return page.screenshot().catch(() => null);
+      });
     }
-
     if (!qrcodeBuffer) {
-      throw new Error('二维码截图失败，请稍后重试')
+      throw new Error('二维码截图失败，请稍后重试');
     }
-
-    const waitForCode = async ({ timeoutMs = SCAN_TIMEOUT_MS, onStatusChange } = {}) => {
-      const began = Date.now()
-      let scannedNotified = false
+    const waitForCode = async ({
+      timeoutMs = SCAN_TIMEOUT_MS,
+      onStatusChange
+    } = {}) => {
+      const began = Date.now();
+      let scannedNotified = false;
       while (Date.now() - began < timeoutMs) {
         if (codeValue) {
-          return codeValue
+          return codeValue;
         }
         if (closed) {
-          const error = new Error('登录会话已结束')
-          error.code = 'QR_CANCELED'
-          throw error
+          const error = new Error('登录会话已结束');
+          error.code = 'QR_CANCELED';
+          throw error;
         }
         // 页面自己会轮询，这里只借 DOM 判断「已扫码」给用户一个提示
         // （沿用微信那套状态协议：404 = 已扫码待确认）
         if (!scannedNotified && typeof onStatusChange === 'function') {
-          const scanned = await page
-            .evaluate(() => /扫码成功|请在手机上确认|已扫码|确认登录/.test(document.body?.innerText || ''))
-            .catch(() => false)
+          const scanned = await page.evaluate(() => /扫码成功|请在手机上确认|已扫码|确认登录/.test(document.body?.innerText || '')).catch(() => false);
           if (scanned) {
-            scannedNotified = true
-            void onStatusChange({ statusCode: 404 })
+            scannedNotified = true;
+            void onStatusChange({
+              statusCode: 404
+            });
           }
         }
-        const waitResult = await Promise.race([
-          codePromise.then(() => 'code'),
-          sleep(1500).then(() => 'tick')
-        ])
+        const waitResult = await Promise.race([codePromise.then(() => 'code'), sleep(1500).then(() => 'tick')]);
         if (waitResult === 'code') {
-          return codeValue
+          return codeValue;
         }
       }
-
-      const error = new Error('登录等待超时')
-      error.code = scannedNotified ? 'QR_TIMEOUT' : 'QR_EXPIRED'
-      throw error
-    }
-
-    return { browser, page, qrcodeBuffer, waitForCode, close }
+      const error = new Error('登录等待超时');
+      error.code = scannedNotified ? 'QR_TIMEOUT' : 'QR_EXPIRED';
+      throw error;
+    };
+    return {
+      browser,
+      page,
+      qrcodeBuffer,
+      waitForCode,
+      close
+    };
   } catch (error) {
-    await close()
-    throw error
+    await close();
+    throw error;
   }
 }
 
 /**
  * 等扫码 → 换三件套 → 营地登录，返回可直接写入账号池的 account。
  */
-export async function waitForQQLogin(session, { onStatusChange } = {}) {
-  const code = await session.waitForCode({ onStatusChange })
-
-  logger.info('[营地QQ登录] 开始用授权码换取登录凭证')
-  const tokens = await exchangeCodeForTokens(code)
-  logger.info(`[营地QQ登录] 登录凭证换取成功，有效期约 ${Math.round(tokens.expiresIn / 86400)} 天`)
-
-  const account = await loginCampByOpenSdk(tokens)
-  logger.info(`[营地QQ登录] 营地登录成功，userId=${account.userId}`)
-  return { account, tokens }
+export async function waitForQQLogin(session, {
+  onStatusChange
+} = {}) {
+  const code = await session.waitForCode({
+    onStatusChange
+  });
+  logger.info('[营地QQ登录] 开始用授权码换取登录凭证');
+  const tokens = await exchangeCodeForTokens(code);
+  logger.info(`[营地QQ登录] 登录凭证换取成功，有效期约 ${Math.round(tokens.expiresIn / 86400)} 天`);
+  const account = await loginCampByOpenSdk(tokens);
+  logger.info(`[营地QQ登录] 营地登录成功，userId=${account.userId}`);
+  return {
+    account,
+    tokens
+  };
 }

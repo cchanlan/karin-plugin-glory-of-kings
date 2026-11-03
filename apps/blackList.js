@@ -1,51 +1,42 @@
+import { getAtUserId } from '../utils/atTarget.js';
+import { Plugin } from "node-karin";
 /**
  * #王者拉黑 / #王者取消拉黑 / #王者黑名单（主人指令）
  *
  * 名单存在 config.yaml 的 blackList 里，锅巴面板也能直接改（两边是同一份）。
- * 真正的拦截不在这个文件：指令走 utils/blackList.js 里 guardApps 套的闸门，
+ * 真正的拦截不在这个文件：指令入口检查 isBlockedEvent，
  * 推送在各自遍历订阅的地方跳过。这里只负责增删查和文案。
  */
-import { AT_HEAD, AT_TAIL, stripAtText, pickAtText, resolveTargetUserId, shouldQuote } from '#utils'
-import {
-  getBlackList,
-  addBlackUser,
-  removeBlackUser,
-  followGlobalBlack,
-  getHostBlackList
-} from '../utils/blackList.js'
+import { AT_HEAD, AT_TAIL, stripAtText, pickAtText, resolveTargetUserId, shouldQuote } from '#utils';
+import { getBlackList, addBlackUser, removeBlackUser, followGlobalBlack, getHostBlackList, isBlockedEvent } from '../utils/blackList.js';
 
 /** 名单太长时只列前这么多个，剩下的让主人去锅巴看 */
-const LIST_LIMIT = 30
-
-export class GokBlackList extends plugin {
+const LIST_LIMIT = 30;
+export class GokBlackList extends Plugin {
   /** 别给这个类套黑名单闸门，否则名单管理会被名单自己锁住 */
-  static skipBlackGuard = true
-
-  constructor () {
+  static skipBlackGuard = true;
+  constructor() {
     super({
       name: '王者黑名单',
-      dsc: '拉黑某人，让他触发不了王者插件的任何功能',
+      desc: '拉黑某人，让他触发不了王者插件的任何功能',
       event: 'message',
       // 完整锚定的短指令要抢在 queryGameStats 那些宽匹配前面
       priority: 0,
-      rule: [
-        {
-          reg: `${AT_HEAD}#王者(拉黑|加黑|禁用)\\s*(\\d*)${AT_TAIL}`,
-          fnc: 'add',
-          permission: 'master'
-        },
-        {
-          reg: `${AT_HEAD}#王者(取消拉黑|解除拉黑|解黑|取消禁用)\\s*(\\d*)${AT_TAIL}`,
-          fnc: 'remove',
-          permission: 'master'
-        },
-        {
-          reg: '^#王者黑名单(列表)?$',
-          fnc: 'list',
-          permission: 'master'
-        }
-      ]
-    })
+      rule: [{
+        reg: `${AT_HEAD}#王者(拉黑|加黑|禁用)\\s*(\\d*)${AT_TAIL}`,
+        fnc: 'add',
+        permission: 'master'
+      }, {
+        reg: `${AT_HEAD}#王者(取消拉黑|解除拉黑|解黑|取消禁用)\\s*(\\d*)${AT_TAIL}`,
+        fnc: 'remove',
+        permission: 'master'
+      }, {
+        reg: '^#王者黑名单(列表)?$',
+        fnc: 'list',
+        permission: 'master'
+      }]
+    });
+    this.priority = 0;
   }
 
   /**
@@ -55,84 +46,113 @@ export class GokBlackList extends plugin {
    * 反过来先认数字会把「@12345678」这种昵称当成 QQ 号。
    * @returns {Promise<{userId?: string, hint?: string}>}
    */
-  async pickTarget (e) {
-    if (e.at && !e.atme) return { userId: String(e.at) }
+  async pickTarget(e) {
+    if (getAtUserId(e)) return {
+      userId: getAtUserId(e)
+    };
 
-    const digits = stripAtText(e.msg).match(/(\d{5,12})(?!\d)/)
-    if (digits) return { userId: digits[1] }
-
-    const { userId, hint } = await resolveTargetUserId(e, { requireMaster: true })
+    // ⚠️⚠️ 必须有**前置**边界 `(?<!\d)`（2026-10-06 修）。
+    //    原来只有后置的 `(?!\d)`，它只保证「匹配结尾后面不是数字」，但正则引擎会
+    //    **从串中任意位置起匹配** —— 遇到 13 位以上的连续数字时，它会从第 2 位开始
+    //    截出 12 位。实测（本机 node 复现）：
+    //      "#王者拉黑 1580886057"           -> 1580886057      ✅
+    //      "#王者拉黑 1234567890123"        -> 234567890123    ❌ 第 1 位被吃掉
+    //      "#王者拉黑 1580886057123456789"  -> 057123456789    ❌ 前 2 位被吃掉
+    //    后果：主人从聊天记录里连带复制了一长串数字时，**真正想拉黑的人毫发无损**，
+    //    而回复却说「已拉黑 057123456789」—— 一个不存在的号被写进了黑名单。
+    //    加前置边界后长数字串会**取不到**（`digits` 为空），落到下面正常的「请写 QQ 号」
+    //    提示路径，而不是静默拉黑一个错的号。
+    const digits = stripAtText(e.msg).match(/(?<!\d)(\d{5,12})(?!\d)/);
+    if (digits) return {
+      userId: digits[1]
+    };
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e, {
+      requireMaster: true
+    });
     // hint 非空 = @ 了人但没认出来。它自带的兜底文案是查询语境的（让用户补营地ID），
     // 在这里得换成「写 QQ 号」
     if (hint) {
-      return { hint: `没找到「${pickAtText(e.msg)}」这个人，请从 @ 列表里点选对方，或者在指令后面写上他的 QQ 号` }
+      return {
+        hint: `没找到「${pickAtText(e.msg)}」这个人，请从 @ 列表里点选对方，或者在指令后面写上他的 QQ 号`
+      };
     }
-    if (String(userId) === String(e.user_id)) {
-      return { hint: '要操作谁呢？@ 他一下，或者在指令后面写上他的 QQ 号' }
+    if (String(userId) === String(e.userId)) {
+      return {
+        hint: '要操作谁呢？@ 他一下，或者在指令后面写上他的 QQ 号'
+      };
     }
-
-    return { userId: String(userId) }
+    return {
+      userId: String(userId)
+    };
   }
 
   /** #王者拉黑@某人 */
-  async add (e) {
-    const { userId, hint } = await this.pickTarget(e)
-    if (hint) return e.reply(hint, shouldQuote())
-
-    const result = addBlackUser(userId)
+  async add(e) {
+    if (isBlockedEvent(e)) return true;
+    const {
+      userId,
+      hint
+    } = await this.pickTarget(e);
+    if (hint) return e.reply(hint, {
+      reply: shouldQuote()
+    });
+    const result = addBlackUser(userId);
     if (result === 'exists') {
-      return e.reply(`${userId} 已经在王者黑名单里了`, shouldQuote())
+      return e.reply(`${userId} 已经在王者黑名单里了`, {
+        reply: shouldQuote()
+      });
     }
     if (result !== 'ok') {
-      return e.reply('没认出要拉黑的人，请 @ 他一下再发一次', shouldQuote())
+      return e.reply('没认出要拉黑的人，请 @ 他一下再发一次', {
+        reply: shouldQuote()
+      });
     }
-
-    return e.reply([
-      `已拉黑 ${userId}`,
-      '他发的指令不再有回应，已开的推送、日报和统计也都停',
-      '订阅还留着，想恢复发送 #王者取消拉黑@他'
-    ].join('\n'), shouldQuote())
+    return e.reply([`已拉黑 ${userId}`, '他发的指令不再有回应，已开的推送、日报和统计也都停', '订阅还留着，想恢复发送 #王者取消拉黑@他'].join('\n'), {
+      reply: shouldQuote()
+    });
   }
 
   /** #王者取消拉黑@某人 */
-  async remove (e) {
-    const { userId, hint } = await this.pickTarget(e)
-    if (hint) return e.reply(hint, shouldQuote())
-
-    const result = removeBlackUser(userId)
+  async remove(e) {
+    if (isBlockedEvent(e)) return true;
+    const {
+      userId,
+      hint
+    } = await this.pickTarget(e);
+    if (hint) return e.reply(hint, {
+      reply: shouldQuote()
+    });
+    const result = removeBlackUser(userId);
     if (result === 'absent') {
       // 只在插件名单里没找到，但人可能是被机器人全局黑名单挡着的，得说清楚
-      const inHost = followGlobalBlack() && getHostBlackList().includes(String(userId))
-      return e.reply(
-        inHost
-          ? `${userId} 不在王者黑名单里，他是被机器人的全局黑名单挡住的，去那边解除`
-          : `${userId} 不在王者黑名单里`,
-        shouldQuote()
-      )
+      const inHost = followGlobalBlack() && getHostBlackList().includes(String(userId));
+      return e.reply(inHost ? `${userId} 不在王者黑名单里，他是被机器人的全局黑名单挡住的，去那边解除` : `${userId} 不在王者黑名单里`, {
+        reply: shouldQuote()
+      });
     }
     if (result !== 'ok') {
-      return e.reply('没认出要操作的人，请 @ 他一下再发一次', shouldQuote())
+      return e.reply('没认出要操作的人，请 @ 他一下再发一次', {
+        reply: shouldQuote()
+      });
     }
-
-    return e.reply(`已把 ${userId} 移出王者黑名单，他的指令和之前订阅的推送都恢复了`, shouldQuote())
+    return e.reply(`已把 ${userId} 移出王者黑名单，他的指令和之前订阅的推送都恢复了`, {
+      reply: shouldQuote()
+    });
   }
 
   /** #王者黑名单 */
-  async list (e) {
-    const list = getBlackList()
-    const hostCount = followGlobalBlack() ? getHostBlackList().length : 0
-
-    const lines = list.length
-      ? [
-          `📕 王者黑名单（${list.length} 人）`,
-          ...list.slice(0, LIST_LIMIT).map(id => `· ${id}`),
-          list.length > LIST_LIMIT ? `……还有 ${list.length - LIST_LIMIT} 人，完整名单去 #王者设置 里看` : ''
-        ]
-      : ['王者黑名单是空的']
-
-    if (hostCount) lines.push(`另外机器人全局黑名单里的 ${hostCount} 人也一样不响应`)
-    lines.push('拉黑发送 #王者拉黑@某人，取消发送 #王者取消拉黑@某人')
-
-    return e.reply(lines.filter(Boolean).join('\n'), shouldQuote())
+  async list(e) {
+    if (isBlockedEvent(e)) return true;
+    const list = getBlackList();
+    const hostCount = followGlobalBlack() ? getHostBlackList().length : 0;
+    const lines = list.length ? [`📕 王者黑名单（${list.length} 人）`, ...list.slice(0, LIST_LIMIT).map(id => `· ${id}`), list.length > LIST_LIMIT ? `……还有 ${list.length - LIST_LIMIT} 人，完整名单去 #王者设置 里看` : ''] : ['王者黑名单是空的'];
+    if (hostCount) lines.push(`另外机器人全局黑名单里的 ${hostCount} 人也一样不响应`);
+    lines.push('拉黑发送 #王者拉黑@某人，取消发送 #王者取消拉黑@某人');
+    return e.reply(lines.filter(Boolean).join('\n'), {
+      reply: shouldQuote()
+    });
   }
 }

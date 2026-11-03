@@ -5,31 +5,33 @@
  * 但刻意保留了 summarizeSession 需要的那几个，所以段位星数直接复用 pushStore 那套——
  * 小编号回绕、赛季切换、0 星是真实值这些坑已经在那边踩平了，不重写一遍。
  */
-import { summarizeSession, getHeroNameMap, formatOnlineDuration, formatDuration, formatStarChange, formatScoreDelta } from './pushStore.js'
-
+import { summarizeSession, getHeroNameMap, formatOnlineDuration, formatDuration, formatStarChange, formatScoreDelta } from './pushStore.js';
+import { rankStarTotal, rankBand, rankBandShort, rankSegLabel } from './rankTrend.js';
 const toInt = value => {
-  const num = Number(value)
-  return Number.isFinite(num) ? Math.trunc(num) : 0
-}
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : 0;
+};
 
 /** 模式归类。mapName 实测形如「排位赛」/「排位赛 双排」/「巅峰赛」，其余按娱乐算 */
-const MODE_RULES = [
-  { test: /排位/, name: '排位赛' },
-  { test: /巅峰/, name: '巅峰赛' }
-]
-
-export function resolveMode (mapName) {
-  const name = String(mapName || '').trim()
-  return MODE_RULES.find(rule => rule.test.test(name))?.name || (name || '其它')
+const MODE_RULES = [{
+  test: /排位/,
+  name: '排位赛'
+}, {
+  test: /巅峰/,
+  name: '巅峰赛'
+}];
+export function resolveMode(mapName) {
+  const name = String(mapName || '').trim();
+  return MODE_RULES.find(rule => rule.test.test(name))?.name || name || '其它';
 }
 
 /* ------------------------------------------------------------------ 区间 */
 
 /** 今天 00:00 的时间戳（秒） */
-export function todayStart (nowMs = Date.now()) {
-  const d = new Date(nowMs)
-  d.setHours(0, 0, 0, 0)
-  return Math.floor(d.getTime() / 1000)
+export function todayStart(nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  d.setHours(0, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
 }
 
 /**
@@ -37,20 +39,20 @@ export function todayStart (nowMs = Date.now()) {
  * getDay() 里 0 是周日，而中文语境的「本周」是周一到周日，
  * 所以周日要算成本周第 7 天（往前退 6 天），不能退到下一个周一去。
  */
-export function weekStart (nowMs = Date.now()) {
-  const d = new Date(nowMs)
-  const day = d.getDay()
-  d.setHours(0, 0, 0, 0)
-  d.setDate(d.getDate() - (day === 0 ? 6 : day - 1))
-  return Math.floor(d.getTime() / 1000)
+export function weekStart(nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  const day = d.getDay();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+  return Math.floor(d.getTime() / 1000);
 }
 
 /** 本月 1 号 00:00 的时间戳（秒） */
-export function monthStart (nowMs = Date.now()) {
-  const d = new Date(nowMs)
-  d.setHours(0, 0, 0, 0)
-  d.setDate(1)
-  return Math.floor(d.getTime() / 1000)
+export function monthStart(nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(1);
+  return Math.floor(d.getTime() / 1000);
 }
 
 /**
@@ -65,15 +67,14 @@ export function monthStart (nowMs = Date.now()) {
  *
  * @returns {boolean} 今天该不该推月报
  */
-export function isMonthlyPushDay (nowMs = Date.now()) {
-  const d = new Date(nowMs)
-  if (d.getDate() < 28) return true
-  const next = new Date(d)
-  next.setDate(d.getDate() + 1)
-  return next.getMonth() !== d.getMonth()
+export function isMonthlyPushDay(nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  if (d.getDate() < 28) return true;
+  const next = new Date(d);
+  next.setDate(d.getDate() + 1);
+  return next.getMonth() !== d.getMonth();
 }
-
-const DAY_SEC = 86400
+const DAY_SEC = 86400;
 
 /**
  * 一份报告到底统计哪一段。
@@ -96,27 +97,49 @@ const DAY_SEC = 86400
  * @returns {{fromSec:number, toSec:number, scopeText:string, isPrev:boolean}}
  *   区间是闭区间 [fromSec, toSec]；scopeText 给文案用；isPrev 表示统计的是上一个完整周期
  */
-export function resolveRange (kind, nowMs = Date.now()) {
-  const nowSec = Math.floor(nowMs / 1000)
-
+export function resolveRange(kind, nowMs = Date.now()) {
+  const nowSec = Math.floor(nowMs / 1000);
   if (kind === 'weekly') {
-    const thisWeek = weekStart(nowMs)
+    const thisWeek = weekStart(nowMs);
     if (nowSec - thisWeek < 2 * DAY_SEC) {
       // 退一秒落到上周日 23:59:59，再取那一周的周一，不用减整天，跨月跨年都不用特殊照顾
-      return { fromSec: weekStart((thisWeek - 1) * 1000), toSec: thisWeek - 1, scopeText: '上周', isPrev: true }
+      return {
+        fromSec: weekStart((thisWeek - 1) * 1000),
+        toSec: thisWeek - 1,
+        scopeText: '上周',
+        isPrev: true
+      };
     }
-    return { fromSec: thisWeek, toSec: nowSec, scopeText: '本周至今', isPrev: false }
+    return {
+      fromSec: thisWeek,
+      toSec: nowSec,
+      scopeText: '本周至今',
+      isPrev: false
+    };
   }
-
   if (kind === 'monthly') {
-    const thisMonth = monthStart(nowMs)
+    const thisMonth = monthStart(nowMs);
     if (nowSec - thisMonth < 2 * DAY_SEC) {
-      return { fromSec: monthStart((thisMonth - 1) * 1000), toSec: thisMonth - 1, scopeText: '上个月', isPrev: true }
+      return {
+        fromSec: monthStart((thisMonth - 1) * 1000),
+        toSec: thisMonth - 1,
+        scopeText: '上个月',
+        isPrev: true
+      };
     }
-    return { fromSec: thisMonth, toSec: nowSec, scopeText: '本月至今', isPrev: false }
+    return {
+      fromSec: thisMonth,
+      toSec: nowSec,
+      scopeText: '本月至今',
+      isPrev: false
+    };
   }
-
-  return { fromSec: todayStart(nowMs), toSec: nowSec, scopeText: '今日', isPrev: false }
+  return {
+    fromSec: todayStart(nowMs),
+    toSec: nowSec,
+    scopeText: '今日',
+    isPrev: false
+  };
 }
 
 /* ------------------------------------------------------------------ 统计 */
@@ -130,72 +153,73 @@ export function resolveRange (kind, nowMs = Date.now()) {
  * @param {Array<object>} battles 倒序（最新在前）
  * @returns {{type:'win'|'lose'|'', count:number}}
  */
-export function maxStreak (battles = []) {
-  let best = { type: '', count: 0 }
-  let curType = 0
-  let curCount = 0
+export function maxStreak(battles = []) {
+  let best = {
+    type: '',
+    count: 0
+  };
+  let curType = 0;
+  let curCount = 0;
 
   // 从最早往最新扫，方向不影响「最长一段」的长度
   for (let i = battles.length - 1; i >= 0; i -= 1) {
-    const result = toInt(battles[i]?.gameresult)
+    const result = toInt(battles[i]?.gameresult);
     // 1胜 2负，其它值是逃跑/未结算，中断计数
     if (result !== 1 && result !== 2) {
-      curType = 0
-      curCount = 0
-      continue
+      curType = 0;
+      curCount = 0;
+      continue;
     }
-
-    if (result === curType) curCount += 1
-    else {
-      curType = result
-      curCount = 1
+    if (result === curType) curCount += 1;else {
+      curType = result;
+      curCount = 1;
     }
-
     if (curCount > best.count) {
-      best = { type: curType === 1 ? 'win' : 'lose', count: curCount }
+      best = {
+        type: curType === 1 ? 'win' : 'lose',
+        count: curCount
+      };
     }
   }
-
-  return best
+  return best;
 }
 
 /** 按天分组，返回从早到晚。周报的柱状图用 */
-export function groupByDay (battles = []) {
-  const days = new Map()
-
+export function groupByDay(battles = []) {
+  const days = new Map();
   for (const item of battles) {
-    const ts = toInt(item?.dtEventTime)
-    if (ts <= 0) continue
-
-    const d = new Date(ts * 1000)
-    const key = `${d.getMonth() + 1}/${d.getDate()}`
-
+    const ts = toInt(item?.dtEventTime);
+    if (ts <= 0) continue;
+    const d = new Date(ts * 1000);
+    const key = `${d.getMonth() + 1}/${d.getDate()}`;
     if (!days.has(key)) {
-      days.set(key, { date: key, weekday: '日一二三四五六'[d.getDay()], count: 0, win: 0, lose: 0, ts })
+      days.set(key, {
+        date: key,
+        weekday: '日一二三四五六'[d.getDay()],
+        count: 0,
+        win: 0,
+        lose: 0,
+        ts
+      });
     }
-
-    const entry = days.get(key)
-    entry.count += 1
-    if (toInt(item.gameresult) === 1) entry.win += 1
-    else if (toInt(item.gameresult) === 2) entry.lose += 1
+    const entry = days.get(key);
+    entry.count += 1;
+    if (toInt(item.gameresult) === 1) entry.win += 1;else if (toInt(item.gameresult) === 2) entry.lose += 1;
     // 同一天里留最早那个时间戳，用于排序
-    if (ts < entry.ts) entry.ts = ts
+    if (ts < entry.ts) entry.ts = ts;
   }
-
-  return [...days.values()].sort((a, b) => a.ts - b.ts)
+  return [...days.values()].sort((a, b) => a.ts - b.ts);
 }
 
 /** 24 格活跃时段，返回每小时的场次数 */
-export function groupByHour (battles = []) {
-  const hours = new Array(24).fill(0)
-
+export function groupByHour(battles = []) {
+  const hours = new Array(24).fill(0);
   for (const item of battles) {
-    const ts = toInt(item?.dtEventTime)
-    if (ts <= 0) continue
-    hours[new Date(ts * 1000).getHours()] += 1
+    const ts = toInt(item?.dtEventTime);
+    if (ts <= 0) continue;
+    hours[new Date(ts * 1000).getHours()] += 1;
   }
-
-  return hours
+  return hours;
 }
 
 /**
@@ -207,24 +231,27 @@ export function groupByHour (battles = []) {
  *
  * @returns {Array<{count:number, win:number, lose:number}>} 定长 24
  */
-export function groupByHourStats (battles = []) {
-  const hours = Array.from({ length: 24 }, () => ({ count: 0, win: 0, lose: 0 }))
-
+export function groupByHourStats(battles = []) {
+  const hours = Array.from({
+    length: 24
+  }, () => ({
+    count: 0,
+    win: 0,
+    lose: 0
+  }));
   for (const item of battles) {
-    const ts = toInt(item?.dtEventTime)
-    if (ts <= 0) continue
-    const entry = hours[new Date(ts * 1000).getHours()]
-    entry.count += 1
-    if (toInt(item.gameresult) === 1) entry.win += 1
-    else if (toInt(item.gameresult) === 2) entry.lose += 1
+    const ts = toInt(item?.dtEventTime);
+    if (ts <= 0) continue;
+    const entry = hours[new Date(ts * 1000).getHours()];
+    entry.count += 1;
+    if (toInt(item.gameresult) === 1) entry.win += 1;else if (toInt(item.gameresult) === 2) entry.lose += 1;
   }
-
-  return hours
+  return hours;
 }
 
 /** 胜率高于这个才配叫「手感最好」，低于那个才配叫「最容易翻车」；中间是正常波动，不下结论 */
-const GOOD_HOUR_RATE = 55
-const BAD_HOUR_RATE = 45
+const GOOD_HOUR_RATE = 55;
+const BAD_HOUR_RATE = 45;
 
 /**
  * 时段结论：打得最多的点位、以及打得最准的点位。
@@ -238,42 +265,46 @@ const BAD_HOUR_RATE = 45
  * @returns {{busyHour:number, busyCount:number, bestHour:number, bestRate:number,
  *   bestCount:number, worstHour:number, worstRate:number, worstCount:number, text:string}}
  */
-export function summarizeHours (hours = [], total = 0) {
-  const list = Array.isArray(hours) ? hours : []
-  const minSample = Math.max(3, Math.round(total * 0.08))
-  let busyHour = -1
-  let busyCount = 0
-  let best = null
-  let worst = null
-
+export function summarizeHours(hours = [], total = 0) {
+  const list = Array.isArray(hours) ? hours : [];
+  const minSample = Math.max(3, Math.round(total * 0.08));
+  let busyHour = -1;
+  let busyCount = 0;
+  let best = null;
+  let worst = null;
   list.forEach((entry, hour) => {
     if (entry.count > busyCount) {
-      busyCount = entry.count
-      busyHour = hour
+      busyCount = entry.count;
+      busyHour = hour;
     }
-
-    const decided = entry.win + entry.lose
-    if (decided < minSample) return
-    const rate = Math.round((entry.win / decided) * 100)
-    if (!best || rate > best.rate) best = { hour, rate, count: entry.count }
-    if (!worst || rate < worst.rate) worst = { hour, rate, count: entry.count }
-  })
-
-  const hh = h => `${String(h).padStart(2, '0')}:00`
-  const parts = []
-  if (busyHour >= 0) parts.push(`${hh(busyHour)} 打得最多（${busyCount} 场）`)
+    const decided = entry.win + entry.lose;
+    if (decided < minSample) return;
+    const rate = Math.round(entry.win / decided * 100);
+    if (!best || rate > best.rate) best = {
+      hour,
+      rate,
+      count: entry.count
+    };
+    if (!worst || rate < worst.rate) worst = {
+      hour,
+      rate,
+      count: entry.count
+    };
+  });
+  const hh = h => `${String(h).padStart(2, '0')}:00`;
+  const parts = [];
+  if (busyHour >= 0) parts.push(`${hh(busyHour)} 打得最多（${busyCount} 场）`);
   // 最高和最低是同一个点位就只说一次：样本够的点位只剩一个时会这样
   if (best && best.hour !== busyHour) {
     // 五五开就别叫「手感最好」了。样本够的点位少的时候，最高的那个可能才 50%，
     // 说出来像是在夸他，实际什么信息都没给
-    if (best.rate >= GOOD_HOUR_RATE) parts.push(`${hh(best.hour)} 手感最好（胜率 ${best.rate}%）`)
+    if (best.rate >= GOOD_HOUR_RATE) parts.push(`${hh(best.hour)} 手感最好（胜率 ${best.rate}%）`);
   } else if (best) {
-    parts.push(`这个点位胜率 ${best.rate}%`)
+    parts.push(`这个点位胜率 ${best.rate}%`);
   }
   if (worst && best && worst.hour !== best.hour && worst.rate <= BAD_HOUR_RATE) {
-    parts.push(`${hh(worst.hour)} 最容易翻车（胜率 ${worst.rate}%）`)
+    parts.push(`${hh(worst.hour)} 最容易翻车（胜率 ${worst.rate}%）`);
   }
-
   return {
     busyHour,
     busyCount,
@@ -285,7 +316,7 @@ export function summarizeHours (hours = [], total = 0) {
     worstCount: worst?.count ?? 0,
     // 样本不足时只有「打得最多」一句，别硬凑结论
     text: parts.join('，')
-  }
+  };
 }
 
 /**
@@ -293,36 +324,36 @@ export function summarizeHours (hours = [], total = 0) {
  * @param {Array<object>} battles
  * @param {Record<string,string>} heroMap heroId -> 英雄名
  */
-export function rankHeroes (battles = [], heroMap = {}) {
-  const heroes = new Map()
-
+export function rankHeroes(battles = [], heroMap = {}) {
+  const heroes = new Map();
   for (const item of battles) {
-    const id = String(item?.heroId ?? '')
-    if (!id || id === '0') continue
-
+    const id = String(item?.heroId ?? '');
+    if (!id || id === '0') continue;
     if (!heroes.has(id)) {
-      heroes.set(id, { heroId: id, name: heroMap[id] || `英雄${id}`, count: 0, win: 0, lose: 0, gradeSum: 0, graded: 0 })
+      heroes.set(id, {
+        heroId: id,
+        name: heroMap[id] || `英雄${id}`,
+        count: 0,
+        win: 0,
+        lose: 0,
+        gradeSum: 0,
+        graded: 0
+      });
     }
-
-    const entry = heroes.get(id)
-    entry.count += 1
-    if (toInt(item.gameresult) === 1) entry.win += 1
-    else if (toInt(item.gameresult) === 2) entry.lose += 1
-
-    const grade = Number(item.gradeGame)
+    const entry = heroes.get(id);
+    entry.count += 1;
+    if (toInt(item.gameresult) === 1) entry.win += 1;else if (toInt(item.gameresult) === 2) entry.lose += 1;
+    const grade = Number(item.gradeGame);
     if (Number.isFinite(grade) && grade > 0) {
-      entry.gradeSum += grade
-      entry.graded += 1
+      entry.gradeSum += grade;
+      entry.graded += 1;
     }
   }
-
-  return [...heroes.values()]
-    .map(entry => ({
-      ...entry,
-      winRate: entry.win + entry.lose > 0 ? Math.round((entry.win / (entry.win + entry.lose)) * 100) : 0,
-      avgGrade: entry.graded > 0 ? (entry.gradeSum / entry.graded).toFixed(1) : ''
-    }))
-    .sort((a, b) => b.count - a.count || b.winRate - a.winRate)
+  return [...heroes.values()].map(entry => ({
+    ...entry,
+    winRate: entry.win + entry.lose > 0 ? Math.round(entry.win / (entry.win + entry.lose) * 100) : 0,
+    avgGrade: entry.graded > 0 ? (entry.gradeSum / entry.graded).toFixed(1) : ''
+  })).sort((a, b) => b.count - a.count || b.winRate - a.winRate);
 }
 
 /**
@@ -336,82 +367,81 @@ export function rankHeroes (battles = [], heroMap = {}) {
  * @param {Record<string,string>} [options.heroMap] heroId -> 英雄名
  * @returns {object} 给模板用的汇总结果
  */
-export function summarizeReport (battles = [], { fromSec = 0, toSec = 0, heroMap = {} } = {}) {
-  const all = Array.isArray(battles) ? battles : []
+export function summarizeReport(battles = [], {
+  fromSec = 0,
+  toSec = 0,
+  heroMap = {},
+  prevSnapshot = null
+} = {}) {
+  const all = Array.isArray(battles) ? battles : [];
   // 上界在这里再兜一道：调用方大多传的是 collectBattles 过滤好的列表，
   // 但这个模块是纯函数层，脱机测和群报都直接喂原始归档
-  const list = toSec > 0 ? all.filter(item => toInt(item?.dtEventTime) <= toSec) : all
-  const win = list.filter(item => toInt(item?.gameresult) === 1).length
-  const lose = list.filter(item => toInt(item?.gameresult) === 2).length
-  const decided = win + lose
+  const list = toSec > 0 ? all.filter(item => toInt(item?.dtEventTime) <= toSec) : all;
+  const win = list.filter(item => toInt(item?.gameresult) === 1).length;
+  const lose = list.filter(item => toInt(item?.gameresult) === 2).length;
+  const decided = win + lose;
 
   // 段位星数与巅峰分直接复用推送那套：它的口径是「dtEventTime >= since 到最新」，
-  // 和日报/周报的「区间起点到现在」完全一致
-  const session = summarizeSession(list, fromSec)
-
-  const modes = new Map()
-  let totalSec = 0
-  let mvp = 0
-  let loseMvp = 0
-  let best = null
+  // 和日报/周报的「区间起点到现在」完全一致。prevSnapshot 是区间开始前最近的一局，
+  // 传进来才能算准每个人第一局的星数变化
+  const session = summarizeSession(list, fromSec, prevSnapshot);
+  const modes = new Map();
+  let totalSec = 0;
+  let mvp = 0;
+  let loseMvp = 0;
+  let best = null;
   // 最长 / 最短的一局。只认 usedTime > 0：归档里偶有 0（未结算或字段缺失），
   // 拿它当「最短」会报出一场 0 秒的对局
-  let longest = null
-  let shortest = null
-
+  let longest = null;
+  let shortest = null;
   for (const item of list) {
-    const mode = resolveMode(item?.mapName)
-    if (!modes.has(mode)) modes.set(mode, { name: mode, count: 0, win: 0 })
-    const entry = modes.get(mode)
-    entry.count += 1
-    if (toInt(item.gameresult) === 1) entry.win += 1
-
-    const used = toInt(item.usedTime)
-    totalSec += used
-    mvp += toInt(item.mvpcnt)
-    loseMvp += toInt(item.losemvp)
-
+    const mode = resolveMode(item?.mapName);
+    if (!modes.has(mode)) modes.set(mode, {
+      name: mode,
+      count: 0,
+      win: 0
+    });
+    const entry = modes.get(mode);
+    entry.count += 1;
+    if (toInt(item.gameresult) === 1) entry.win += 1;
+    const used = toInt(item.usedTime);
+    totalSec += used;
+    mvp += toInt(item.mvpcnt);
+    loseMvp += toInt(item.losemvp);
     if (used > 0) {
-      if (!longest || used > toInt(longest.usedTime)) longest = item
-      if (!shortest || used < toInt(shortest.usedTime)) shortest = item
+      if (!longest || used > toInt(longest.usedTime)) longest = item;
+      if (!shortest || used < toInt(shortest.usedTime)) shortest = item;
     }
-
-    const grade = Number(item.gradeGame)
-    if (Number.isFinite(grade) && grade > 0 && (!best || grade > Number(best.gradeGame))) best = item
+    const grade = Number(item.gradeGame);
+    if (Number.isFinite(grade) && grade > 0 && (!best || grade > Number(best.gradeGame))) best = item;
   }
-
-  const heroes = rankHeroes(list, heroMap)
-  const byHourStats = groupByHourStats(list)
+  const heroes = rankHeroes(list, heroMap);
+  const byHourStats = groupByHourStats(list);
   /** 单局摘要，「最长鏖战 / 最快结束」两格共用 */
-  const oneBattle = item => (item
-    ? {
-        timeText: formatDuration(toInt(item.usedTime)),
-        sec: toInt(item.usedTime),
-        heroName: heroMap[String(item.heroId)] || `英雄${item.heroId}`,
-        win: toInt(item.gameresult) === 1,
-        resultText: toInt(item.gameresult) === 1 ? '胜' : (toInt(item.gameresult) === 2 ? '负' : '—'),
-        mapName: item.mapName || ''
-      }
-    : null)
-
+  const oneBattle = item => item ? {
+    timeText: formatDuration(toInt(item.usedTime)),
+    sec: toInt(item.usedTime),
+    heroName: heroMap[String(item.heroId)] || `英雄${item.heroId}`,
+    win: toInt(item.gameresult) === 1,
+    resultText: toInt(item.gameresult) === 1 ? '胜' : toInt(item.gameresult) === 2 ? '负' : '—',
+    mapName: item.mapName || ''
+  } : null;
   return {
     count: list.length,
     win,
     lose,
     // 逃跑/未结算的局不算进胜率分母，否则胜率会被莫名拉低
-    winRate: decided > 0 ? Math.round((win / decided) * 100) : 0,
+    winRate: decided > 0 ? Math.round(win / decided * 100) : 0,
     modes: [...modes.values()].sort((a, b) => b.count - a.count),
     heroes,
     topHero: heroes[0] || null,
-    best: best
-      ? {
-          grade: best.gradeGame,
-          heroName: heroMap[String(best.heroId)] || `英雄${best.heroId}`,
-          kda: `${toInt(best.killcnt)}/${toInt(best.deadcnt)}/${toInt(best.assistcnt)}`,
-          win: toInt(best.gameresult) === 1,
-          mapName: best.mapName || ''
-        }
-      : null,
+    best: best ? {
+      grade: best.gradeGame,
+      heroName: heroMap[String(best.heroId)] || `英雄${best.heroId}`,
+      kda: `${toInt(best.killcnt)}/${toInt(best.deadcnt)}/${toInt(best.assistcnt)}`,
+      win: toInt(best.gameresult) === 1,
+      mapName: best.mapName || ''
+    } : null,
     mvp,
     loseMvp,
     streak: maxStreak(list),
@@ -439,44 +469,104 @@ export function summarizeReport (battles = [], { fromSec = 0, toSec = 0, heroMap
     },
     // 键名必须是 scoreFrom/scoreTo：formatScoreDelta 读的是这两个名字，
     // 之前写成 { from, to } 它取到 undefined，巅峰分那行从来没出现过
-    score: { scoreFrom: session.scoreFrom, scoreTo: session.scoreTo }
-  }
+    score: {
+      scoreFrom: session.scoreFrom,
+      scoreTo: session.scoreTo
+    }
+  };
 }
 
 /** 英雄名映射的薄封装，让 app 只依赖 reportStore 一个模块 */
-export { getHeroNameMap }
+export { getHeroNameMap };
 
 /* ------------------------------------------------------------------ 群汇总 */
 
+/** 血亏之王里「一星当多少巅峰分」的折算口径，只用于掉分榜，和上分榜无关 */
+const STAR_POINTS = 10;
+
+/** 段位短名 + 小段，如「至尊星耀III」→「星耀III」、「最强王者」→「王者」 */
+function shortRank(jobName) {
+  if (!jobName) return '';
+  return `${rankBandShort(jobName)}${rankSegLabel(jobName)}`;
+}
+
+/** 起止段位快照，如「星耀I 3★」；段位认不出时给空串 */
+function rankSnapshotText(jobName, stars) {
+  if (!jobName) return '';
+  return `${shortRank(jobName)} ${toInt(stars)}★`;
+}
+
 /**
- * 一个成员这段时间的「涨跌」，供群榜的进步榜/掉分榜排序。
+ * 上分之王的展示文案。星数与排位场次明显对不上时不报数字、只报段位变化：
+ * 归档里偶有「历史局段位名被后一次抓取改写成当时最新段位」的记录，
+ * 首尾快照算出来的累计差会被这种记录撑大（实测 18 胜 5 负显示 +38 星）。
+ * 排序仍用这个累计差——首尾两点本身是真实的，只是中间过程不可信。
+ */
+function riseAwardText(row) {
+  if (row.starSuspect) return row.rankChangeText || `上了 ${row.starDelta} 星`;
+  return `上了 ${row.starDelta} 星`;
+}
+
+/**
+ * 血亏之王的展示文案：掉星折算后哪边更惨就报哪边，和排序用的是同一把尺子。
+ * 跨段掉星也参与，但换算异常的记录直接不用星数，免得赛季重置那种 -50 星刷榜。
+ */
+function dropAwardText(row) {
+  const score = Number.isFinite(row.scoreDelta) ? row.scoreDelta : Infinity;
+  const star = Number.isFinite(row.starDelta) && !row.starSuspect && row.starDelta >= -30 ? row.starDelta * STAR_POINTS : Infinity;
+  return star < score ? `掉了 ${-row.starDelta} 星` : `巅峰分 ${row.scoreDelta}`;
+}
+
+/**
+ * 一个成员这段时间的「涨跌」，供群榜的上分榜/掉分榜排序。
  *
- * 只拿**巅峰分**做可比的数值：巅峰分是一条全服连续刻度，谁涨 30 谁掉 20 直接可比。
- * 段位星数不行——星耀的 1 星和最强王者的 1 星难度差着量级，跨人相减没有意义，
- * 所以段位那边只产出「升没升段」这个布尔性质的结论（rankUpText），不参与数值排序。
+ * 净星数用 rankStarTotal 折算成一条连续刻度，跨段也能相减
+ * （星耀I 4星 → 王者1星 = +2 星）。只有段位名认不出小段时才退回 null。
+ *
+ * 场次上限校验：一局排位最多净涨 1 星，再加 5 星的加星卡余量。超了就说明
+ * 归档里那条段位名是后来补抓时被改写的（单局跳 25 星），标 starSuspect，
+ * 排序仍按累计刻度（首尾快照是真实的），但文案只报段位不报星数。
  *
  * @param {object} report summarizeReport 的结果
- * @returns {{scoreDelta:number|null, scoreText:string, rankUpText:string}}
- *   scoreDelta 为 null 表示这段时间没打巅峰赛（或分数没动），不该进这两个榜
+ * @returns {{scoreDelta:number|null, starDelta:number|null, starSuspect:boolean,
+ *   scoreText:string, rankChangeText:string, rankUp:boolean, rankUpText:string}}
  */
-function pickProgress (report) {
-  const delta = formatScoreDelta(report?.score)
-  const from = toInt(report?.score?.scoreFrom)
-  const to = toInt(report?.score?.scoreTo)
+function pickProgress(report) {
+  const delta = formatScoreDelta(report?.score);
+  const from = toInt(report?.score?.scoreFrom);
+  const to = toInt(report?.score?.scoreTo);
+  const jobFrom = String(report?.stars?.jobFrom || '').trim();
+  const jobTo = String(report?.stars?.jobTo || '').trim();
+  const starFrom = toInt(report?.stars?.starFrom);
+  const starTo = toInt(report?.stars?.starTo);
 
-  // 段位：只报「升段」这一种结论。formatStarChange 的 tone 已经把
-  // 「同名段跨小段」「赛季重置导致编号下降」这些坑判过了，别在这里重写判据
-  const star = formatStarChange(report?.stars)
-  const jobFrom = String(report?.stars?.jobFrom || '')
-  const jobTo = String(report?.stars?.jobTo || '')
-
+  // 净星数：段位名认得出小段就用累计刻度（跨段可比），否则只在同名段时直接相减
+  const totalFrom = rankStarTotal(jobFrom, starFrom);
+  const totalTo = rankStarTotal(jobTo, starTo);
+  let starDelta = null;
+  if (totalFrom !== null && totalTo !== null) starDelta = totalTo - totalFrom;else if (jobFrom && jobFrom === jobTo) starDelta = starTo - starFrom;
+  const rankedCount = (report?.modes || []).find(m => m.name === '排位赛')?.count || 0;
+  const starSuspect = Number.isFinite(starDelta) && rankedCount > 0 && Math.abs(starDelta) > rankedCount + 5;
+  const bandFrom = rankBand(jobFrom);
+  const bandTo = rankBand(jobTo);
+  const segFrom = rankSegLabel(jobFrom);
+  const segTo = rankSegLabel(jobTo);
+  // 真的升了一个台阶才算升段：跨大段，或同大段换了小段。
+  // 王者段的称号随星数变（非凡王者 → 绝世王者），名字不同但只是升星，不是升段
+  const stepUp = Boolean(jobFrom && jobTo) && (bandTo > bandFrom || bandTo === bandFrom && bandTo > 0 && Boolean(segFrom) && Boolean(segTo) && segFrom !== segTo);
+  const rankUp = stepUp && Number.isFinite(starDelta) && starDelta > 0;
   return {
     scoreDelta: delta ? to - from : null,
+    starDelta,
+    starSuspect,
     scoreText: delta ? delta.text : '',
-    rankUpText: star?.tone === 'up' && jobFrom && jobTo && jobFrom !== jobTo
-      ? `${jobFrom} → ${jobTo}`
-      : ''
-  }
+    // 「A → B」：段位真的换了一档才给，王者段内升星不算
+    rankChangeText: stepUp ? `${shortRank(jobFrom)} → ${shortRank(jobTo)}` : '',
+    rankUp,
+    // 升段之星的主文案：起止星数都带上。星差与场次明显对不上（starSuspect）时
+    // 只报起止快照、不报净升，免得拿污染过的数据吹一个不可能的星数
+    rankUpText: rankUp ? `${shortRank(jobFrom)} ${starFrom}★ → ${shortRank(jobTo)} ${starTo}★${starSuspect ? '' : `（+${starDelta}★）`}` : ''
+  };
 }
 
 /**
@@ -486,14 +576,22 @@ function pickProgress (report) {
  * 是单人口径，混着算出来的星数变化没有任何意义；群榜要的是「谁打得多、谁胜率高」，
  * 逐人汇总再排行就够了。
  *
- * @param {Array<{name:string, icon:string, report:object}>} members
+ * @param {Array<{name:string, icon:string, nick?:string, report:object}>} members
  * @returns {object} 给 buildGroupView 用的聚合结果
  */
-export function summarizeGroup (members = []) {
-  const rows = members
-    .filter(m => m?.report?.count > 0)
-    .map(m => ({
-      name: m.name || '召唤师',
+export function summarizeGroup(members = []) {
+  const rows = members.filter(m => m?.report?.count > 0).map(m => {
+    const name = m.name || '召唤师';
+    // 群名片限 6 个字：称号格和排行榜行都是单行 nowrap，
+    // 「AAA.龙哥智商批发（全网进货中）」这种长名片会把称号内容直接挤成省略号
+    const rawNick = String(m.nick || '').trim();
+    const chars = [...rawNick];
+    const nick = rawNick === name ? '' : chars.length > 6 ? `${chars.slice(0, 6).join('')}…` : rawNick;
+    return {
+      name,
+      nick,
+      // 榜单和称号统一用这个：游戏名（群昵称）
+      displayName: nick ? `${name}（${nick}）` : name,
       icon: m.icon || '',
       count: m.report.count,
       win: m.report.win,
@@ -503,56 +601,77 @@ export function summarizeGroup (members = []) {
       totalTimeText: m.report.totalTimeText,
       mvp: m.report.mvp,
       loseMvp: m.report.loseMvp,
-      topHero: m.report.topHero
-        ? { heroId: m.report.topHero.heroId, name: m.report.topHero.name, count: m.report.topHero.count }
-        : null,
-      streak: m.report.streak || { type: '', count: 0 },
+      topHero: m.report.topHero ? {
+        heroId: m.report.topHero.heroId,
+        name: m.report.topHero.name,
+        count: m.report.topHero.count
+      } : null,
+      streak: m.report.streak || {
+        type: '',
+        count: 0
+      },
       // 进步榜/掉分榜要用的两个量，口径见 pickProgress
       ...pickProgress(m.report)
-    }))
-    .sort((a, b) => b.count - a.count || b.winRate - a.winRate)
-
-  const totalCount = rows.reduce((s, r) => s + r.count, 0)
-  const totalWin = rows.reduce((s, r) => s + r.win, 0)
-  const totalLose = rows.reduce((s, r) => s + r.lose, 0)
-  const decided = totalWin + totalLose
+    };
+  }).sort((a, b) => b.count - a.count || b.winRate - a.winRate);
+  const totalCount = rows.reduce((s, r) => s + r.count, 0);
+  const totalWin = rows.reduce((s, r) => s + r.win, 0);
+  const totalLose = rows.reduce((s, r) => s + r.lose, 0);
+  const decided = totalWin + totalLose;
 
   // 所有成员的战绩合起来算活跃时段 / 每日分布——这是「群」的作息，单人的没意义
-  const allBattles = members.flatMap(m => m.battles || [])
+  const allBattles = members.flatMap(m => m.battles || []);
 
   // 全群英雄合计。直接合并各成员 report.heroes 而不是拿 allBattles 重跑 rankHeroes：
   // 英雄名已经在 summarizeReport 那边解析过了，这样 summarizeGroup 就不用再接一份 heroMap
-  const heroTotals = new Map()
+  const heroTotals = new Map();
   for (const m of members) {
     for (const h of m?.report?.heroes || []) {
-      const id = String(h?.heroId ?? '')
-      if (!id) continue
+      const id = String(h?.heroId ?? '');
+      if (!id) continue;
       if (!heroTotals.has(id)) {
-        heroTotals.set(id, { heroId: id, name: h.name, count: 0, win: 0, lose: 0, users: 0 })
+        heroTotals.set(id, {
+          heroId: id,
+          name: h.name,
+          count: 0,
+          win: 0,
+          lose: 0,
+          users: 0
+        });
       }
-      const entry = heroTotals.get(id)
-      entry.count += h.count || 0
-      entry.win += h.win || 0
-      entry.lose += h.lose || 0
+      const entry = heroTotals.get(id);
+      entry.count += h.count || 0;
+      entry.win += h.win || 0;
+      entry.lose += h.lose || 0;
       // 有多少个人玩过这个英雄，用来说明「全群都在玩」还是「某一个人在刷」
-      entry.users += 1
+      entry.users += 1;
     }
   }
+  const heroes = [...heroTotals.values()].map(entry => ({
+    ...entry,
+    winRate: entry.win + entry.lose > 0 ? Math.round(entry.win / (entry.win + entry.lose) * 100) : 0
+  })).sort((a, b) => b.count - a.count || b.winRate - a.winRate);
 
-  const heroes = [...heroTotals.values()]
-    .map(entry => ({
-      ...entry,
-      winRate: entry.win + entry.lose > 0 ? Math.round((entry.win / (entry.win + entry.lose)) * 100) : 0
-    }))
-    .sort((a, b) => b.count - a.count || b.winRate - a.winRate)
+  // 上分之王只看段位净升星（跨段已按累计刻度换算），巅峰分另开一个「巅峰之王」。
+  // 原来把两者乘个数混在一起比，升了大段却没打巅峰赛的人会直接落选
+  // （2026-10 月报：10 个跨段升段的人因为净星不可比被整体排除）。
+  const risePoints = row => Number.isFinite(row.starDelta) ? row.starDelta : -Infinity;
+  const peakPoints = row => Number.isFinite(row.scoreDelta) ? row.scoreDelta : -Infinity;
 
+  // 血亏之王：取折算后更惨的那项。星数与场次明显对不上（starSuspect）的不参与星数比较，
+  // 否则赛季重置那种 -50 星会年年霸榜
+  const dropPoints = row => {
+    const score = Number.isFinite(row.scoreDelta) ? row.scoreDelta : Infinity;
+    const star = Number.isFinite(row.starDelta) && !row.starSuspect && row.starDelta >= -30 ? row.starDelta * STAR_POINTS : Infinity;
+    return Math.min(score, star);
+  };
   return {
     rows,
     memberCount: rows.length,
     count: totalCount,
     win: totalWin,
     lose: totalLose,
-    winRate: decided > 0 ? Math.round((totalWin / decided) * 100) : 0,
+    winRate: decided > 0 ? Math.round(totalWin / decided * 100) : 0,
     totalSec: rows.reduce((s, r) => s + r.totalSec, 0),
     mvp: rows.reduce((s, r) => s + r.mvp, 0),
     heroes,
@@ -561,23 +680,25 @@ export function summarizeGroup (members = []) {
     // 全群的时段结论。分母是全群场次，样本下限自然比单人宽松，结论更可信
     hours: summarizeHours(groupByHourStats(allBattles), allBattles.length),
     // 各榜的头名，没有就是 null，模板自己兜底
-    topGrinder: rows[0] || null, // 肝帝：场次最多
-    topWinner: rows.length ? [...rows].sort((a, b) => b.win - a.win)[0] : null, // 胜场王
-    topRate: rows.filter(r => r.count >= 3).sort((a, b) => b.winRate - a.winRate)[0] || null, // 胜率王（≥3 场防一场 100% 刷榜）
+    topGrinder: rows[0] || null,
+    // 肝帝：场次最多
+    topWinner: rows.length ? [...rows].sort((a, b) => b.win - a.win)[0] : null,
+    // 胜场王
+    topRate: rows.filter(r => r.count >= 3).sort((a, b) => b.winRate - a.winRate)[0] || null,
+    // 胜率王（≥3 场防一场 100% 刷榜）
     topMvp: rows.filter(r => r.mvp > 0).sort((a, b) => b.mvp - a.mvp)[0] || null,
-    topLoseMvp: rows.filter(r => r.loseMvp > 0).sort((a, b) => b.loseMvp - a.loseMvp)[0] || null, // 尽力局长
+    topLoseMvp: rows.filter(r => r.loseMvp > 0).sort((a, b) => b.loseMvp - a.loseMvp)[0] || null,
+    // 尽力局长
     // 最长连败也值一个称号，群里就爱看这个
-    topStreak: rows.filter(r => r.streak?.type === 'win' && r.streak.count >= 3)
-      .sort((a, b) => b.streak.count - a.streak.count)[0] || null,
-    // 巅峰分涨得最多 / 掉得最多。只认巅峰分（口径见 pickProgress），
-    // 没人打巅峰赛时两个都是 null，称号栏自动不占位
-    topRise: rows.filter(r => Number(r.scoreDelta) > 0)
-      .sort((a, b) => b.scoreDelta - a.scoreDelta)[0] || null,
-    topDrop: rows.filter(r => Number(r.scoreDelta) < 0)
-      .sort((a, b) => a.scoreDelta - b.scoreDelta)[0] || null,
-    // 升段的人。段位跨段没法和别人比数值，所以不排序，谁先升到就先列谁
-    topRankUp: rows.filter(r => r.rankUpText)[0] || null
-  }
+    topStreak: rows.filter(r => r.streak?.type === 'win' && r.streak.count >= 3).sort((a, b) => b.streak.count - a.streak.count)[0] || null,
+    // 上分之王：段位净升星最多，同星数看场次
+    topRise: rows.filter(r => risePoints(r) > 0).sort((a, b) => risePoints(b) - risePoints(a) || b.count - a.count)[0] || null,
+    // 巅峰之王：巅峰分涨得最多
+    topPeak: rows.filter(r => peakPoints(r) > 0).sort((a, b) => peakPoints(b) - peakPoints(a) || b.count - a.count)[0] || null,
+    topDrop: rows.filter(r => dropPoints(r) < 0).sort((a, b) => dropPoints(a) - dropPoints(b))[0] || null,
+    // 升段之星：段位名真的变了且净升星为正的人里，升得最多的（原来按场次排，谁打得多谁拿）
+    topRankUp: rows.filter(r => r.rankUp).sort((a, b) => risePoints(b) - risePoints(a) || b.count - a.count)[0] || null
+  };
 }
 
 /* ------------------------------------------------------------------ 模板数据 */
@@ -587,23 +708,22 @@ export function summarizeGroup (members = []) {
  * （实测 519 / 558 / 166 都是 200），所以不用把 heroIcon 那串 URL 存进归档——
  * 一条 URL 80 字节，一千场就是 80KB，白占一倍体积。
  */
-export function heroIconUrl (heroId) {
-  const id = String(heroId ?? '').trim()
-  return id ? `https://game.gtimg.cn/images/yxzj/img201606/heroimg/${id}/${id}.jpg` : ''
+export function heroIconUrl(heroId) {
+  const id = String(heroId ?? '').trim();
+  return id ? `https://game.gtimg.cn/images/yxzj/img201606/heroimg/${id}/${id}.jpg` : '';
 }
-
 const MD = ts => {
-  const d = new Date(ts * 1000)
-  return `${d.getMonth() + 1}月${d.getDate()}日`
-}
-const WEEKDAY = ts => `周${'日一二三四五六'[new Date(ts * 1000).getDay()]}`
+  const d = new Date(ts * 1000);
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+};
+const WEEKDAY = ts => `周${'日一二三四五六'[new Date(ts * 1000).getDay()]}`;
 
 /** 胜率的色调档位。55% 以上算好、45% 以下算差，中间不着色 */
-function rateTone (rate, count) {
-  if (!count) return ''
-  if (rate >= 55) return 'good'
-  if (rate < 45) return 'bad'
-  return ''
+function rateTone(rate, count) {
+  if (!count) return '';
+  if (rate >= 55) return 'good';
+  if (rate < 45) return 'bad';
+  return '';
 }
 
 /**
@@ -626,7 +746,7 @@ function rateTone (rate, count) {
  * @param {string} [opts.roleIcon] 头像 URL
  * @param {number} [opts.heroLimit] 英雄榜最多列几个
  */
-export function buildReportView (report, {
+export function buildReportView(report, {
   kind = 'daily',
   fromSec = 0,
   nowMs = Date.now(),
@@ -638,59 +758,66 @@ export function buildReportView (report, {
   roleIcon = '',
   heroLimit = 0
 } = {}) {
-  const isWeekly = kind === 'weekly'
-  const isMonthly = kind === 'monthly'
-  const nowSec = Math.floor(nowMs / 1000)
-  const endSec = toSec > 0 ? Math.min(toSec, nowSec) : nowSec
-  const limit = heroLimit || (isWeekly ? 8 : isMonthly ? 10 : 5)
-
-  const star = formatStarChange(report.stars)
-  const score = formatScoreDelta(report.score)
-  const changeLines = [star, score]
-    .filter(Boolean)
-    .map(item => ({ text: `${item.icon} ${item.text}`.trim(), tone: item.tone }))
+  const isWeekly = kind === 'weekly';
+  const isMonthly = kind === 'monthly';
+  const nowSec = Math.floor(nowMs / 1000);
+  const endSec = toSec > 0 ? Math.min(toSec, nowSec) : nowSec;
+  const limit = heroLimit || (isWeekly ? 8 : isMonthly ? 10 : 5);
+  const star = formatStarChange(report.stars);
+  const score = formatScoreDelta(report.score);
+  const changeLines = [star, score].filter(Boolean).map(item => ({
+    text: `${item.icon} ${item.text}`.trim(),
+    tone: item.tone
+  }));
 
   // 英雄榜的条形长度按「场次占最多那个的比例」，第一名铺满
-  const topCount = report.heroes[0]?.count || 1
+  const topCount = report.heroes[0]?.count || 1;
   const heroes = report.heroes.slice(0, limit).map((h, idx) => ({
     ...h,
     rank: idx + 1,
     icon: heroIconUrl(h.heroId),
-    barWidth: Math.max(6, Math.round((h.count / topCount) * 100)),
+    barWidth: Math.max(6, Math.round(h.count / topCount * 100)),
     wrClass: rateTone(h.winRate, h.count)
-  }))
-
-  const facts = []
+  }));
+  const facts = [];
   if (report.streak.count >= 2) {
     facts.push({
       key: report.streak.type === 'win' ? '最长连胜' : '最长连败',
       val: `${report.streak.count} 连${report.streak.type === 'win' ? '胜' : '败'}`,
       tone: report.streak.type === 'win' ? 'gold' : 'bad'
-    })
+    });
   }
   if (report.best) {
     facts.push({
       key: '最佳一局',
       val: `${report.best.grade} 分 · ${report.best.heroName} · ${report.best.kda}`,
       tone: 'gold'
-    })
+    });
   }
   if (report.mvp > 0 || report.loseMvp > 0) {
     // 败方 MVP 单独说：那是「输了但打得好」，混进 MVP 数里会虚高
-    const parts = []
-    if (report.mvp > 0) parts.push(`${report.mvp} 次`)
-    if (report.loseMvp > 0) parts.push(`败方 ${report.loseMvp} 次`)
-    facts.push({ key: 'MVP', val: parts.join(' · '), tone: 'gold' })
+    const parts = [];
+    if (report.mvp > 0) parts.push(`${report.mvp} 次`);
+    if (report.loseMvp > 0) parts.push(`败方 ${report.loseMvp} 次`);
+    facts.push({
+      key: 'MVP',
+      val: parts.join(' · '),
+      tone: 'gold'
+    });
   }
   if (report.modes.length) {
     facts.push({
       key: '模式分布',
       val: report.modes.map(m => `${m.name} ${m.count}`).join(' · '),
       tone: ''
-    })
+    });
   }
   if (report.count > 0) {
-    facts.push({ key: '场均时长', val: report.avgTimeText || '—', tone: '' })
+    facts.push({
+      key: '场均时长',
+      val: report.avgTimeText || '—',
+      tone: ''
+    });
   }
   // 最长鏖战：场均时长看不出「有没有打过那种拖到 30 分钟的拉锯局」，
   // 而这种局往往是当天最有记忆点的一场
@@ -699,40 +826,43 @@ export function buildReportView (report, {
       key: '最长鏖战',
       val: `${report.longest.timeText} · ${report.longest.heroName} · ${report.longest.resultText}`,
       tone: report.longest.win ? 'gold' : ''
-    })
+    });
   }
   if ((isWeekly || isMonthly) && report.byDay.length) {
-    const busiest = report.byDay.reduce((a, b) => (b.count > a.count ? b : a))
-    facts.push({ key: '最勤快的一天', val: `${busiest.date} 打了 ${busiest.count} 局`, tone: '' })
+    const busiest = report.byDay.reduce((a, b) => b.count > a.count ? b : a);
+    facts.push({
+      key: '最勤快的一天',
+      val: `${busiest.date} 打了 ${busiest.count} 局`,
+      tone: ''
+    });
   }
   // 奇数个 fact 会在两列布局里留一个空格子，补一条把它填满
   if (facts.length % 2 === 1) {
-    facts.push({ key: '统计范围', val: scopeText || (isMonthly ? '本月至今' : isWeekly ? '本周至今' : '今日'), tone: '' })
+    facts.push({
+      key: '统计范围',
+      val: scopeText || (isMonthly ? '本月至今' : isWeekly ? '本周至今' : '今日'),
+      tone: ''
+    });
   }
 
   // 活跃时段：24 格，按最高的那小时归一
-  const maxHour = Math.max(...report.byHour, 1)
-  const peakHour = report.byHour.indexOf(maxHour)
+  const maxHour = Math.max(...report.byHour, 1);
+  const peakHour = report.byHour.indexOf(maxHour);
   const hourBars = report.byHour.map((count, hour) => ({
     label: hour % 3 === 0 ? String(hour) : '',
-    height: count > 0 ? Math.max(6, Math.round((count / maxHour) * 100)) : 0,
+    height: count > 0 ? Math.max(6, Math.round(count / maxHour * 100)) : 0,
     peak: count === maxHour && count > 0
-  }))
+  }));
 
   // 统计的是上一个完整周期时，把「上周」写进区间徽章里。
   // 只画日期区间不够：周一收到的图上写着「8月24日 - 8月30日」，
   // 不说一声很容易被当成「这周的数据怎么是上周的日期」
-  const prevScope = toSec > 0 && endSec < nowSec ? scopeText : ''
-  const rangeText = isWeekly || isMonthly
-    ? `${prevScope ? `${prevScope} ` : ''}${MD(fromSec)} - ${MD(endSec)}`
-    : `${MD(fromSec)} ${WEEKDAY(fromSec)}`
+  const prevScope = toSec > 0 && endSec < nowSec ? scopeText : '';
+  const rangeText = isWeekly || isMonthly ? `${prevScope ? `${prevScope} ` : ''}${MD(fromSec)} - ${MD(endSec)}` : `${MD(fromSec)} ${WEEKDAY(fromSec)}`;
 
   // 覆盖范围如实标注：首次查周报时库是空的，翻页有上限，重度玩家一周 200 场可能盖不住。
   // 不标的话图上「本周 140 场」会被当成全部，实际是被截断的
-  const covered = truncated && coveredFrom > fromSec
-    ? `数据覆盖自 ${MD(coveredFrom)}（更早的还没归档）`
-    : ''
-
+  const covered = truncated && coveredFrom > fromSec ? `数据覆盖自 ${MD(coveredFrom)}（更早的还没归档）` : '';
   return {
     title: isMonthly ? '战绩月报' : isWeekly ? '战绩周报' : '战绩日报',
     isWeekly,
@@ -740,7 +870,12 @@ export function buildReportView (report, {
     // 每日趋势图：周报/月报都有多天数据才画，日报只有一天画了也是一根孤柱
     showDayChart: (isWeekly || isMonthly) && report.byDay.length > 1,
     rangeText,
-    subText: new Date(nowMs).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+    subText: new Date(nowMs).toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    }),
     roleName: roleName || '召唤师',
     roleIcon,
     count: report.count,
@@ -759,8 +894,11 @@ export function buildReportView (report, {
     peakHourText: report.count ? `${peakHour} 点最活跃` : '',
     // 时段结论文案：柱状图只画出「几点打得多」，这句话补上「几点打得准」
     hourNote: report.hours?.text || '',
-    footText: covered || `王者插件 · ${isMonthly ? '月报' : isWeekly ? '周报' : '日报'}生成于 ${new Date(nowMs).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`
-  }
+    footText: covered || `王者插件 · ${isMonthly ? '月报' : isWeekly ? '周报' : '日报'}生成于 ${new Date(nowMs).toLocaleString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit'
+    })}`
+  };
 }
 
 /* ------------------------------------------------------------------ 群模板数据 */
@@ -781,7 +919,7 @@ export function buildReportView (report, {
  * @param {number} [opts.heroLimit] 群英雄榜最多列几个
  * @param {number} [opts.scanned] 实际扫了几个绑定成员（含没打的），用于「N 人有对局 / 共扫 M 人」
  */
-export function buildGroupView (group, {
+export function buildGroupView(group, {
   kind = 'daily',
   fromSec = 0,
   nowMs = Date.now(),
@@ -794,66 +932,64 @@ export function buildGroupView (group, {
   heroLimit = 6,
   scanned = 0
 } = {}) {
-  const isWeekly = kind === 'weekly'
-  const isMonthly = kind === 'monthly'
-  const nowSec = Math.floor(nowMs / 1000)
-  const endSec = toSec > 0 ? Math.min(toSec, nowSec) : nowSec
-  const label = isMonthly ? '月报' : isWeekly ? '周报' : '日报'
-
-  const topCount = group.rows[0]?.count || 1
+  const isWeekly = kind === 'weekly';
+  const isMonthly = kind === 'monthly';
+  const nowSec = Math.floor(nowMs / 1000);
+  const endSec = toSec > 0 ? Math.min(toSec, nowSec) : nowSec;
+  const label = isMonthly ? '月报' : isWeekly ? '周报' : '日报';
+  const topCount = group.rows[0]?.count || 1;
   const rows = group.rows.slice(0, rowLimit).map((r, idx) => ({
     ...r,
+    // 模板只用 name 一个字段，这里直接换成「游戏名（群昵称）」，不用改 HTML
+    name: r.displayName || r.name,
     rank: idx + 1,
     topHeroIcon: r.topHero ? heroIconUrl(r.topHero.heroId) : '',
-    barWidth: Math.max(6, Math.round((r.count / topCount) * 100)),
+    barWidth: Math.max(6, Math.round(r.count / topCount * 100)),
     wrClass: rateTone(r.winRate, r.count),
     // 前三名给金银铜色调，模板按 rankClass 上色
     rankClass: idx === 0 ? 'gold' : idx === 1 ? 'silver' : idx === 2 ? 'bronze' : '',
     // 连胜/连败徽标，3 连起才值得标
     streakText: r.streak?.count >= 3 ? `${r.streak.count}连${r.streak.type === 'win' ? '胜' : '败'}` : '',
     streakClass: r.streak?.type === 'win' ? 'gold' : 'bad'
-  }))
+  }));
 
   // 称号栏：只列存在的，空的不占位
-  const awards = []
-  const award = (key, row, fmt) => row && awards.push({ key, val: fmt(row), icon: row.icon })
-  award('肝帝', group.topGrinder, r => `${r.name} · ${r.count} 场`)
-  award('胜场王', group.topWinner, r => `${r.name} · ${r.win} 胜`)
-  award('胜率王', group.topRate, r => `${r.name} · ${r.winRate}%（${r.count} 场）`)
-  award('MVP 收割机', group.topMvp, r => `${r.name} · ${r.mvp} 次`)
-  award('尽力局长', group.topLoseMvp, r => `${r.name} · 败方 MVP ${r.loseMvp} 次`)
-  award('连胜之星', group.topStreak, r => `${r.name} · ${r.streak.count} 连胜`)
-  award('上分之王', group.topRise, r => `${r.name} · 巅峰分 +${r.scoreDelta}`)
-  award('血亏之王', group.topDrop, r => `${r.name} · 巅峰分 ${r.scoreDelta}`)
-  award('升段之星', group.topRankUp, r => `${r.name} · ${r.rankUpText}`)
-
-  const heroTop = group.heroes?.[0]?.count || 1
+  const awards = [];
+  const award = (key, row, fmt) => row && awards.push({
+    key,
+    val: fmt(row),
+    icon: row.icon
+  });
+  award('肝帝', group.topGrinder, r => `${r.displayName} · ${r.count} 场`);
+  award('胜场王', group.topWinner, r => `${r.displayName} · ${r.win} 胜`);
+  award('胜率王', group.topRate, r => `${r.displayName} · ${r.winRate}%（${r.count} 场）`);
+  award('MVP 收割机', group.topMvp, r => `${r.displayName} · ${r.mvp} 次`);
+  award('尽力局长', group.topLoseMvp, r => `${r.displayName} · 败方 MVP ${r.loseMvp} 次`);
+  award('连胜之星', group.topStreak, r => `${r.displayName} · ${r.streak.count} 连胜`);
+  award('上分之王', group.topRise, r => `${r.displayName} · ${riseAwardText(r)}`);
+  award('巅峰之王', group.topPeak, r => `${r.displayName} · 巅峰分 +${r.scoreDelta}`);
+  award('血亏之王', group.topDrop, r => `${r.displayName} · ${dropAwardText(r)}`);
+  award('升段之星', group.topRankUp, r => `${r.displayName} · ${r.rankUpText}`);
+  const heroTop = group.heroes?.[0]?.count || 1;
   const heroes = (group.heroes || []).slice(0, heroLimit).map((h, idx) => ({
     ...h,
     rank: idx + 1,
     icon: heroIconUrl(h.heroId),
-    barWidth: Math.max(6, Math.round((h.count / heroTop) * 100)),
+    barWidth: Math.max(6, Math.round(h.count / heroTop * 100)),
     wrClass: rateTone(h.winRate, h.count)
-  }))
-
-  const maxHour = Math.max(...group.byHour, 1)
-  const peakHour = group.byHour.indexOf(maxHour)
+  }));
+  const maxHour = Math.max(...group.byHour, 1);
+  const peakHour = group.byHour.indexOf(maxHour);
   const hourBars = group.byHour.map((count, hour) => ({
     label: hour % 3 === 0 ? String(hour) : '',
-    height: count > 0 ? Math.max(6, Math.round((count / maxHour) * 100)) : 0,
+    height: count > 0 ? Math.max(6, Math.round(count / maxHour * 100)) : 0,
     peak: count === maxHour && count > 0
-  }))
+  }));
 
   // 同 buildReportView：统计上一个完整周期时把「上周」写进区间徽章
-  const prevScope = toSec > 0 && endSec < nowSec ? scopeText : ''
-  const rangeText = isWeekly || isMonthly
-    ? `${prevScope ? `${prevScope} ` : ''}${MD(fromSec)} - ${MD(endSec)}`
-    : `${MD(fromSec)} ${WEEKDAY(fromSec)}`
-
-  const covered = truncated && coveredFrom > fromSec
-    ? `数据覆盖自 ${MD(coveredFrom)}（更早的还没归档）`
-    : ''
-
+  const prevScope = toSec > 0 && endSec < nowSec ? scopeText : '';
+  const rangeText = isWeekly || isMonthly ? `${prevScope ? `${prevScope} ` : ''}${MD(fromSec)} - ${MD(endSec)}` : `${MD(fromSec)} ${WEEKDAY(fromSec)}`;
+  const covered = truncated && coveredFrom > fromSec ? `数据覆盖自 ${MD(coveredFrom)}（更早的还没归档）` : '';
   return {
     title: `群战绩${label}`,
     label,
@@ -863,7 +999,12 @@ export function buildGroupView (group, {
     isMonthly,
     showDayChart: (isWeekly || isMonthly) && group.byDay.length > 1,
     rangeText,
-    subText: new Date(nowMs).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+    subText: new Date(nowMs).toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    }),
     groupName: groupName || '本群',
     memberCount: group.memberCount,
     // 扫了几个人：群里绑定了但这段时间没打的不上榜，图上要说清分母
@@ -886,6 +1027,9 @@ export function buildGroupView (group, {
     hourBars,
     peakHourText: group.count ? `${peakHour} 点最活跃` : '',
     hourNote: group.hours?.text || '',
-    footText: covered || `王者插件 · 群${label}生成于 ${new Date(nowMs).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`
-  }
+    footText: covered || `王者插件 · 群${label}生成于 ${new Date(nowMs).toLocaleString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit'
+    })}`
+  };
 }

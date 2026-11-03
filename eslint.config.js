@@ -1,14 +1,10 @@
-import neostandard from 'neostandard'
-
-const data = neostandard({
-  ignores: ['node_modules', 'temp', 'logs', 'data'],
-  globals: ['logger', 'NodeJS'],
-  ts: true,
-})
-
-/** 关闭驼峰命名 */
-data.forEach((val, index) => {
-  if (val?.rules?.['camelcase']) data[index].rules['camelcase'] = ['off']
-})
-
-export default data
+export default [{
+  ignores: ['node_modules/**', 'data/**', 'temp/**', 'logs/**'],
+  files: ['**/*.js'],
+  languageOptions: { ecmaVersion: 2022, sourceType: 'module', globals: Object.fromEntries([
+    'console','process','Buffer','setTimeout','clearTimeout','setInterval','clearInterval','globalThis',
+    'URL','URLSearchParams','AbortController','AbortSignal','fetch','document','window','FileReader','navigator',
+    'crypto','performance','structuredClone','TextDecoder','TextEncoder'
+  ].map(name => [name, 'readonly'])) },
+  rules: { 'no-undef': 'error', 'no-unreachable': 'error', 'no-constant-condition': ['error', { checkLoops: false }] }
+}]

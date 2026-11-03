@@ -1,59 +1,105 @@
-import path from 'path'
-import puppeteer from '#puppeteer'
-import { getImgType, readYamlFile, Button, getUserAvatar, shouldQuote } from '#utils'
-import { collectRankData, buildRankList, getAllBindings, dedupeTargets, readSnapshot, SNAPSHOT_TTL } from '../utils/rankStore.js'
-import { estimateRequestSeconds } from '../utils/api.js'
-import { PluginData } from '#components'
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import { Plugin, render, segment, logger } from "node-karin";
+import path from 'path';
+import { getImgType, readYamlFile, Button, getUserAvatar, shouldQuote, isShareReady, querySharedBind, fetchSharedRoster, uploadLocalBindings } from '#utils';
+import { collectRankData, buildRankList, getAllBindings, readSnapshot, SNAPSHOT_TTL } from '../utils/rankStore.js';
+import { getNickMap, nickOf, withGroupNick, getMemberMap } from '../utils/groupNick.js';
+import { mapConcurrent } from '../utils/parallel.js';
+import { PluginData, ResourcePath, ResourceUrl } from '#components';
 
 /** 榜单最多展示多少人，太长图片会非常高 */
-const MAX_ROWS_GROUP = 10
-const MAX_ROWS_GLOBAL = 30
+const MAX_ROWS_GROUP = 10;
+const MAX_ROWS_GLOBAL = 30;
 
-export class RankList extends plugin {
+/** 共享库查询结果缓存：本机 QQ 集合没变就 5 分钟内复用 */
+const SHARED_CACHE_TTL_MS = 5 * 60 * 1000;
+let sharedCache = {
+  key: '',
+  at: 0,
+  map: new Map()
+};
+
+/**
+ * 从共享库补拉「本机 QQ 在其他机器人上绑定过」的营地 ID。
+ *
+ * 老服务端没有全库清单接口时的兜底：用本机出现过的 QQ 逐个问。
+ * 查不到的 QQ 不影响整张榜；新服务端走 `fetchSharedRoster`，一次拿全。
+ *
+ * @param {Array<{campId:string, botUserId:string}>} bindings 本机绑定
+ * @returns {Promise<Map<string,string>>} campId -> 归属QQ
+ */
+async function fetchSharedCampIds(bindings) {
+  const qqs = [...new Set(bindings.map(item => String(item.botUserId)).filter(Boolean))];
+  const key = qqs.slice().sort().join(',');
+  if (sharedCache.key === key && Date.now() - sharedCache.at < SHARED_CACHE_TTL_MS) {
+    return sharedCache.map;
+  }
+  const found = new Map();
+  await mapConcurrent(qqs, async qq => {
+    try {
+      const result = await querySharedBind(qq);
+      for (const id of result?.campIds || []) {
+        const campId = String(id);
+        if (campId && !found.has(campId)) found.set(campId, qq);
+      }
+    } catch {
+      // 单个 QQ 查询失败只少一个号，不能拖垮整张榜
+    }
+  }, {
+    concurrency: 3
+  });
+  sharedCache = {
+    key,
+    at: Date.now(),
+    map: found
+  };
+  return found;
+}
+export class RankList extends Plugin {
   constructor() {
     super({
       name: '王者排行榜',
-      dsc: '统计已绑定用户的排位星数与巅峰分排名',
+      desc: '统计已绑定用户的排位星数与巅峰分排名',
       event: 'message',
       priority: 1,
-      rule: [
-        { reg: '^#(排位|巅峰)总排名\\s*(刷新)?$', fnc: 'globalRank' },
-        { reg: '^#(排位|巅峰)排名\\s*(刷新)?$', fnc: 'groupRank' }
-      ]
-    })
+      rule: [{
+        reg: '^#(排位|巅峰)总排名\\s*(刷新)?$',
+        fnc: 'globalRank'
+      }, {
+        reg: '^#(排位|巅峰)bot排名\\s*(刷新)?$',
+        fnc: 'botRank'
+      }, {
+        reg: '^#(排位|巅峰)排名\\s*(刷新)?$',
+        fnc: 'groupRank'
+      }]
+    });
   }
 
   /** #排位排名 / #巅峰排名：只统计本群成员 */
   async groupRank(e) {
-    const type = e.msg.includes('巅峰') ? 'peak' : 'rank'
-    const force = e.msg.includes('刷新')
-
+    if (isBlockedEvent(e)) return true;
+    const type = e.msg.includes('巅峰') ? 'peak' : 'rank';
+    const force = e.msg.includes('刷新');
     if (!e.isGroup) {
-      await e.reply('本群排名只能在群里使用，私聊请用 #排位总排名 / #巅峰总排名')
-      return
+      await e.reply('本群排名只能在群里使用，私聊请用 #排位bot排名 / #排位总排名');
+      return;
     }
-
-    let memberIds = []
+    let memberIds = [];
     try {
-      const memberMap = await e.group.getMemberMap()
-      memberIds = [...memberMap.keys()].map(String)
+      const memberMap = await getMemberMap(e.groupId, e.bot);
+      memberIds = [...memberMap.keys()].map(String);
     } catch (error) {
-      logger.warn(`[王者排名] 获取群成员失败: ${error.message}`)
-      await e.reply('获取群成员列表失败，可改用 #排位总排名 查看全局排名')
-      return
+      logger.warn(`[王者排名] 获取群成员失败: ${error.message}`);
+      await e.reply('获取群成员列表失败，可改用 #排位bot排名 查看本机排名');
+      return;
     }
-
-    const memberSet = new Set(memberIds)
-    const bindings = getAllBindings().filter(item => memberSet.has(item.botUserId))
-
+    const memberSet = new Set(memberIds);
+    const bindings = getAllBindings().filter(item => memberSet.has(item.botUserId));
     if (!bindings.length) {
-      await e.reply([
-        '本群还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入排名吧',
-        Button.bind()
-      ])
-      return
+      await e.reply(['本群还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入排名吧', Button.bind()]);
+      return;
     }
-
     await this.render(e, {
       type,
       force,
@@ -61,116 +107,205 @@ export class RankList extends plugin {
       scope: '本群',
       isGlobal: false,
       title: `本群${type === 'peak' ? '巅峰分' : '排位'}排行榜`
-    })
+    });
   }
 
-  /** #排位总排名 / #巅峰总排名：统计全部绑定用户 */
-  async globalRank(e) {
-    const type = e.msg.includes('巅峰') ? 'peak' : 'rank'
-    const force = e.msg.includes('刷新')
-    const bindings = getAllBindings()
-
+  /** #排位bot排名 / #巅峰bot排名：只统计本机绑定 */
+  async botRank(e) {
+    if (isBlockedEvent(e)) return true;
+    const type = e.msg.includes('巅峰') ? 'peak' : 'rank';
+    const force = e.msg.includes('刷新');
+    const bindings = getAllBindings();
     if (!bindings.length) {
-      await e.reply([
-        '还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入排名吧',
-        Button.bind()
-      ])
-      return
+      await e.reply(['还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入排名吧', Button.bind()]);
+      return;
     }
-
     await this.render(e, {
       type,
       force,
       bindings,
-      scope: '全服',
+      scope: '本机',
       isGlobal: true,
-      title: `${type === 'peak' ? '巅峰分' : '排位'}总排行榜`
-    })
+      title: `本机${type === 'peak' ? '巅峰分' : '排位'}排行榜`
+    });
   }
 
-  async render(e, { type, force, bindings, scope, title, isGlobal = false }) {
+  /** #排位总排名 / #巅峰总排名：本机绑定 + 共享库里所有可查到的营地ID */
+  async globalRank(e) {
+    if (isBlockedEvent(e)) return true;
+    const type = e.msg.includes('巅峰') ? 'peak' : 'rank';
+    const force = e.msg.includes('刷新');
+    const bindings = getAllBindings();
+
+    // 优先拉「全库营地ID」：按本机 QQ 逐个问只能补到本机出现过的人，
+    // 别的机器人独有的用户永远问不到。老服务端没这个接口时再退回按 QQ 查。
+    let extraTargets = new Map();
+    let rosterSignature = null;
+    if (isShareReady()) {
+      // 先把本机本地绑定整表推上去，再拉全库清单 —— 否则别的机器人刚绑的人要等下一轮才进榜。
+      // 最多等 3 秒：共享库是外部依赖，它慢不能把排位榜一起拖死，没传完就下一轮再说。
+      await Promise.race([uploadLocalBindings().catch(() => {}), new Promise(resolve => {
+        const timer = setTimeout(resolve, 3000);
+        timer.unref?.();
+      })]);
+      const roster = await fetchSharedRoster();
+      if (roster.ok && roster.campIds.length) {
+        for (const campId of roster.campIds) extraTargets.set(String(campId), '');
+        rosterSignature = roster.campIds.slice().sort().join(',');
+      } else {
+        extraTargets = await fetchSharedCampIds(bindings);
+      }
+    }
+    if (!bindings.length && !extraTargets.size) {
+      await e.reply([isShareReady() ? '本机和共享库里都没有可用的营地ID，先发送 #绑定营地 [营地ID] 加入排名吧' : '还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入排名吧', Button.bind()]);
+      return;
+    }
+
+    // 全库名单变了才重采；名单没变就吃 12 小时缓存。
+    // 不能按「某个号不在 entries 里」判断：隐藏主页/采集失败的号永远进不了 entries，
+    // 那样每次排位都会全量重采。
+    const signatureMismatch = rosterSignature !== null && String(readSnapshot().signature || '') !== rosterSignature;
+    await this.render(e, {
+      type,
+      force: force || signatureMismatch,
+      bindings,
+      extraTargets,
+      signature: rosterSignature,
+      scope: '全库',
+      isGlobal: true,
+      title: `全库${type === 'peak' ? '巅峰分' : '排位'}排行榜`
+    });
+  }
+  async render(e, {
+    type,
+    force,
+    bindings,
+    extraTargets = null,
+    signature = null,
+    scope,
+    title,
+    isGlobal = false
+  }) {
     // 采集要逐个拉接口，命中缓存时很快，需要刷新时先给个提示。
-    // 预估耗时按「去重后的账号数」算：同一个营地ID 被多人绑定时只拉一次，
-    // 拿 bindings.length 会高估；节奏和并发度都由 api.js 决定，不能在这写死
-    const needFetch = force || Date.now() - readSnapshot().updatedAt >= SNAPSHOT_TTL
+    // 刷新时先给个回执，避免群里以为机器人没反应
+    const needFetch = force || Date.now() - readSnapshot().updatedAt >= SNAPSHOT_TTL;
     if (needFetch) {
-      const targetCount = dedupeTargets(bindings).size
-      const seconds = estimateRequestSeconds(targetCount)
-      await e.reply(`正在更新 ${targetCount} 个账号的数据，约需 ${seconds} 秒，请稍候...`)
+      await e.reply('正在更新数据，请稍候...');
     }
-
-    let snapshot
+    let snapshot;
     try {
-      snapshot = await collectRankData({ force })
+      snapshot = await collectRankData({
+        force,
+        extraTargets,
+        signature
+      });
     } catch (error) {
-      logger.error(`[王者排名] 采集失败: ${error.message}`)
-      await e.reply('排行榜数据采集失败，请稍后再试')
-      return
+      logger.error(`[王者排名] 采集失败: ${error.message}`);
+      await e.reply('排行榜数据采集失败，请稍后再试');
+      return;
     }
 
-    // campId -> botUserId，同一个ID被多人绑定时取第一个，用于回显归属
-    const ownerMap = {}
+    // campId -> [botUserId, ...]，同一个ID被多人绑定时**全部记下**（用于回显归属 + 认自己）
+    //
+    // ⚠️⚠️ 不能只留第一个（2026-10-06 修）。原先 `if (!ownerMap[campId]) ownerMap[campId] = qq`
+    //    只留首个绑定人，而下面「找自己那行」靠 `botUserId === selfId` ——
+    //    第二个绑定人的 botUserId 是空串，他掉出前 N 名时就**看不到自己那行**。
+    //    实测线上 campId 1807995411 被 3220564986 / 3667259455 同时绑定：
+    //    以后者身份查询，rank #18 那行不显示；前者正常。
+    const ownerMap = {};
     for (const item of bindings) {
-      if (!ownerMap[item.campId]) ownerMap[item.campId] = item.botUserId
+      const key = String(item.campId);
+      if (!ownerMap[key]) ownerMap[key] = [];
+      if (item.botUserId && !ownerMap[key].includes(String(item.botUserId))) {
+        ownerMap[key].push(String(item.botUserId));
+      }
     }
 
+    // 共享库补进来的号也要能认出归属 QQ（前三名头像、查自己那行都要用）
+    for (const [campId, qq] of extraTargets || []) {
+      const key = String(campId);
+      if (!ownerMap[key]) ownerMap[key] = [];
+      if (qq && !ownerMap[key].includes(String(qq))) ownerMap[key].push(String(qq));
+    }
+    const campIds = [...new Set([...bindings.map(item => String(item.campId)), ...(extraTargets ? [...extraTargets.keys()].map(String) : [])])];
     const full = buildRankList(snapshot.entries, type, {
-      campIds: bindings.map(item => item.campId),
+      campIds,
       ownerMap
-    })
+    });
 
-    if (!full.length) {
-      await e.reply(type === 'peak'
-        ? `${scope}暂无巅峰分数据，可能大家都还没打巅峰赛`
-        : `${scope}暂无排位数据，请稍后再试`)
-      return
+    // 群里发的榜，游戏名后面补该群的群名片（私聊没有群名片，不加）。
+    // 一个营地号被多人绑定时，取**第一个在这个群里**的绑定人
+    if (e.isGroup) {
+      const nickMap = await getNickMap(e.groupId, e.bot);
+      if (nickMap?.size) {
+        for (const item of full) {
+          const owners = (item.botUserIds?.length ? item.botUserIds : [item.botUserId]).map(String);
+          const owner = owners.find(qq => nickOf(nickMap, qq));
+          item.roleName = withGroupNick(item.roleName, owner ? nickOf(nickMap, owner) : '');
+        }
+      }
     }
+    if (!full.length) {
+      await e.reply(type === 'peak' ? `${scope}暂无巅峰分数据，可能大家都还没打巅峰赛` : `${scope}暂无排位数据，请稍后再试`);
+      return;
+    }
+    const maxRows = isGlobal ? MAX_ROWS_GLOBAL : MAX_ROWS_GROUP;
+    const list = full.slice(0, maxRows);
 
-    const maxRows = isGlobal ? MAX_ROWS_GLOBAL : MAX_ROWS_GROUP
-    const list = full.slice(0, maxRows)
-
-    // 查询者自己的名次：即使掉出前 N 也单独显示一行
-    const selfId = String(e.user_id)
-    const selfEntry = full.find(item => item.botUserId === selfId)
-    const self = selfEntry && selfEntry.index > maxRows ? selfEntry : null
+    // 查询者自己的名次：即使掉出前 N 也单独显示一行。
+    // 用 `botUserIds`（全部绑定人）判断，一个营地号被多人绑定时每个人都能认出自己那行
+    const selfId = String(e.userId);
+    const selfEntry = full.find(item => (item.botUserIds || [item.botUserId]).includes(selfId));
+    const self = selfEntry && selfEntry.index > maxRows ? selfEntry : null;
 
     // 前三名取 QQ 头像做展示，取不到就回落到营地头像
     await Promise.all(list.slice(0, 3).map(async item => {
-      if (!item.botUserId) return
+      if (!item.botUserId) return;
       try {
-        item.avatar = await getUserAvatar(e, item.botUserId, 100)
+        item.avatar = await getUserAvatar(e, item.botUserId, 100);
       } catch {
-        item.avatar = ''
+        item.avatar = '';
       }
-    }))
+    }));
+    const img = segment.image(resourceUrl("base64://" + (await render.render({
+      name: 'RankList',
+      file: path.join(ResourcePath, "html", "RankList.html"),
+      type: getImgType(),
+      data: {
+        title,
+        scope,
+        type,
+        isPeak: type === 'peak',
+        valueLabel: type === 'peak' ? '巅峰分' : '段位',
+        list,
+        top3: list.slice(0, 3),
+        rest: list.slice(3),
+        hasRest: list.length > 3,
+        self,
+        total: full.length,
+        shown: list.length,
+        updatedAt: formatTime(snapshot.updatedAt),
+        fromCache: snapshot.fromCache,
+        _res_path: ResourceUrl
+      },
+      pageGotoParams: {
+        waitUntil: "networkidle2",
+        timeout: 60000
+      }
+    }))));
 
-    const img = await puppeteer.screenshot('RankList', {
-      tplFile: 'plugins/GloryOfKings-Plugin/resources/html/RankList.html',
-      _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-      imgType: getImgType(),
-      title,
-      scope,
-      type,
-      isPeak: type === 'peak',
-      valueLabel: type === 'peak' ? '巅峰分' : '段位',
-      list,
-      top3: list.slice(0, 3),
-      rest: list.slice(3),
-      hasRest: list.length > 3,
-      self,
-      total: full.length,
-      shown: list.length,
-      updatedAt: formatTime(snapshot.updatedAt),
-      fromCache: snapshot.fromCache
-    })
-
-    await e.reply([img, Button.rank(type, isGlobal)], shouldQuote())
+    // ⚠️ screenshot 失败返回 false 而不抛错，不判空会把 false 当文本发进群（2026-10-06 修）
+    if (!img) return e.reply('排行榜出图失败，稍后再试', {
+      reply: shouldQuote()
+    });
+    await e.reply([img, Button.rank(type, isGlobal)], {
+      reply: shouldQuote()
+    });
   }
 }
-
 function formatTime(timestamp) {
-  if (!timestamp) return '—'
-  const d = new Date(timestamp)
-  const pad = n => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  if (!timestamp) return '—';
+  const d = new Date(timestamp);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }

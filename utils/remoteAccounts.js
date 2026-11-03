@@ -1,3 +1,4 @@
+import { logger } from "node-karin";
 /**
  * 「连别人的服务端」时，把本机的营地账号递给那台服务端。
  *
@@ -27,49 +28,169 @@
  * 两个功能都是高频调用（拉消息默认 3 秒一轮），所以带**指纹 + 60 秒**双重节流：
  * 账号没变就一分钟报一次（够续上服务端的 TTL），指纹一变立刻上报。
  */
-import authStore, { isUsableAuth } from './authStore.js'
+import authStore, { isUsableAuth } from './authStore.js';
 
-/** 两个服务端都有的状态接口 —— 拿它当「这个地址到底是不是个服务端」的探针 */
-export const STATUS_PATH = '/api/status'
+/** 状态接口。⚠️ 它在**两个面上都有**，所以只能证明「这是个服务」，证明不了「控制面在这」 */
+export const STATUS_PATH = '/api/status';
+
+/**
+ * ⭐ **只在控制面存在**的探针接口。
+ *
+ * ⚠️⚠️ 为什么不能再用 `/api/status` 当探针（2026-10-05 修）：服务端从 2026-10-05 起
+ *    把控制面（开播/停止/好友名单/账号）拆到了**本机回环**的 8898，播放面（8899，公网）
+ *    只留下播放页要用的 `/api/status`、`/api/record/*`。
+ *    而 `#营地观战连接` 原来正是拿 `/api/status` 探活 —— 那个接口**在播放面上也通**，
+ *    于是：
+ *      · 用户填的地址是对方的**播放面**（外网唯一能填的）
+ *      · 探测**必定成功** → 插件报「✅ 已连接这个观战服务」并写进配置
+ *      · 之后每一次调用（`/api/friends` `/api/start` …）全是 **404 没有这个接口**
+ *    等于把用户引进一个「连上了但什么都干不了」的死局，而且提示完全看不出来。
+ *
+ *    `/api/rooms` 是控制面独有的**只读、零营地请求**接口，正好当探针：
+ *    它通 = 这个地址确实是可指挥的控制面；它 404 = 那是播放面（或根本不是我们的服务）。
+ */
+export const CONTROL_PATH = '/api/rooms';
+
+/**
+ * 探一下这个地址是不是活着的**控制面**（能开播/能取名单的那个面）。
+ *
+ * 三层判据，为的是把「填错面」和「填错服务」分开说清楚：
+ *   ① `/api/rooms` 通 → 控制面，可用
+ *   ② `/api/rooms` 404 但 `/api/status` 通 → **这是播放面**（或老版本服务端被拆开之后
+ *      只剩播放面）：插件指挥不动它，得换成控制面地址
+ *   ③ 两个都不通 → 根本不是我们的服务（比如填成了分发服务）
+ *
+ * @returns {Promise<{ok: boolean, kind?: 'control'|'playback'|'unknown', status?: object,
+ *                    accounts?: number, message?: string}>}
+ */
+export async function probeControl(base, {
+  timeout = 8000
+} = {}) {
+  const url = String(base || '').replace(/\/+$/, '');
+  if (!url) return {
+    ok: false,
+    kind: 'unknown',
+    message: '还没填服务地址'
+  };
+  const getJson = async path => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
+    try {
+      const r = await fetch(url + path, {
+        signal: ctl.signal
+      });
+      if (r.status === 401) return {
+        status: 401,
+        data: null
+      };
+      const data = await r.json().catch(() => null);
+      return {
+        status: r.status,
+        data
+      };
+    } catch (error) {
+      return {
+        status: 0,
+        data: null,
+        error
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // ① 控制面独有的接口
+  const ctrl = await getJson(CONTROL_PATH);
+  if (ctrl.status === 401) {
+    return {
+      ok: false,
+      kind: 'control',
+      message: '这个服务设了口令，插件连不上（让对方去掉服务端口令）'
+    };
+  }
+  if (ctrl.data?.ok) {
+    return {
+      ok: true,
+      kind: 'control',
+      status: ctrl.data,
+      accounts: Number(ctrl.data.accounts || 0)
+    };
+  }
+
+  // ② 退一步看它是不是「播放面」——/api/status 在两个面上都有
+  //    2026-10-06 起 SINGLE_PORT 是常态：8899 同时受理 /api/*（能指挥）。
+  //    只有当 /api/rooms 404 而 /api/status 通 时，才说明对方是老版本
+  //    拆端口部署（/api/* 在本机回环），这时候才提示用户。
+  const play = await getJson(STATUS_PATH);
+  if (play.data?.ok) {
+    return {
+      ok: false,
+      kind: 'playback',
+      message: '这个地址是**播放面**（只能看直播，指挥接口没放开），对方的服务端是老版本拆端口形态。' + '让那台机器的主人发一次 #营地观战部署 更新到最新版，本插件已支持单端口（8899 全量受理）。'
+    };
+  }
+
+  // ③ 什么都不是
+  if (ctrl.status === 404 || play.status === 404) {
+    return {
+      ok: false,
+      kind: 'unknown',
+      message: '这个地址不是观战/消息服务（观战和消息各是一个独立服务，不是发代码包的那个分发服务）'
+    };
+  }
+  const timeoutHit = /abort|timeout/i.test(ctrl.error?.message || play.error?.message || '');
+  return {
+    ok: false,
+    kind: 'unknown',
+    message: timeoutHit ? '服务没响应' : '连不上这个地址'
+  };
+}
 
 /**
  * 探一下这个地址是不是活着的观战/消息服务（GET /api/status）。
  *
- * 「连接」指令用它做**先试连再落盘**：地址写错了要当场知道，
- * 而不是等发 `#营地观战` 时才报一句看不懂的错。
- *
- * ⚠️ 顺便拦一类常见坑：**把「分发服务」的地址当成观战服务填**。
- *    分发服务（gok-share，发代码包的那个）也跑在 http 上、也要令牌，
- *    但它的 `/api/status` 是 404 —— 只回一句 `not_found`，
- *    用户完全看不出「我填错服务了」。这里替他把话说清楚。
+ * ⚠️ `#营地消息连接` 那边也用它。⚠️ 它**证明不了控制面**（那个接口两个面都有）——
+ *    要判断「能不能指挥」，用上面的 `probeControl`。
  */
-export async function probeRemoteStatus (base, { timeout = 8000 } = {}) {
-  const url = String(base || '').replace(/\/+$/, '')
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), timeout)
+export async function probeRemoteStatus(base, {
+  timeout = 8000
+} = {}) {
+  const url = String(base || '').replace(/\/+$/, '');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeout);
   try {
-    const r = await fetch(url + STATUS_PATH, { signal: ctl.signal })
+    const r = await fetch(url + STATUS_PATH, {
+      signal: ctl.signal
+    });
     // ⚠️ 插件**不带口令**。对方服务端要是设了 GOK_*_TOKEN，这里就会撞 401。
     //    而插件没地方填口令 —— 所以别说「口令不对」（用户没法改），
     //    直接告诉他一条走得通的路：让对方去掉那个口令。
     if (r.status === 401) {
-      return { ok: false, message: '这个服务设了口令，插件连不上（让对方去掉服务端口令）' }
+      return {
+        ok: false,
+        message: '这个服务设了口令，插件连不上（让对方去掉服务端口令）'
+      };
     }
-    const data = await r.json().catch(() => null)
+    const data = await r.json().catch(() => null);
     if (!data?.ok) {
       return {
         ok: false,
-        message: r.status === 404
-          ? '这个地址不是观战/消息服务（观战和消息各是一个独立服务，不是发代码包的那个分发服务）'
-          : `服务返回异常`
-      }
+        message: r.status === 404 ? '这个地址不是观战/消息服务（观战和消息各是一个独立服务，不是发代码包的那个分发服务）' : `服务返回异常`
+      };
     }
-    return { ok: true, status: data, accounts: Number(data.accounts || 0) }
+    return {
+      ok: true,
+      status: data,
+      accounts: Number(data.accounts || 0)
+    };
   } catch (error) {
-    const timeoutHit = /abort|timeout/i.test(error?.message || '')
-    return { ok: false, message: timeoutHit ? '服务没响应' : '连不上这个地址' }
+    const timeoutHit = /abort|timeout/i.test(error?.message || '');
+    return {
+      ok: false,
+      message: timeoutHit ? '服务没响应' : '连不上这个地址'
+    };
   } finally {
-    clearTimeout(timer)
+    clearTimeout(timer);
   }
 }
 
@@ -79,38 +200,45 @@ export async function probeRemoteStatus (base, { timeout = 8000 } = {}) {
  * ⚠️ 只把 loopback 当本机：同机部署时服务端读得到 AuthPool.json，不用传。
  *    局域网 IP（192.168.x.x 之类）算远端 —— 那多半是另一台机器。
  */
-export function isRemoteBase (base = '') {
-  const host = String(base)
-    .replace(/^[a-z]+:\/\//i, '')
-    .replace(/\/.*$/, '')
-    .toLowerCase()
-  return !/^(127\.|localhost\b|\[::1\]|::1\b|0\.0\.0\.0)/.test(host)
+export function isRemoteBase(base = '') {
+  const host = String(base).replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '').toLowerCase();
+  return !/^(127\.|localhost\b|\[::1\]|::1\b|0\.0\.0\.0)/.test(host);
 }
 
 /** 本机「能用来查好友 / 取流」的全局账号（服务端要的就是这批） */
-function usableGlobalAccounts () {
-  const accounts = {}
+function usableGlobalAccounts() {
+  const accounts = {};
   for (const account of authStore.listAccounts()) {
-    if (!account.isGlobalDefault || account.authInvalid || !isUsableAuth(account)) continue
-    accounts[account.userId] = account
+    if (!account.isGlobalDefault || account.authInvalid || !isUsableAuth(account)) continue;
+    accounts[account.userId] = account;
   }
-  return accounts
+  return accounts;
 }
 
 /**
- * 指纹：id + 登录态最后更新时间。
- * 重新扫码会刷新 updatedAt —— 那一变就必须立刻重报，不能等节流窗口过去。
+ * 指纹：id + 该号的 token 尾部。
+ * 重新扫码会换 token —— 那一变就必须立刻重报，不能等节流窗口过去。
+ * （⚠️ 曾经用 updatedAt，但它在每次读池时都被刷成当前时间，节流因此永久失效，见下。）
  */
-function fingerprint (accounts) {
+function fingerprint(accounts) {
   return Object.keys(accounts).sort()
-    .map(id => `${id}:${accounts[id].updatedAt || ''}`)
-    .join('|')
+  // ⚠️⚠️ **不能用 updatedAt**（2026-10-06 修）：authStore 的 `#normalizeAccount` 里
+  //    `updated: (key, account, existing, timestamp) => timestamp`，而 `getPool()` /
+  //    `listAccounts()` 没有任何缓存、每次现读盘现归一化 —— 于是 updatedAt 恒等于
+  //    「本次调用时刻」，两次调用只要不在同一毫秒就必然不同，`prev.fp === fp`
+  //    永远为 false，下面那道 60 秒节流**一次都不会生效**。
+  //    连远端服务端时（isRemoteBase 为真，正是本模块存在的意义）营地的消息轮询
+  //    每 3 秒一轮、每轮都调本函数，等于每 3 秒把本机全部全局账号（含 token /
+  //    userKey / encodeRes）POST 给对方一次。
+  //    改用 token：重新扫码会换 token（指纹变 → 立刻上报，正是注释想要的语义），
+  //    不重扫则恒定（指纹不变 → 正常节流）。只取尾部 8 位，别把完整凭证拼进常驻内存的长字符串。
+  .map(id => `${id}:${String(accounts[id].token || '').slice(-8)}`).join('|');
 }
 
 /** 指纹没变时的最小上报间隔 */
-const REPORT_MIN_MS = 60 * 1000
+const REPORT_MIN_MS = 60 * 1000;
 /** 上次上报记录：服务地址 → { fp, at } */
-const lastReport = new Map()
+const lastReport = new Map();
 
 /**
  * 把本机全局账号递给服务端。
@@ -122,38 +250,59 @@ const lastReport = new Map()
  * @param {string} base 服务地址（观战 / 消息各自的）
  * @param {{force?: boolean, timeout?: number}} [opts]
  */
-export async function reportRemoteAccounts (base, { force = false, timeout = 8000 } = {}) {
-  const url = String(base || '').replace(/\/+$/, '')
-  if (!url || !isRemoteBase(url)) return { ok: true, skipped: 'local' }
-
-  const accounts = usableGlobalAccounts()
-  const ids = Object.keys(accounts)
-  if (!ids.length) return { ok: false, skipped: 'no-account' }
-
-  const fp = fingerprint(accounts)
-  const prev = lastReport.get(url)
+export async function reportRemoteAccounts(base, {
+  force = false,
+  timeout = 8000
+} = {}) {
+  const url = String(base || '').replace(/\/+$/, '');
+  if (!url || !isRemoteBase(url)) return {
+    ok: true,
+    skipped: 'local'
+  };
+  const accounts = usableGlobalAccounts();
+  const ids = Object.keys(accounts);
+  if (!ids.length) return {
+    ok: false,
+    skipped: 'no-account'
+  };
+  const fp = fingerprint(accounts);
+  const prev = lastReport.get(url);
   if (!force && prev && prev.fp === fp && Date.now() - prev.at < REPORT_MIN_MS) {
-    return { ok: true, skipped: 'throttled' }
+    return {
+      ok: true,
+      skipped: 'throttled'
+    };
   }
-
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), timeout)
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeout);
   try {
     const r = await fetch(`${url}/api/accounts`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ accounts }),
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        accounts
+      }),
       signal: ctl.signal
-    })
-    const data = await r.json().catch(() => ({}))
+    });
+    const data = await r.json().catch(() => ({}));
     // 只有真送进去了才记节流点：被 401 挡回来时下次还得再试
-    if (data?.ok) lastReport.set(url, { fp, at: Date.now() })
-    else logger.warn(`[远端账号] 上报被拒（HTTP ${r.status}）${data?.error || ''}`)
-    return { ...data, ok: Boolean(data?.ok) }
+    if (data?.ok) lastReport.set(url, {
+      fp,
+      at: Date.now()
+    });else logger.warn(`[远端账号] 上报被拒（HTTP ${r.status}）${data?.error || ''}`);
+    return {
+      ...data,
+      ok: Boolean(data?.ok)
+    };
   } catch (error) {
     // 连不上/超时：静默交给主流程兜（下面那次真正的查询会把原因暴露得更准）
-    return { ok: false, error: error?.message || String(error) }
+    return {
+      ok: false,
+      error: error?.message || String(error)
+    };
   } finally {
-    clearTimeout(timer)
+    clearTimeout(timer);
   }
 }

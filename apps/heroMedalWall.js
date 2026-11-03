@@ -1,3 +1,8 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import path from "node:path";
+import { ResourcePath, ResourceUrl } from "#components";
+import { Plugin, render, segment, logger } from "node-karin";
 /**
  * #称号墙 —— 把「台北第37孙权」这类荣耀称号按排名列出来。
  *
@@ -13,152 +18,185 @@
  *
  * 出图走 HeroMedalWall.html（视觉与战报同源），渲染失败时回落到纯文字清单。
  */
-import puppeteer from '#puppeteer'
-import path from 'path'
-import {
-  getImgType,
-  ApiService, resolveCurrentId, readYamlFile, Button, shouldQuote, getUserAvatar,
-  AT_HEAD, stripAtText, resolveTargetUserId, resolveMemberName
-} from '#utils'
-import { fetchHeroMedals, parseMedal, pendingMedalCount } from '../utils/heroMedals.js'
-import { loadPushList } from '../utils/pushStore.js'
-import { heroIconUrl } from '../utils/reportStore.js'
-import { PluginData } from '#components'
+
+import { getImgType, ApiService, resolveCurrentId, readUserData, Button, shouldQuote, getUserAvatar, AT_HEAD, stripAtText, resolveTargetUserId, resolveMemberName } from '#utils';
+import { fetchHeroMedals, parseMedal, pendingMedalCount } from '../utils/heroMedals.js';
+import { loadPushList } from '../utils/pushStore.js';
+import { heroIconUrl } from '../utils/reportStore.js';
+import { getNickMap, nickOf, withGroupNick } from '../utils/groupNick.js';
 
 /** 默认扫多少个英雄。20 秒左右，再多用户就该以为指令死了 */
-const SCAN_COUNT = 15
+const SCAN_COUNT = 15;
 /** 上限。30 个英雄约 40 秒，够到顶了 */
-const MAX_SCAN = 30
-
-export class HeroMedalWall extends plugin {
-  constructor () {
+const MAX_SCAN = 30;
+export class HeroMedalWall extends Plugin {
+  constructor() {
     super({
       name: '王者称号墙',
-      dsc: '按排名列出荣耀称号',
+      desc: '按排名列出荣耀称号',
       event: 'message',
       priority: 0,
-      rule: [
-        { reg: `${AT_HEAD}#(称号墙|荣耀称号|我的称号|称号列表)\\s*(.*)$`, fnc: 'wall' }
-      ]
-    })
+      rule: [{
+        reg: `${AT_HEAD}#(称号墙|荣耀称号|我的称号|称号列表)\\s*(.*)$`,
+        fnc: 'wall'
+      }]
+    });
+    this.priority = 0;
   }
-
-  async wall (e) {
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint, shouldQuote())
-
-    const input = stripAtText(e.msg).replace(/^#(称号墙|荣耀称号|我的称号|称号列表)\s*/, '').trim()
-    const args = parseArgs(input)
-
-    let campId = args.campId
+  async wall(e) {
+    if (isBlockedEvent(e)) return true;
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint, {
+      reply: shouldQuote()
+    });
+    const input = stripAtText(e.msg).replace(/^#(称号墙|荣耀称号|我的称号|称号列表)\s*/, '').trim();
+    const args = parseArgs(input);
+    let campId = args.campId;
     if (!campId && args.index) {
-      const ids = (readYamlFile(path.join(PluginData, 'UserData.yaml')) || {})[userId]?.ids || []
-      campId = ids[args.index - 1] || ''
+      // ⚠️ 走封装而不是裸 readYamlFile（2026-10-06 修）：utils/yamlUtils.js 明确声明「文件不存在 /
+      //    内容坏了都原样抛错，不在这里兜底」，而这里没有 try/catch —— 抛出的 ENOENT 或 YAML
+      //    解析错误会冒泡出 wall()，用户什么都收不到。readUserData() 读失败按空表处理。
+      const ids = readUserData()[userId]?.ids || [];
+      campId = ids[args.index - 1] || '';
       if (!campId) {
-        return e.reply(`你没有第 ${args.index} 个绑定的营地ID，发送 #营地ID 看看列表`, shouldQuote())
+        return e.reply(`你没有第 ${args.index} 个绑定的营地ID，发送 #营地ID 看看列表`, {
+          reply: shouldQuote()
+        });
       }
     }
     // 本机没绑就问共享库（用户在别的机器人上绑过也能直接用）
     if (!campId) {
-      const resolved = await resolveCurrentId(userId)
-      campId = resolved.campId
+      const resolved = await resolveCurrentId(userId);
+      campId = resolved.campId;
       if (!campId) {
-        return e.reply([resolved.hint, Button.bind()], shouldQuote())
+        return e.reply([resolved.hint, Button.bind()], {
+          reply: shouldQuote()
+        });
       }
     }
 
-    const scan = Math.min(Math.max(args.count || SCAN_COUNT, 1), MAX_SCAN)
-
-    let role = {}
-    let roleId = ''
-    let played = []
+    // ⚠️ 用 ?? 不用 ||（2026-10-06 修）：`#称号墙 0` 会被 || 当成假值换成默认 15，
+    //    后面的 Math.max(…, 1)（本意「最少扫 1 个」）于是成了死代码，还白扫 15 个英雄。
+    const scan = Math.min(Math.max(args.count ?? SCAN_COUNT, 1), MAX_SCAN);
+    let role = {};
+    let roleId = '';
+    let played = [];
     try {
-      const profile = await ApiService.getProfile(String(campId), String(userId))
-      roleId = String(profile?.data?.targetRoleId || '')
-      role = (profile?.data?.roleList || []).find(item => String(item.roleId) === roleId) || {}
-
-      const heroRes = await ApiService.getGameHeroList(String(campId), String(userId))
-      played = (heroRes?.data?.heroList || []).filter(hero => Number(hero.playNum) > 0)
+      const profile = await ApiService.getProfile(String(campId), String(e.userId));
+      roleId = String(profile?.data?.targetRoleId || '');
+      role = (profile?.data?.roleList || []).find(item => String(item.roleId) === roleId) || {};
+      const heroRes = await ApiService.getGameHeroList(String(campId), String(e.userId));
+      played = (heroRes?.data?.heroList || []).filter(hero => Number(hero.playNum) > 0);
     } catch (error) {
-      logger.error(`[王者称号墙] ${campId} 取数据失败: ${error.message}`)
+      logger.error(`[王者称号墙] ${campId} 取数据失败: ${error.message}`);
       return e.reply(ApiService.formatUserFacingError(error, {
         isMaster: Boolean(e.isMaster),
         scene: '称号墙查询异常'
-      }), shouldQuote())
+      }), {
+        reply: shouldQuote()
+      });
     }
-
     if (!roleId) {
-      return e.reply('取不到角色信息，请前往王者营地开启「陌生人可见」后重试', shouldQuote())
+      return e.reply('取不到角色信息，请前往王者营地开启「陌生人可见」后重试', {
+        reply: shouldQuote()
+      });
     }
     if (!played.length) {
-      return e.reply('未获取到英雄数据，请前往王者营地开启「陌生人可见」后重试', shouldQuote())
+      return e.reply('未获取到英雄数据，请前往王者营地开启「陌生人可见」后重试', {
+        reply: shouldQuote()
+      });
     }
 
     // 战力降序：称号是战力榜，从最高的开始扫才不会漏掉有称号的英雄
-    const picked = [...played]
-      .sort((a, b) => Number(b.heroFightPower) - Number(a.heroFightPower) || Number(b.playNum) - Number(a.playNum))
-      .slice(0, scan)
+    const picked = [...played].sort((a, b) => Number(b.heroFightPower) - Number(a.heroFightPower) || Number(b.playNum) - Number(a.playNum)).slice(0, scan);
 
     // 缓存（30 分钟，与 #我的英雄 共用）没命中的才真发请求，全命中时省掉这句回执
-    const pending = pendingMedalCount(roleId, picked)
+    const pending = pendingMedalCount(roleId, picked);
     if (pending > 3) {
-      await e.reply(`正在逐英雄查称号（战力最高的 ${picked.length} 个），大约 ${Math.ceil(pending * 1.3)} 秒...`, shouldQuote())
+      await e.reply(`正在逐英雄查称号（战力最高的 ${picked.length} 个），大约 ${Math.ceil(pending * 1.3)} 秒...`, {
+        reply: shouldQuote()
+      });
     }
-
     const medals = await fetchHeroMedals(roleId, picked, {
       roleName: role.roleName,
       serverId: role.serverId,
       campId: String(campId),
-      botUserId: String(userId)
-    })
-
-    const name = String(role.roleName || '').trim() || await displayName(e, userId)
-    const stat = { name, picked, medals, scanned: picked.length, total: played.length }
-
-    return e.reply([
-      await this.shot(e, userId, stat) || renderWall(stat),
-      Button.medalWall(campId)
-    ], shouldQuote())
+      botUserId: String(e.userId)
+    });
+    const name = String(role.roleName || '').trim() || (await displayName(e, userId));
+    const stat = {
+      name,
+      picked,
+      medals,
+      scanned: picked.length,
+      total: played.length
+    };
+    return e.reply([(await this.shot(e, userId, stat)) || renderWall(stat), Button.medalWall(campId)], {
+      reply: shouldQuote()
+    });
   }
 
   /** 出图。失败返回 null，由调用方回落到文字清单 */
-  async shot (e, userId, stat) {
+  async shot(e, userId, stat) {
     try {
-      return await puppeteer.screenshot('HeroMedalWall', {
-        imgType: getImgType(),
-        tplFile: 'plugins/GloryOfKings-Plugin/resources/html/HeroMedalWall.html',
-        // 模板的 CSS / 字体都靠 {{_res_path}} 拼相对路径，漏了这项样式表 404，出的是纯文字图
-        _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-        avatar: await getUserAvatar(e, userId, 100).catch(() => ''),
-        ...buildWallView(stat)
-      })
+      return segment.image(resourceUrl("base64://" + (await render.render({
+        name: 'HeroMedalWall',
+        type: getImgType(),
+        file: path.join(ResourcePath, "html", "HeroMedalWall.html"),
+        data: {
+          avatar: await getUserAvatar(e, userId, 100).catch(() => ''),
+          ...buildWallView(stat),
+          _res_path: ResourceUrl
+        },
+        pageGotoParams: {
+          waitUntil: "networkidle2",
+          timeout: 60000
+        }
+      }))));
     } catch (error) {
-      logger.error(`[王者称号墙] 渲染失败: ${error.message}`)
-      return null
+      logger.error(`[王者称号墙] 渲染失败: ${error.message}`);
+      return null;
     }
   }
 }
 
 /** `#称号墙 25 1580886057`：5 位以上是营地ID，1-2 位是扫描个数，3-4 位当绑定序号 */
-function parseArgs (input = '') {
-  const out = { campId: '', index: null, count: null }
+function parseArgs(input = '') {
+  const out = {
+    campId: '',
+    index: null,
+    count: null
+  };
   for (const tok of String(input).split(/[\s,，、]+/).filter(Boolean)) {
-    if (!/^\d+$/.test(tok)) continue
-    if (tok.length >= 5) out.campId = tok
-    else if (Number(tok) <= MAX_SCAN && out.count === null) out.count = Number(tok)
-    else if (out.index === null) out.index = Number(tok)
+    if (!/^\d+$/.test(tok)) continue;
+    // ⚠️ 按**位数**分派，别用数值大小（2026-10-06 修）：上面注释声明的口径就是「1-2 位是扫描个数、
+    //    3-4 位当绑定序号」，而 `Number(tok) <= MAX_SCAN`（30）会让 31~99 全部掉进 index 分支 ——
+    //    用户发 `#称号墙 50`（想多扫几个）会收到「你没有第 50 个绑定的营地ID」，他根本没提过序号。
+    if (tok.length >= 5) out.campId = tok;else if (tok.length <= 2 && out.count === null) out.count = Number(tok);else if (out.index === null) out.index = Number(tok);
   }
-  return out
+  return out;
 }
 
 /** 展示名兜底：推送轮询缓存的营地昵称 → 群名片 → QQ 号，都不额外发请求 */
-async function displayName (e, userId) {
-  const cached = String(loadPushList()[String(userId)]?.roleName || '').trim()
-  if (cached) return cached
+async function displayName(e, userId) {
+  const cached = String(loadPushList()[String(userId)]?.roleName || '').trim();
+  if (cached) {
+    // 群里发的图，游戏名后面补该群的群名片；私聊不加
+    const nick = e?.isGroup ? nickOf(await getNickMap(e.groupId, e.bot), userId) : '';
+    return withGroupNick(cached, nick);
+  }
   try {
-    return await resolveMemberName(e, userId) || String(userId)
+    // ⚠️ 传 `e.group` 而不是 `e`（2026-10-06 修）：resolveMemberName 的形参是**群对象**
+    //    （内部走 `group?.pickMember?.()`），而消息事件上并没有 pickMember ——
+    //    TRSS 的 prepareEvent 只挂 bot/friend/group/member/sender/reply，JiuLi 同。
+    //    传 e 进去必然取不到群名片，只会静默落到 QQ 号兜底。
+    //    ⚠️ 同组另外两处（apps/rankTrend.js / apps/scoreTrend.js）已按这个口径改过，这里是第三处。
+    return (await resolveMemberName(e.bot, e.groupId, userId)) || String(userId);
   } catch {
-    return String(userId)
+    return String(userId);
   }
 }
 
@@ -169,24 +207,29 @@ async function displayName (e, userId) {
  * 两条 medalList 分别是带地名的市级榜(TitleType 2)和不带地名的小范围榜(TitleType 1)，
  * 按 TitleType 分组：混在一起会出现「第9孙权」「台北第37孙权」挨着，看着像重复。
  */
-function groupMedals (picked, medals) {
-  const groups = new Map()
-  const none = []
-
+function groupMedals(picked, medals) {
+  const groups = new Map();
+  const none = [];
   for (const hero of picked) {
-    const list = medals.get(String(hero.heroId))
+    const list = medals.get(String(hero.heroId));
     // 没进 Map 的是请求失败（不是「没上榜」），两者都归到未上榜里但不细分——用户不关心
     if (!list?.length) {
-      none.push({ name: hero.name || `英雄${hero.heroId}`, heroIcon: heroIconUrl(hero.heroId) })
-      continue
+      none.push({
+        name: hero.name || `英雄${hero.heroId}`,
+        heroIcon: heroIconUrl(hero.heroId)
+      });
+      continue;
     }
     for (const item of list) {
-      const parsed = parseMedal(item?.UserMedalInfo)
-      if (!parsed.text) continue
-      const key = String(item?.TitleType ?? '')
-      if (!groups.has(key)) groups.set(key, { area: parsed.area, rows: [] })
-      const group = groups.get(key)
-      if (!group.area && parsed.area) group.area = parsed.area
+      const parsed = parseMedal(item?.UserMedalInfo);
+      if (!parsed.text) continue;
+      const key = String(item?.TitleType ?? '');
+      if (!groups.has(key)) groups.set(key, {
+        area: parsed.area,
+        rows: []
+      });
+      const group = groups.get(key);
+      if (!group.area && parsed.area) group.area = parsed.area;
       group.rows.push({
         rank: parsed.rank,
         hero: parsed.hero || hero.name || '',
@@ -194,30 +237,38 @@ function groupMedals (picked, medals) {
         power: Number(hero.heroFightPower) || 0,
         playNum: Number(hero.playNum) || 0,
         text: parsed.text
-      })
+      });
     }
   }
 
   // 地名榜（TitleType 2）排在前：数字更大但范围更广，是营地默认显示的那条
-  const ordered = [...groups.entries()]
-    .sort((a, b) => Number(b[0]) - Number(a[0]))
-    .map(([type, group]) => ({
-      type,
-      area: group.area,
-      rows: group.rows.sort((x, y) => x.rank - y.rank || y.power - x.power)
-    }))
-
-  return { groups: ordered, none }
+  const ordered = [...groups.entries()].sort((a, b) => Number(b[0]) - Number(a[0])).map(([type, group]) => ({
+    type,
+    area: group.area,
+    rows: group.rows.sort((x, y) => x.rank - y.rank || y.power - x.power)
+  }));
+  return {
+    groups: ordered,
+    none
+  };
 }
 
 /* ---------------------------------------------------------- 出图 */
 
-function buildWallView ({ name, picked, medals, scanned, total }) {
-  const { groups, none } = groupMedals(picked, medals)
-  const rows = groups.flatMap(group => group.rows)
-  const best = rows.length ? Math.min(...rows.map(row => row.rank)) : 0
-  const bestRow = rows.find(row => row.rank === best)
-
+function buildWallView({
+  name,
+  picked,
+  medals,
+  scanned,
+  total
+}) {
+  const {
+    groups,
+    none
+  } = groupMedals(picked, medals);
+  const rows = groups.flatMap(group => group.rows);
+  const best = rows.length ? Math.min(...rows.map(row => row.rank)) : 0;
+  const bestRow = rows.find(row => row.rank === best);
   return {
     title: '荣耀称号墙',
     subText: `${groups.length ? '当前排名' : '暂无称号'}`,
@@ -232,40 +283,58 @@ function buildWallView ({ name, picked, medals, scanned, total }) {
     noneCount: none.length,
     noneList: none,
     groups: groups.map(group => ({
-      // 小范围榜（TitleType 1）不带地名，标成「小范围榜」而不是「本区榜」，免得和市级榜混
-      title: group.area ? `${group.area}榜` : '小范围榜',
+      // 小范围榜（TitleType 1）不带地名，标成「小范围榜」而不是「本区榜」，免得和市级榜混。
+      // 和文字兜底 renderWall 共用 groupTitle，两处必须一致
+      title: groupTitle(group),
       tip: group.area ? '营地默认展示的就是这条' : '范围更小，名次数字也更小',
       rows: group.rows
     })),
-    footText: `扫了战力最高的 ${scanned} / ${total} 个英雄，指令后跟数字可以多扫（最多 ${MAX_SCAN}，每个英雄要单独请求）\n` +
-      '这里是当前排名；营地「历史赛季」页显示的是历史最高时的称号，可能不一样'
-  }
+    footText: `扫了战力最高的 ${scanned} / ${total} 个英雄，指令后跟数字可以多扫（最多 ${MAX_SCAN}，每个英雄要单独请求）\n` + '这里是当前排名；营地「历史赛季」页显示的是历史最高时的称号，可能不一样'
+  };
 }
 
 /* ---------------------------------------------------------- 文案（出图失败时的兜底） */
 
-function renderWall ({ name, picked, medals, scanned, total }) {
-  const { groups, none } = groupMedals(picked, medals)
-  const lines = [`🏅 ${name} 的荣耀称号`]
-
+/**
+ * 一个分组的展示名。**出图和文字兜底必须共用它**（2026-10-06 修）。
+ *
+ * ⚠️⚠️ 原先两处各写一份、结果不一致：
+ *    · 出图（上面 `groups` 的 `title`）写的是 `group.area ? area+'榜' : '小范围榜'`
+ *    · 文字兜底（`renderWall`）写的是 `group.area || '本区'` + '榜'
+ *    于是**同一个分组**在图上叫「小范围榜」、在文字里叫「本区榜」——
+ *    出图失败（puppeteer 起不来）时用户看到的和图上说的不是一个东西。
+ *    现在两处都走这里，改名只改一处。
+ */
+function groupTitle(group) {
+  return group?.area ? `${group.area}榜` : '小范围榜';
+}
+function renderWall({
+  name,
+  picked,
+  medals,
+  scanned,
+  total
+}) {
+  const {
+    groups,
+    none
+  } = groupMedals(picked, medals);
+  const lines = [`🏅 ${name} 的荣耀称号`];
   if (!groups.length) {
-    lines.push('', `战力最高的 ${scanned} 个英雄都还没上榜`)
-    lines.push('称号是英雄战力排行榜的名次，把某个英雄的战力练上去就有了')
-    return lines.join('\n')
+    lines.push('', `战力最高的 ${scanned} 个英雄都还没上榜`);
+    lines.push('称号是英雄战力排行榜的名次，把某个英雄的战力练上去就有了');
+    return lines.join('\n');
   }
-
   for (const group of groups) {
-    lines.push('', `📍 ${group.area || '本区'}榜（${group.rows.length}）`)
+    lines.push('', `📍 ${groupTitle(group)}（${group.rows.length}）`);
     for (const row of group.rows) {
-      lines.push(`· 第 ${row.rank} ${row.hero}${row.power ? `　战力 ${row.power}` : ''}`)
+      lines.push(`· 第 ${row.rank} ${row.hero}${row.power ? `　战力 ${row.power}` : ''}`);
     }
   }
-
   if (none.length) {
-    lines.push('', `未上榜（${none.length}）：${none.map(item => item.name).join('、')}`)
+    lines.push('', `未上榜（${none.length}）：${none.map(item => item.name).join('、')}`);
   }
-
-  lines.push('', `扫了战力最高的 ${scanned} / ${total} 个英雄，指令后跟数字可以多扫（最多 ${MAX_SCAN}，每个英雄要单独请求）`)
-  lines.push('这里是当前排名；营地「历史赛季」页显示的是历史最高时的称号，可能不一样')
-  return lines.join('\n')
+  lines.push('', `扫了战力最高的 ${scanned} / ${total} 个英雄，指令后跟数字可以多扫（最多 ${MAX_SCAN}，每个英雄要单独请求）`);
+  lines.push('这里是当前排名；营地「历史赛季」页显示的是历史最高时的称号，可能不一样');
+  return lines.join('\n');
 }

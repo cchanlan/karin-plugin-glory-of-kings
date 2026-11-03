@@ -1,3 +1,8 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resolveGroupBot, sendGroup } from "../utils/group.js";
+import { resourceUrl } from "../utils/message.js";
+import path from "node:path";
+import { Plugin, render, segment, logger, karin } from "node-karin";
 /**
  * 群战绩日报 / 周报 / 月报。
  *
@@ -13,28 +18,29 @@
  * 开关限群主 / 管理员 / 主人：这是全群可见的定时推送，不该让任何人随手开。
  * 手动查（#群日报）不限权限。
  */
-import puppeteer from '#puppeteer'
-import { resolveRange, buildGroupView, isMonthlyPushDay } from '../utils/reportStore.js'
-import {
-  collectGroupReport,
-  setGroupFlag,
-  listGroupSubs,
-  loadGroupSubs,
-  isGroupFlagOn,
-  resolveGroupTargets,
-  GROUP_SUB_FLAGS,
-  MAX_MEMBERS
-} from '../utils/groupReportStore.js'
-import { loadPushList, sleep, REQUEST_INTERVAL } from '../utils/pushStore.js'
-import { estimateRequestSeconds } from '../utils/api.js'
-import { getImgType, shouldQuote, Button, getGroupAvatar, pickGroupSafe } from '#utils'
-import { Config } from '#components'
+
+import { resolveRange, buildGroupView, isMonthlyPushDay } from '../utils/reportStore.js';
+import { collectGroupReport, setGroupFlag, listGroupSubs, loadGroupSubs, isGroupFlagOn, resolveGroupTargets, GROUP_SUB_FLAGS, MAX_MEMBERS } from '../utils/groupReportStore.js';
+import { loadPushList, subGroups, sleep, REQUEST_INTERVAL } from '../utils/pushStore.js';
+// 并发锁跨热重载共享：模块级 `let` 在热重载后是新变量，锁会被架空（见 utils/hotState.js）
+import { hotBox } from '../utils/hotState.js';
+import { getImgType, shouldQuote, Button, getGroupAvatar } from '#utils';
+import { Config, ResourcePath, ResourceUrl } from '#components';
+import { getNickMap } from '../utils/groupNick.js';
 
 /** 三路的中文名 */
-const LABEL = { daily: '日报', weekly: '周报', monthly: '月报' }
+const LABEL = {
+  daily: '日报',
+  weekly: '周报',
+  monthly: '月报'
+};
 
 /** 指令里的「日/周/月」到 kind */
-const KIND_BY_CHAR = { 日: 'daily', 周: 'weekly', 月: 'monthly' }
+const KIND_BY_CHAR = {
+  日: 'daily',
+  周: 'weekly',
+  月: 'monthly'
+};
 
 /**
  * 区间口径走 reportStore.resolveRange：周一查周报、1 号查月报会退回上一个完整周期，
@@ -46,134 +52,173 @@ const CRON_KEY = {
   daily: 'groupDailyReportCron',
   weekly: 'groupWeeklyReportCron',
   monthly: 'groupMonthlyReportCron'
-}
+};
 
 /** 榜单最多列几个人。和 #排位排名 的群榜一样是 10 上下，太长图会非常高 */
-const MAX_ROWS = 15
+const MAX_ROWS = 15;
 
-/** 出图并发锁，三路 task 共用一把：群报要扫几十个号，撞在一起会把频控和 puppeteer 一起拖垮 */
-let pushing = false
-
-export class GroupReport extends plugin {
-  constructor () {
+/**
+ * 出图并发锁，三路 task 共用一把：群报要扫几十个号，撞在一起会把频控和 puppeteer 一起拖垮。
+ *
+ * ⚠️ 必须跨热重载共享（见 `utils/hotState.js`）：模块级 `let` 热重载后是新变量，
+ *    旧实例那轮还在扫号，新实例看到 `false` 就并发再来一轮 —— 请求量翻倍、更容易吃频控。
+ */
+const S = hotBox('groupReport.pushing', {
+  pushing: false
+});
+export class GroupReport extends Plugin {
+  constructor() {
     super({
       name: '王者群战绩报告',
-      dsc: '本群成员的战绩日报 / 周报 / 月报',
+      desc: '本群成员的战绩日报 / 周报 / 月报',
       event: 'message',
       // 和 battleReport 一致用 0：queryGameStats 的 `#?(查询|王者)战绩\s*(.*)$` 是宽匹配，
       // 抢在它前面更稳
       priority: 0,
-      rule: [
-        { reg: '^#(王者|战绩)?群(日|周|月)报$', fnc: 'report' },
-        {
-          reg: '^#(开启|关闭)(王者|战绩)?群(日|周|月)报推送$',
-          fnc: 'toggle',
-          // admin 会自动放行主人（loader.js:308 先看 e.isMaster），群里则要求管理员
-          permission: 'admin'
-        },
-        { reg: '^#(王者|战绩)?群报(状态|推送状态)$', fnc: 'status' }
-      ]
-    })
-
-    const cfg = readConfig()
-    this.task = [
-      { name: '王者群日报', cron: cfg.groupDailyReportCron, fnc: () => this.pushAll('daily'), log: false },
-      { name: '王者群周报', cron: cfg.groupWeeklyReportCron, fnc: () => this.pushAll('weekly'), log: false },
-      { name: '王者群月报', cron: cfg.groupMonthlyReportCron, fnc: () => this.pushAll('monthly'), log: false }
-    ]
+      rule: [{
+        reg: '^#(王者|战绩)?群(日|周|月)报$',
+        fnc: 'report'
+      }, {
+        reg: '^#(开启|关闭)(王者|战绩)?群(日|周|月)报推送$',
+        fnc: 'toggle',
+        // admin 会自动放行主人（loader.js:308 先看 e.isMaster），群里则要求管理员
+        permission: 'admin'
+      }, {
+        reg: '^#(王者|战绩)?群报(状态|推送状态)$',
+        fnc: 'status'
+      }]
+    });
+    this.priority = 0;
+    const cfg = readConfig();
   }
 
   /* ------------------------------------------------------------ 指令查询 */
 
-  async report (e) {
-    const kind = KIND_BY_CHAR[e.msg.match(/群(日|周|月)报/)?.[1]] || 'daily'
-    const label = LABEL[kind]
-
+  async report(e) {
+    if (isBlockedEvent(e)) return true;
+    const kind = KIND_BY_CHAR[e.msg.match(/群(日|周|月)报/)?.[1]] || 'daily';
+    const label = LABEL[kind];
     if (!e.isGroup) {
-      return e.reply(`群${label}只能在群里使用，私聊请发送 #王者${label} 看自己的`, shouldQuote())
+      return e.reply(`群${label}只能在群里使用，私聊请发送 #王者${label} 看自己的`, {
+        reply: shouldQuote()
+      });
     }
-
-    const { memberIds, degraded } = await this.resolveMembers(e.group_id, e.group)
-    const { targets, bound } = resolveGroupTargets(memberIds)
-
+    const {
+      memberIds,
+      nickMap,
+      degraded
+    } = await this.resolveMembers(e.groupId, e.bot);
+    const {
+      targets,
+      bound
+    } = resolveGroupTargets(memberIds);
     if (!targets.length) {
-      return e.reply([
-        '本群还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入群榜吧',
-        Button.bind()
-      ], shouldQuote())
+      return e.reply(['本群还没有人绑定营地ID，先发送 #绑定营地 [营地ID] 加入群榜吧', Button.bind()], {
+        reply: shouldQuote()
+      });
     }
 
-    // 每个号至少一次请求，人多就是几十秒，先给个回执。
-    // 秒数交给 estimateRequestSeconds 算：请求按账号并发，池里有几个号就快几倍
-    const seconds = estimateRequestSeconds(targets.length)
-    await e.reply(
-      `正在汇总本群 ${targets.length} 个账号的${label}数据，约需 ${seconds} 秒，请稍候...`,
-      shouldQuote()
-    )
-
+    // 每个号至少一次请求，人多就是几十秒，先给个回执
+    await e.reply('正在更新数据，请稍候...', {
+      reply: shouldQuote()
+    });
     const view = await this.buildView(kind, {
       memberIds,
-      groupName: e.group_name || String(e.group_id),
-      groupAvatar: await getGroupAvatar(e.group_id, e.group, 640),
+      nickMap,
+      groupName: e.contact.name || String(e.groupId),
+      groupAvatar: await getGroupAvatar(e.groupId, e.bot, 640),
       degraded,
       bound
-    })
-
+    });
     if (!view) {
-      const { scopeText, isPrev } = resolveRange(kind)
-      const scope = isPrev ? scopeText : { daily: '今天', weekly: '本周', monthly: '本月' }[kind]
-      return e.reply(`本群${scope}还没有人打过对局`, shouldQuote())
+      const {
+        scopeText,
+        isPrev
+      } = resolveRange(kind);
+      const scope = isPrev ? scopeText : {
+        daily: '今天',
+        weekly: '本周',
+        monthly: '本月'
+      }[kind];
+      return e.reply(`本群${scope}还没有人打过对局`, {
+        reply: shouldQuote()
+      });
     }
-
-    const image = await this.shot(view)
-    if (!image) return e.reply(`群${label}出图失败，请稍后再试`, shouldQuote())
-
-    return e.reply(image, shouldQuote())
+    const image = await this.shot(view);
+    if (!image) return e.reply(`群${label}出图失败，请稍后再试`, {
+      reply: shouldQuote()
+    });
+    return e.reply(image, {
+      reply: shouldQuote()
+    });
   }
 
   /**
    * 群成员列表。
    *
    * 官方机器人（user_id 是 appid:openid 形态）常拿不到群成员列表，这时降级成
-   * 「订阅表里记着 group 是本群的那些人」——不能退回「全部绑定用户」，
+   * 「订阅表里记着本群的那些人」——不能退回「全部绑定用户」，
    * 那会把别的群的人算进本群榜里。
+   *
+   * ⚠️⚠️ 降级那份**必须认全 `subGroups()`**（2026-10-06 修）。原先只看单值
+   *    `sub.group`，而多群订阅的人主群在 `group`、其余在 `groups[]` 里 ——
+   *    于是「只出现在 `groups[]` 里的群」会拼出**空名单**。空名单本身不危险，
+   *    危险的是它接着被 `resolveGroupTargets` 当成「不过滤」（那边的旧判据），
+   *    结果整张群报统计的是全服绑定（跨群泄露）。现在两边都堵上了：
+   *    这里认全订阅群，那边空名单直接谁都不匹配。
+   *    实测：群 `972915804` 正好只出现在某个号的 `groups[]` 里，旧写法下名单为空。
    *
    * @returns {Promise<{memberIds:Array<string>, degraded:boolean}>}
    */
-  async resolveMembers (groupId, group) {
-    try {
-      const map = await group.getMemberMap()
-      const ids = [...map.keys()].map(String)
-      if (ids.length) return { memberIds: ids, degraded: false }
-    } catch (error) {
-      logger.warn(`[王者群报] 取群 ${groupId} 成员失败: ${error.message}`)
+  async resolveMembers(groupId, group) {
+    const nickMap = await getNickMap(groupId, group);
+    if (nickMap?.size) {
+      return {
+        memberIds: [...nickMap.keys()],
+        nickMap,
+        degraded: false
+      };
     }
-
-    const ids = Object.entries(loadPushList())
-      .filter(([, sub]) => String(sub?.group || '') === String(groupId))
-      .map(([qq]) => String(qq))
-
-    return { memberIds: ids, degraded: true }
+    const ids = Object.entries(loadPushList()).filter(([, sub]) => subGroups(sub).includes(String(groupId))).map(([qq]) => String(qq));
+    return {
+      memberIds: ids,
+      nickMap: {},
+      degraded: true
+    };
   }
 
   /**
    * 组装群报的模板数据。
    * @returns {Promise<object|null>} 区间内全群零对局时返回 null（不出空图）
    */
-  async buildView (kind, { memberIds = [], groupName = '', groupAvatar = '', degraded = false, bound = 0 } = {}) {
-    const nowMs = Date.now()
-    const { fromSec, toSec, scopeText } = resolveRange(kind, nowMs)
-
-    let collected
+  async buildView(kind, {
+    memberIds = [],
+    nickMap = {},
+    groupName = '',
+    groupAvatar = '',
+    degraded = false,
+    bound = 0
+  } = {}) {
+    const nowMs = Date.now();
+    const {
+      fromSec,
+      toSec,
+      scopeText
+    } = resolveRange(kind, nowMs);
+    let collected;
     try {
-      collected = await collectGroupReport({ kind, fromSec, toSec, memberIds })
+      collected = await collectGroupReport({
+        kind,
+        fromSec,
+        toSec,
+        memberIds,
+        nickMap
+      });
     } catch (error) {
-      logger.error(`[王者群${LABEL[kind]}] 采集失败: ${error.message}`)
-      return null
+      logger.error(`[王者群${LABEL[kind]}] 采集失败: ${error.message}`);
+      return null;
     }
-
-    if (!collected.group) return null
-
+    if (!collected.group) return null;
     const view = buildGroupView(collected.group, {
       kind,
       fromSec,
@@ -185,183 +230,207 @@ export class GroupReport extends plugin {
       truncated: collected.truncated,
       rowLimit: MAX_ROWS,
       scanned: collected.scanned
-    })
+    });
 
     // 两种「统计得不全」都要如实说，别让群里以为榜就是全部
-    const notes = []
+    const notes = [];
     if (bound > collected.scanned) {
-      notes.push(`本群绑定 ${bound} 个账号，只统计了最近活跃的前 ${collected.scanned} 个`)
+      notes.push(`本群绑定 ${bound} 个账号，只统计了最近活跃的前 ${collected.scanned} 个`);
     }
-    if (degraded) notes.push('取不到群成员列表，只统计了开过推送的成员')
-
-    return { ...view, groupAvatar, noteText: notes.join(' · ') }
+    if (degraded) notes.push('取不到群成员列表，只统计了开过推送的成员');
+    return {
+      ...view,
+      groupAvatar,
+      noteText: notes.join(' · ')
+    };
   }
-
-  async shot (view) {
+  async shot(view) {
     try {
-      return await puppeteer.screenshot('GroupReport', {
-        imgType: getImgType(),
-        tplFile: 'plugins/GloryOfKings-Plugin/resources/html/GroupReport.html',
-        // 模板里 CSS / 字体都靠 {{_res_path}} 拼相对路径，漏了这项样式表 404，
-        // 出来的是一张没有任何样式的纯文字图
-        _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-        ...view
-      })
+      return segment.image(resourceUrl("base64://" + (await render.render({
+        name: 'GroupReport',
+        type: getImgType(),
+        file: path.join(ResourcePath, "html", "GroupReport.html"),
+        data: {
+          ...view,
+          _res_path: ResourceUrl
+        },
+        pageGotoParams: {
+          waitUntil: "networkidle2",
+          timeout: 60000
+        }
+      }))));
     } catch (error) {
-      logger.error(`[王者群报] 渲染失败: ${error.message}`)
-      return null
+      logger.error(`[王者群报] 渲染失败: ${error.message}`);
+      return null;
     }
   }
 
   /* ------------------------------------------------------------ 订阅开关 */
 
-  async toggle (e) {
-    const kind = KIND_BY_CHAR[e.msg.match(/群(日|周|月)报/)?.[1]] || 'daily'
-    const label = LABEL[kind]
-    const enable = e.msg.includes('开启')
-
+  async toggle(e) {
+    if (isBlockedEvent(e)) return true;
+    const kind = KIND_BY_CHAR[e.msg.match(/群(日|周|月)报/)?.[1]] || 'daily';
+    const label = LABEL[kind];
+    const enable = e.msg.includes('开启');
     if (!e.isGroup) {
-      return e.reply(`群${label}推送是群维度的，请在要推送的群里开启`, shouldQuote())
+      return e.reply(`群${label}推送是群维度的，请在要推送的群里开启`, {
+        reply: shouldQuote()
+      });
     }
-
-    const groupId = String(e.group_id)
-
+    const groupId = String(e.groupId);
     if (!enable) {
-      const { changed } = setGroupFlag(groupId, kind, false)
-      return e.reply(changed ? `已关闭本群的群${label}推送` : `本群还没有开启群${label}推送`, shouldQuote())
+      const {
+        changed
+      } = setGroupFlag(groupId, kind, false);
+      return e.reply(changed ? `已关闭本群的群${label}推送` : `本群还没有开启群${label}推送`, {
+        reply: shouldQuote()
+      });
     }
-
-    const { changed } = setGroupFlag(groupId, kind, true, {
-      groupName: e.group_name || '',
-      operator: String(e.user_id),
+    const {
+      changed
+    } = setGroupFlag(groupId, kind, true, {
+      groupName: e.contact.name || '',
+      operator: String(e.userId),
       enabledAt: Date.now()
-    })
-
-    if (!changed) return e.reply(`本群已经开着群${label}推送了`, shouldQuote())
-
-    const cron = readConfig()[CRON_KEY[kind]] || ''
-    const period = { daily: '每天', weekly: '每周', monthly: '每月' }[kind]
-    const unit = { daily: '天', weekly: '周', monthly: '月' }[kind]
-
-    return e.reply([
-      `✅ 已开启本群的群${label}推送`,
-      `${period}会在本群发一张全员战绩排行榜（最多统计 ${MAX_MEMBERS} 个活跃账号）`,
-      cron ? `推送时间：${cron}` : '（主人还没配推送时间，暂时不会自动发）',
-      `全群没人打的${unit}不会推送。想立刻看发送 #群${label}`
-    ].join('\n'), shouldQuote())
+    });
+    if (!changed) return e.reply(`本群已经开着群${label}推送了`, {
+      reply: shouldQuote()
+    });
+    const cron = readConfig()[CRON_KEY[kind]] || '';
+    const period = {
+      daily: '每天',
+      weekly: '每周',
+      monthly: '每月'
+    }[kind];
+    const unit = {
+      daily: '天',
+      weekly: '周',
+      monthly: '月'
+    }[kind];
+    return e.reply([`✅ 已开启本群的群${label}推送`, `${period}会在本群发一张全员战绩排行榜（最多统计 ${MAX_MEMBERS} 个活跃账号）`, cron ? `推送时间：${cron}` : '（主人还没配推送时间，暂时不会自动发）', `全群没人打的${unit}不会推送。想立刻看发送 #群${label}`].join('\n'), {
+      reply: shouldQuote()
+    });
   }
-
-  async status (e) {
-    if (!e.isGroup) return e.reply('请在群里发送，查看本群的群报推送状态', shouldQuote())
-
-    const sub = loadGroupSubs()[String(e.group_id)]
-    const cfg = readConfig()
-
+  async status(e) {
+    if (isBlockedEvent(e)) return true;
+    if (!e.isGroup) return e.reply('请在群里发送，查看本群的群报推送状态', {
+      reply: shouldQuote()
+    });
+    const sub = loadGroupSubs()[String(e.groupId)];
+    const cfg = readConfig();
     const lines = GROUP_SUB_FLAGS.map(kind => {
-      const on = isGroupFlagOn(sub, kind)
-      const cron = cfg[CRON_KEY[kind]] || ''
-      return `群${LABEL[kind]}：${on ? '已开启' : '未开启'}${on && cron ? `（${cron}）` : ''}${on && !cron ? '（主人未配推送时间）' : ''}`
-    })
-
-    let bound = 0
+      const on = isGroupFlagOn(sub, kind);
+      const cron = cfg[CRON_KEY[kind]] || '';
+      return `群${LABEL[kind]}：${on ? '已开启' : '未开启'}${on && cron ? `（${cron}）` : ''}${on && !cron ? '（主人未配推送时间）' : ''}`;
+    });
+    let bound = 0;
     try {
-      const { memberIds } = await this.resolveMembers(e.group_id, e.group)
-      bound = resolveGroupTargets(memberIds).bound
+      const {
+        memberIds
+      } = await this.resolveMembers(e.groupId, e.bot);
+      bound = resolveGroupTargets(memberIds).bound;
     } catch {
-      bound = 0
+      bound = 0;
     }
-
-    return e.reply([
-      `📊 本群群报推送状态`,
-      ...lines,
-      `本群参与统计的账号：${bound} 个（上限 ${MAX_MEMBERS}）`,
-      '开关指令：#开启群日报推送 / #关闭群周报推送（限群管理）',
-      '手动查看：#群日报 / #群周报 / #群月报'
-    ].join('\n'), shouldQuote())
+    return e.reply([`📊 本群群报推送状态`, ...lines, `本群参与统计的账号：${bound} 个（上限 ${MAX_MEMBERS}）`, '开关指令：#开启群日报推送 / #关闭群周报推送（限群管理）', '手动查看：#群日报 / #群周报 / #群月报'].join('\n'), {
+      reply: shouldQuote()
+    });
   }
 
   /* ------------------------------------------------------------ 定时推送 */
 
-  async pushAll (kind) {
-    const label = LABEL[kind]
+  async pushAll(kind) {
+    const label = LABEL[kind];
 
     // 月报的 cron 是 28-31 号每晚触发，只有真正的月末才推完整的一个月
     if (kind === 'monthly' && !isMonthlyPushDay()) {
-      logger.debug(`[王者群${label}] 今天不是本月最后一天，跳过`)
-      return
+      logger.debug(`[王者群${label}] 今天不是本月最后一天，跳过`);
+      return;
     }
-
-    const subs = listGroupSubs(kind)
-    if (!subs.length) return
-
-    if (pushing) {
-      logger.warn(`[王者群${label}] 上一轮推送还在跑，本轮跳过`)
-      return
+    const subs = listGroupSubs(kind);
+    if (!subs.length) return;
+    if (S.pushing) {
+      logger.warn(`[王者群${label}] 上一轮推送还在跑，本轮跳过`);
+      return;
     }
-
-    pushing = true
+    S.pushing = true;
     try {
-      for (const { groupId, sub } of subs) {
+      for (const {
+        groupId,
+        sub
+      } of subs) {
         try {
-          await this.pushOne(groupId, sub, kind)
+          await this.pushOne(groupId, sub, kind);
         } catch (error) {
-          logger.error(`[王者群${label}] 推送群 ${groupId} 失败: ${error.message}`)
+          logger.error(`[王者群${label}] 推送群 ${groupId} 失败: ${error.message}`);
         }
-        await sleep(REQUEST_INTERVAL)
+        await sleep(REQUEST_INTERVAL);
       }
     } finally {
-      pushing = false
+      S.pushing = false;
     }
   }
-
-  async pushOne (groupId, sub, kind) {
-    const label = LABEL[kind]
-
-    const group = pickGroupSafe(groupId)
+  async pushOne(groupId, sub, kind) {
+    const label = LABEL[kind];
+    const group = await resolveGroupBot(groupId);
     if (!group?.sendMsg) {
-      logger.warn(`[王者群${label}] 取不到群 ${groupId}，跳过`)
-      return
+      logger.warn(`[王者群${label}] 取不到群 ${groupId}，跳过`);
+      return;
     }
-
-    const { memberIds, degraded } = await this.resolveMembers(groupId, group)
-    const { targets, bound } = resolveGroupTargets(memberIds)
+    const {
+      memberIds,
+      nickMap,
+      degraded
+    } = await this.resolveMembers(groupId, group);
+    const {
+      targets,
+      bound
+    } = resolveGroupTargets(memberIds);
     if (!targets.length) {
-      logger.debug(`[王者群${label}] 群 ${groupId} 没有绑定账号，跳过`)
-      return
+      logger.debug(`[王者群${label}] 群 ${groupId} 没有绑定账号，跳过`);
+      return;
     }
-
     const view = await this.buildView(kind, {
       memberIds,
+      nickMap,
       groupName: sub.groupName || String(groupId),
       groupAvatar: await getGroupAvatar(groupId, group, 640),
       degraded,
       bound
-    })
+    });
 
     // 全群零对局就不发，推一张空图纯属刷屏
     if (!view) {
-      logger.debug(`[王者群${label}] 群 ${groupId} 本区间无对局，跳过`)
-      return
+      logger.debug(`[王者群${label}] 群 ${groupId} 本区间无对局，跳过`);
+      return;
     }
-
-    const image = await this.shot(view)
-    if (!image) return
-
+    const image = await this.shot(view);
+    if (!image) return;
     try {
       // 群报是给全群看的，不 @ 任何人；图在前、一行图注在后，和个人日报的排版一致
-      await group.sendMsg([image, `📊 本群${label}（${view.rangeText}）· ${view.scannedText}`])
-      logger.mark(`[王者群${label}] 已推送到群 ${groupId}`)
+      await sendGroup(groupId, [image, `📊 本群${label}（${view.rangeText}）· ${view.scannedText}`], group);
+      logger.mark(`[王者群${label}] 已推送到群 ${groupId}`);
     } catch (error) {
-      logger.error(`[王者群${label}] 发送失败 群${groupId}: ${error.message}`)
+      logger.error(`[王者群${label}] 发送失败 群${groupId}: ${error.message}`);
     }
   }
 }
 
 /** 读配置，读不到时返回空对象，和 battleReport 的兜底思路一致 */
-function readConfig () {
+function readConfig() {
   try {
-    return Config.getDefOrConfig('config') || {}
+    return Config.getDefOrConfig('config') || {};
   } catch {
-    return {}
+    return {};
   }
 }
+const runner = new GroupReport();
+export const groupDailyTask = readConfig().groupDailyReportCron ? karin.task("王者群日报", String(readConfig().groupDailyReportCron), () => runner.pushAll('daily'), {
+  log: false
+}) : [];
+export const groupWeeklyTask = readConfig().groupWeeklyReportCron ? karin.task("王者群周报", String(readConfig().groupWeeklyReportCron), () => runner.pushAll('weekly'), {
+  log: false
+}) : [];
+export const groupMonthlyTask = readConfig().groupMonthlyReportCron ? karin.task("王者群月报", String(readConfig().groupMonthlyReportCron), () => runner.pushAll('monthly'), {
+  log: false
+}) : [];

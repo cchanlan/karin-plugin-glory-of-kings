@@ -1,7 +1,7 @@
 {
   "name": "karin-plugin-glory-of-kings",
-  "version": "1.0.0",
-  "description": "王者荣耀营地查询插件（Karin 版）",
+  "version": "2.0.0",
+  "description": "王者荣耀营地查询插件（Karin 原生 npm 版）",
   "homepage": "https://github.com/cchanlan/karin-plugin-glory-of-kings",
   "bugs": {
     "url": "https://github.com/cchanlan/karin-plugin-glory-of-kings/issues"
@@ -23,12 +23,17 @@
   "scripts": {
     "app": "karin start",
     "dev": "karin dev",
-    "lint": "eslint ."
+    "lint": "eslint apps utils components lib",
+    "pack": "npm pack",
+    "prepublishOnly": "npm run lint"
   },
   "dependencies": {
     "moment": "^2.30.1",
     "node-fetch": "^3.3.0",
-    "yaml": "^2.2.2"
+    "yaml": "^2.2.2",
+    "sharp": "^0.34.5",
+    "@snapka/browser-finder": "0.1.12",
+    "puppeteer-core": "^24.43.1"
   },
   "peerDependencies": {
     "node-karin": "^1.17.0"
@@ -40,14 +45,11 @@
   },
   "imports": {
     "#components": "./components/index.js",
-    "#utils": "./utils/index.js",
-    "#puppeteer": "./lib/compat/render.js",
-    "#common": "./lib/compat/common.js",
-    "#update": "./lib/compat/update.js"
+    "#utils": "./utils/index.js"
   },
   "karin": {
     "apps": [
-      "karin-apps"
+      "apps"
     ],
     "static": [
       "resources"
@@ -57,5 +59,28 @@
       "data",
       "resources"
     ]
+  },
+  "engines": {
+    "node": ">=18.20.0",
+    "karin": ">=1.17.0"
+  },
+  "files": [
+    "apps",
+    "utils",
+    "components",
+    "lib/index.js",
+    "config/default_config",
+    "resources",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.1",
+    "prettier": "^3.6.2"
   }
 }

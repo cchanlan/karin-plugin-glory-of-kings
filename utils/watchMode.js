@@ -20,9 +20,9 @@
  * 实测：排位赛 = gameType 4 / battleType 17，巅峰赛 = gameType 14 / battleType 32。
  * 娱乐、模拟战一类营地不开放观战，取流恒回 `-1021`（等多久都没用）。
  */
-export const WATCHABLE_GAME_TYPE = new Set([4, 14])
+export const WATCHABLE_GAME_TYPE = new Set([4, 14]);
 
 /** 这个模式营地给不给观战 */
-export function isWatchableMode (gameType) {
-  return WATCHABLE_GAME_TYPE.has(Number(gameType))
+export function isWatchableMode(gameType) {
+  return WATCHABLE_GAME_TYPE.has(Number(gameType));
 }

@@ -10,19 +10,18 @@
  * 快照（pushed 列表）只用来防重复推送，不用来判断「是不是新的」：
  * 用 diff 判新的话，第一次运行会把 818 条全当成新皮肤。
  */
-import path from 'path'
-import { ApiService, cache, readYamlFile, writeYamlFile } from '#utils'
-import { quarantineCorrupt } from './safeStore.js'
-import { PVP_FIELDS as F, getHeroCatalog } from './heroGuide.js'
-import { PluginData } from '#components'
-
-const SKIN_PUSH_FILE = path.join(PluginData, 'SkinNewsPush.yaml')
+import path from 'path';
+import { ApiService, cache, readYamlFile, writeYamlFile } from '#utils';
+import { quarantineCorrupt } from './safeStore.js';
+import { PVP_FIELDS as F, getHeroCatalog } from './heroGuide.js';
+import { PluginData } from '#components';
+const SKIN_PUSH_FILE = path.join(PluginData, 'SkinNewsPush.yaml');
 
 /** 皮肤总表的内存缓存时长（秒）。官网一天也就更一次，1 小时足够 */
-const CALENDAR_TTL = 3600
+const CALENDAR_TTL = 3600;
 
 /** 防重复推送的记录最多留多少条（一年新皮肤约 100 张，200 条够两年） */
-const PUSHED_KEEP = 200
+const PUSHED_KEEP = 200;
 
 /** 品质配色，和图上其它「强弱」语言保持一致 */
 export const QUALITY_COLOR = {
@@ -33,21 +32,21 @@ export const QUALITY_COLOR = {
   勇者: '#6f8ef5',
   伴生: '#7ee0a8',
   荣耀典藏: '#ff5b7c'
-}
+};
 
 /** YYYYMMDD -> 2026-09-01 */
-export function formatDate (raw) {
-  const text = String(raw || '')
-  if (!/^\d{8}$/.test(text)) return text
-  return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`
+export function formatDate(raw) {
+  const text = String(raw || '');
+  if (!/^\d{8}$/.test(text)) return text;
+  return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
 }
 
 /** 今天的 YYYYMMDD（本地时区，和官网写的日期同一个口径） */
-export function today () {
-  const d = new Date()
-  const mm = String(d.getMonth() + 1).padStart(2, '0')
-  const dd = String(d.getDate()).padStart(2, '0')
-  return `${d.getFullYear()}${mm}${dd}`
+export function today() {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}${mm}${dd}`;
 }
 
 /**
@@ -55,31 +54,26 @@ export function today () {
  * 顺带把英雄头像补上——皮肤条目里只有皮肤自己的封面，英雄头像要从英雄表按名字取。
  * @returns {Promise<object[]>}
  */
-export async function getSkinCalendar () {
-  const hit = cache.get('gok:skinCalendar')
-  if (hit) return hit
-
-  const [raw, catalog] = await Promise.all([ApiService.getPvpSkinList(), getHeroCatalog()])
-  const list = (raw?.[F.skinList] || [])
-    .map(s => {
-      const heroName = String(s[F.skinHero] || '')
-      return {
-        id: String(s[F.skinId] || ''),
-        name: String(s[F.skinName] || ''),
-        hero: heroName,
-        heroAvatar: catalog.byName.get(heroName)?.avatar || '',
-        quality: String(s[F.skinQuality] || ''),
-        online: String(s[F.skinOnline] || ''),
-        intro: String(s[F.skinIntro] || ''),
-        getWay: String(s[F.skinGet] || ''),
-        cover: String(s[F.skinCover] || '')
-      }
-    })
-    .filter(s => s.id && s.name && /^\d{8}$/.test(s.online))
-    .sort((a, b) => b.online.localeCompare(a.online))
-
-  cache.set('gok:skinCalendar', list, CALENDAR_TTL)
-  return list
+export async function getSkinCalendar() {
+  const hit = cache.get('gok:skinCalendar');
+  if (hit) return hit;
+  const [raw, catalog] = await Promise.all([ApiService.getPvpSkinList(), getHeroCatalog()]);
+  const list = (raw?.[F.skinList] || []).map(s => {
+    const heroName = String(s[F.skinHero] || '');
+    return {
+      id: String(s[F.skinId] || ''),
+      name: String(s[F.skinName] || ''),
+      hero: heroName,
+      heroAvatar: catalog.byName.get(heroName)?.avatar || '',
+      quality: String(s[F.skinQuality] || ''),
+      online: String(s[F.skinOnline] || ''),
+      intro: String(s[F.skinIntro] || ''),
+      getWay: String(s[F.skinGet] || ''),
+      cover: String(s[F.skinCover] || '')
+    };
+  }).filter(s => s.id && s.name && /^\d{8}$/.test(s.online)).sort((a, b) => b.online.localeCompare(a.online));
+  cache.set('gok:skinCalendar', list, CALENDAR_TTL);
+  return list;
 }
 
 /**
@@ -88,21 +82,22 @@ export async function getSkinCalendar () {
  * @param {object[]} list getSkinCalendar 的结果
  * @param {number} recentLimit 最近上线最多取几条
  */
-export function splitCalendar (list, recentLimit = 8) {
-  const now = today()
-  const upcoming = []
-  const todayList = []
-  const recent = []
-
+export function splitCalendar(list, recentLimit = 8) {
+  const now = today();
+  const upcoming = [];
+  const todayList = [];
+  const recent = [];
   for (const skin of list) {
-    if (skin.online > now) upcoming.push(skin)
-    else if (skin.online === now) todayList.push(skin)
-    else if (recent.length < recentLimit) recent.push(skin)
+    if (skin.online > now) upcoming.push(skin);else if (skin.online === now) todayList.push(skin);else if (recent.length < recentLimit) recent.push(skin);
   }
 
   // 即将上线按时间正序（最近要来的排最前），和「倒计时」的直觉一致
-  upcoming.sort((a, b) => a.online.localeCompare(b.online))
-  return { upcoming, todayList, recent }
+  upcoming.sort((a, b) => a.online.localeCompare(b.online));
+  return {
+    upcoming,
+    todayList,
+    recent
+  };
 }
 
 /* ---------------------------------------------------------------- 订阅存取 */
@@ -112,48 +107,56 @@ export function splitCalendar (list, recentLimit = 8) {
  * 解析失败先隔离坏文件，否则空表会被下一次保存固化，订阅静默消失（同 groupReportStore）。
  * @returns {{pushList: object, pushed: string[]}}
  */
-export function loadSkinNewsStore () {
+export function loadSkinNewsStore() {
   try {
-    const data = readYamlFile(SKIN_PUSH_FILE)
+    const data = readYamlFile(SKIN_PUSH_FILE);
     return {
       pushList: data?.pushList && typeof data.pushList === 'object' ? data.pushList : {},
       pushed: Array.isArray(data?.pushed) ? data.pushed.map(String) : []
-    }
+    };
   } catch (error) {
-    quarantineCorrupt(SKIN_PUSH_FILE, error, '[王者皮肤上新]')
-    return { pushList: {}, pushed: [] }
+    quarantineCorrupt(SKIN_PUSH_FILE, error, '[王者皮肤上新]');
+    return {
+      pushList: {},
+      pushed: []
+    };
   }
 }
-
-export function saveSkinNewsStore (store) {
+export function saveSkinNewsStore(store) {
   writeYamlFile(SKIN_PUSH_FILE, {
     pushList: store?.pushList || {},
     // 只留最近的，否则这个数组会一直长
     pushed: (store?.pushed || []).slice(-PUSHED_KEEP)
-  })
+  });
 }
 
 /**
  * 开 / 关一个群的皮肤上新推送。关掉就删记录，不留空壳。
  * @returns {{changed: boolean}} changed 为假表示状态本来就是这样
  */
-export function setSkinNewsSub (groupId, enable, extra = {}) {
-  const key = String(groupId || '')
-  if (!key) return { changed: false }
-
-  const store = loadSkinNewsStore()
-  const on = Boolean(store.pushList[key])
-
-  if (on === enable) return { changed: false }
-
+export function setSkinNewsSub(groupId, enable, extra = {}) {
+  const key = String(groupId || '');
+  if (!key) return {
+    changed: false
+  };
+  const store = loadSkinNewsStore();
+  const on = Boolean(store.pushList[key]);
+  if (on === enable) return {
+    changed: false
+  };
   if (enable) {
-    store.pushList[key] = { enabled: true, since: Date.now(), ...extra }
+    store.pushList[key] = {
+      enabled: true,
+      since: Date.now(),
+      ...extra
+    };
   } else {
-    delete store.pushList[key]
+    delete store.pushList[key];
   }
-
-  saveSkinNewsStore(store)
-  return { changed: true }
+  saveSkinNewsStore(store);
+  return {
+    changed: true
+  };
 }
 
 /**
@@ -165,24 +168,57 @@ export function setSkinNewsSub (groupId, enable, extra = {}) {
  * 都按皮肤 ID 去重，`pushed` 里有的不再推。**首次运行不会把历史皮肤全推一遍**：
  * 判据是「上线日期 >= 今天」，历史皮肤天然不入选。
  *
+ * ⚠️⚠️ 去重键**必须区分「预告过」和「上线推过」**（2026-10-06 修）。
+ *    原先 `pushed` 只是一个裸 id 集合，两种推送共用一个名额，于是：
+ *    某张皮肤先以「即将上线」被预告过一次 → 它上线**当天**落进 `todayList`，
+ *    又被 `!pushed.has(skin.id)` 滤掉 → **最该推的那天一条都不出**。
+ *    实测纯函数复现：第 1 轮推 `['TODAY1','FUTURE1']`；
+ *    第 2 轮（FUTURE1 上线当天）实际只推 `['TODAY2']`，FUTURE1 静默消失，
+ *    而期望是 `['FUTURE1','TODAY2']`。
+ *    补充：`splitCalendar(list, 0)` 的 `upcoming` **没有上限**（`recentLimit` 只约束
+ *    `recent`），所以任何未上线皮肤第一次进清单时都会被预告掉，撞上的概率不低。
+ *
+ *    现在键分两种：预告记 `${id}@upcoming`、上线推记 `${id}@online`。
+ *    上线那天只查 `@online`，预告过不影响；反过来预告过之后不会再重复预告。
+ *    读旧数据时裸 id（历史写法）仍按「上线推过」认，保持兼容。
+ *
  * @returns {Promise<{items: object[], store: object}>} items 为空表示这轮没什么可推
  */
-export async function collectSkinNews () {
-  const store = loadSkinNewsStore()
-  const list = await getSkinCalendar()
-  const { upcoming, todayList } = splitCalendar(list, 0)
-  const pushed = new Set(store.pushed)
+export async function collectSkinNews() {
+  const store = loadSkinNewsStore();
+  const list = await getSkinCalendar();
+  const {
+    upcoming,
+    todayList
+  } = splitCalendar(list, 0);
+  const pushed = new Set(store.pushed);
 
-  const items = [...todayList, ...upcoming]
-    .filter(skin => !pushed.has(skin.id))
-    .map(skin => ({ ...skin, isToday: skin.online === today() }))
-
-  return { items, store }
+  // 历史裸 id 一律当「上线推过」，兼容旧存档
+  const pushedOnline = id => pushed.has(`${id}@online`) || pushed.has(String(id));
+  const pushedUpcoming = id => pushed.has(`${id}@upcoming`);
+  const now = today();
+  const items = [...todayList, ...upcoming].filter(skin => skin.online === now ? !pushedOnline(skin.id) : !pushedUpcoming(skin.id)).map(skin => ({
+    ...skin,
+    isToday: skin.online === now
+  }));
+  return {
+    items,
+    store
+  };
 }
 
-/** 把这批皮肤记进已推列表 */
-export function markSkinNewsPushed (store, items) {
-  const ids = items.map(s => String(s.id))
-  store.pushed = [...store.pushed.filter(id => !ids.includes(id)), ...ids]
-  saveSkinNewsStore(store)
+/**
+ * 把这批皮肤记进已推列表（按 `isToday` 分键，见 collectSkinNews 的说明）。
+ *
+ * ⚠️ 落盘前**重读一次**，只把 `pushed` 合并进去（2026-10-06 修，同 gameNews 的修法）。
+ *    传进来的 `store` 是 `collectSkinNews()` 那一刻的快照，而中间隔着出图 +
+ *    逐个订阅群发消息（几十秒）。这段时间里用户发 `#关闭皮肤上新推送` 改了 pushList，
+ *    用旧快照整份 `saveSkinNewsStore` 会把它**静默改回开启**。
+ */
+export function markSkinNewsPushed(store, items) {
+  if (!items.length) return;
+  const keys = items.map(s => `${s.id}${s.isToday ? '@online' : '@upcoming'}`);
+  const fresh = loadSkinNewsStore();
+  fresh.pushed = [...fresh.pushed.filter(k => !keys.includes(k)), ...keys];
+  saveSkinNewsStore(fresh);
 }

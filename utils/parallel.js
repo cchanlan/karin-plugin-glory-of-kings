@@ -16,14 +16,14 @@
  * 任务抛错会直接中断整批（Promise.all 的语义）——需要「单个失败不影响其它」的话，
  * 在 handler 里自己 try/catch，别指望这里兜。
  */
-import ApiService from './api.js'
+import ApiService from './api.js';
 
 /** 默认并发路数：池里能用的全局账号数，读不出来时退成 1（串行，等于没并发） */
-function defaultConcurrency () {
+function defaultConcurrency() {
   try {
-    return Math.max(1, ApiService.usableAccountCount())
+    return Math.max(1, ApiService.usableAccountCount());
   } catch {
-    return 1
+    return 1;
   }
 }
 
@@ -34,23 +34,24 @@ function defaultConcurrency () {
  * @param {number} [opts.concurrency] 手动指定并发路数（默认按账号数）
  * @returns {Promise<Array>} 与 items 同序的结果数组
  */
-export async function mapConcurrent (items, handler, { concurrency } = {}) {
-  const list = Array.from(items || [])
-  if (!list.length) return []
-
-  const lanes = Math.max(1, Math.min(Number(concurrency) || defaultConcurrency(), list.length))
-  const results = new Array(list.length)
+export async function mapConcurrent(items, handler, {
+  concurrency
+} = {}) {
+  const list = Array.from(items || []);
+  if (!list.length) return [];
+  const lanes = Math.max(1, Math.min(Number(concurrency) || defaultConcurrency(), list.length));
+  const results = new Array(list.length);
   // 单线程下 cursor++ 是原子的，多路协程抢号不会重复
-  let cursor = 0
-
+  let cursor = 0;
   const lane = async () => {
     for (;;) {
-      const index = cursor++
-      if (index >= list.length) return
-      results[index] = await handler(list[index], index)
+      const index = cursor++;
+      if (index >= list.length) return;
+      results[index] = await handler(list[index], index);
     }
-  }
-
-  await Promise.all(Array.from({ length: lanes }, lane))
-  return results
+  };
+  await Promise.all(Array.from({
+    length: lanes
+  }, lane));
+  return results;
 }

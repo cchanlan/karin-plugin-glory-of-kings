@@ -1,7 +1,10 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import { Plugin, render, segment, logger } from "node-karin";
 // 我的英雄：主表取自游戏侧 /play/h5getherolist（全部竞技模式的生涯累计），一次请求拿全量英雄。
 // 和 heroList.js 的区别：那边走营地赛季页只有当前赛季 top5，这里是账号拥有的全部英雄（实测一个号 132 条）。
 //
-// 「战力」列是**历史最高战力**（营地 App 那页右上角「⇄ 历史赛季」的口径），
+// 「历史最高」列是**历史最高战力**（营地 App 那页右上角「⇄ 历史赛季」的口径），
 // 来自营地侧 /hero/getseasonusaullyherolist（seasonId=0），不是 h5getherolist 里的当前值。
 // 那个接口顺带把「拿历史最高时的荣耀称号」也放在 honorTitle 里给了，于是以前那套逐英雄拉
 // pagedetails 扫称号的流程整个去掉了 —— 实测历史口径的称号是当前口径的超集：
@@ -9,144 +12,161 @@
 // 当前已掉榜的（戈娅）历史接口照样给得出来；而 honorTitle 为 null 的，pagedetails 实测也一律为空。
 // 顺带 #我的英雄 15 从十几秒（15 个英雄串行请求）降到 2 个请求。
 //
+// 「本赛季」列是 h5getherolist 的 heroFightPower（当前战力）。营地**不提供当前赛季的峰值**
+// （getseasonusaullyherolist 传当前赛季号时 maxHeroFightPower 恒 0），所以这一列只能显示当前值，
+// 不要改叫「赛季最高」。
+//
 // 两个接口靠 heroId 关联，主表必须用 h5getherolist：它有 winNum 能算总胜率，
 // playNum 也是营地那页的口径（孙权 2201），而历史接口的 playNum 是另一套（同英雄 1182），
 // 所以只从历史接口补 maxHeroFightPower 与称号两个字段。
-// 历史接口拿不到时（没绑角色 / 接口异常）退回显示当前战力，模板列名也跟着变，保证图还能出。
-import puppeteer from '#puppeteer'
-import { getImgType, ApiService, readYamlFile, getLocalImage, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils'
-import path from 'path'
-import { PluginData, PluginPath } from '#components'
+// 历史接口拿不到时（没绑角色 / 接口异常）历史列显示「—」，排序退回当前战力，保证图还能出。
+
+import { getImgType, ApiService, readYamlFile, getLocalImage, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import path from 'path';
+import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 
 // 英雄头像图（营地战斗页头像，裁成横图），和常用英雄榜共用一套
-const HERO_IMG_BASE = 'https://game-1255653016.file.myqcloud.com/battle_skin_1250-326'
+const HERO_IMG_BASE = 'https://game-1255653016.file.myqcloud.com/battle_skin_1250-326';
 // 默认展示数量，指令后可跟数字改
-const SHOW_COUNT = 10
-const MAX_COUNT = 30
+const SHOW_COUNT = 10;
+const MAX_COUNT = 30;
 
 // 熟练度等级 → 营地里的叫法。实测 8=神话 7=传说 6=巅峰 5=超凡（对着 pagedetails 的 skilledTitle 核过），
 // 4 及以下没实测到，直接显示 Lv.N，不猜。
-const SKILLED_NAME = { 8: '神话', 7: '传说', 6: '巅峰', 5: '超凡' }
+const SKILLED_NAME = {
+  8: '神话',
+  7: '传说',
+  6: '巅峰',
+  5: '超凡'
+};
 
 // 战力配色，跟营地一致（和 heroList.js 同一套阈值）
 function fightColor(power) {
-  const p = Number(power) || 0
-  if (p <= 2500) return '#c8c8c8'
-  if (p <= 5000) return '#6f8ef5'
-  if (p <= 7500) return '#a24bff'
-  if (p <= 10000) return '#f5d76e'
-  return '#ff5b7c'
+  const p = Number(power) || 0;
+  if (p <= 2500) return '#c8c8c8';
+  if (p <= 5000) return '#6f8ef5';
+  if (p <= 7500) return '#a24bff';
+  if (p <= 10000) return '#f5d76e';
+  return '#ff5b7c';
 }
 
 // “元流之子(射手)” → { name: '元流之子', subName: '射手' }
 function splitHeroName(rawName) {
-  const text = rawName || ''
-  const matched = text.match(/^(.+?)\s*[（(]([^）)]+)[）)]\s*$/)
+  const text = rawName || '';
+  const matched = text.match(/^(.+?)\s*[（(]([^）)]+)[）)]\s*$/);
   return {
     name: matched ? matched[1] : text,
     subName: matched ? matched[2] : ''
-  }
+  };
 }
-
-export class MyHeroList extends plugin {
+export class MyHeroList extends Plugin {
   constructor() {
     super({
       name: '查询王者我的英雄',
-      dsc: '查询账号全部英雄的场次/胜率/最高战力',
+      desc: '查询账号全部英雄的场次/胜率/最高战力',
       event: 'message',
       priority: 5,
-      rule: [
-        {
-          reg: `${AT_HEAD}#(王者)?我的英雄\\s*(.*)$`,
-          fnc: 'myHeroList'
-        }
-      ]
-    })
+      rule: [{
+        reg: `${AT_HEAD}#(王者)?我的英雄\\s*(.*)$`,
+        fnc: 'myHeroList'
+      }]
+    });
   }
-
   async myHeroList(e) {
-    const msg = stripAtText(e.msg).replace(/^#(王者)?我的英雄\s*/, '').trim()
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint)
+    if (isBlockedEvent(e)) return true;
+    const msg = stripAtText(e.msg).replace(/^#(王者)?我的英雄\s*/, '').trim();
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint);
 
     // 指令后可以混着写营地ID和展示数量：营地ID是 5 位以上，数量是 4 位以内
-    let ID = ''
-    let limit = SHOW_COUNT
+    let ID = '';
+    let limit = SHOW_COUNT;
     for (const tok of msg.split(/[\s,，、]+/).filter(Boolean)) {
-      if (!/^\d+$/.test(tok)) continue
-      if (tok.length >= 5) ID = tok
-      else limit = Math.min(Math.max(Number(tok), 1), MAX_COUNT)
+      if (!/^\d+$/.test(tok)) continue;
+      if (tok.length >= 5) ID = tok;else limit = Math.min(Math.max(Number(tok), 1), MAX_COUNT);
     }
-
     if (!ID) {
-      const userInfo = (await resolveUserData(userId))[userId]
-      ID = userInfo?.ids?.[userInfo.current || 0] || ''
+      const userInfo = (await resolveUserData(userId))[userId];
+      ID = userInfo?.ids?.[userInfo.current || 0] || '';
     }
-
     if (!ID) {
-      await e.reply(['未查询到营地ID，请先使用 #绑定营地 绑定营地ID，或在指令后附带营地ID', Button.bind()])
-      return
+      await e.reply(['未查询到营地ID，请先使用 #绑定营地 绑定营地ID，或在指令后附带营地ID', Button.bind()]);
+      return;
     }
-
-    let res
+    let res;
     try {
-      res = await ApiService.getGameHeroList(ID, String(userId))
+      res = await ApiService.getGameHeroList(ID, String(e.userId));
     } catch (error) {
-      logger.error(`[我的英雄] 查询 ${ID} 失败: ${error.message}`)
+      logger.error(`[我的英雄] 查询 ${ID} 失败: ${error.message}`);
       await e.reply(ApiService.formatUserFacingError(error, {
         isMaster: Boolean(e.isMaster),
         scene: '我的英雄查询异常'
-      }))
-      return
+      }));
+      return;
     }
 
     // 没打过的英雄场次为 0，营地那个页面也不展示，这里同样过滤掉
-    const played = (res?.data?.heroList || []).filter(hero => Number(hero.playNum) > 0)
+    const played = (res?.data?.heroList || []).filter(hero => Number(hero.playNum) > 0);
     if (!played.length) {
-      await e.reply('未获取到英雄数据，请前往王者营地开启「陌生人可见」后重试')
-      return
+      await e.reply('未获取到英雄数据，请前往王者营地开启「陌生人可见」后重试');
+      return;
     }
 
     // 历史最高战力 + 历史口径称号，一次请求拿全；失败不抛错，下面自动退回当前战力
-    const history = await this.fetchHistoryPower(ID, userId)
-
+    const history = await this.fetchHistoryPower(ID, userId, String(e.userId));
     const merged = played.map(hero => {
-      const hit = history.byHero.get(String(hero.heroId))
-      const maxPower = Number(hit?.maxPower) || 0
+      const hit = history.byHero.get(String(hero.heroId));
+      const maxPower = Number(hit?.maxPower) || 0;
       return {
         ...hero,
+        // 历史最高（营地「历史赛季」口径）。0 = 接口没取到，图上显示「—」，
+        // 不能拿当前值冒充历史值 —— 两列会变成一模一样。
+        historyPower: maxPower,
+        // 本赛季战力：h5getherolist 的 heroFightPower（当前值）。
+        // 营地当前赛季不返回赛季峰值（maxHeroFightPower 恒 0），只能给当前值。
+        seasonPower: Number(hero.heroFightPower) || 0,
+        // 排序用：历史值优先，取不到时按当前值排，保证图还能正常出
         displayPower: maxPower || Number(hero.heroFightPower) || 0,
         honorText: hit?.honor || ''
-      }
-    })
+      };
+    });
 
     // 默认按战力降序（营地那页「最高战力」列排序），战力相同的场次多的排前面
-    const sorted = [...merged].sort(
-      (a, b) => b.displayPower - a.displayPower || Number(b.playNum) - Number(a.playNum)
-    )
-    const picked = sorted.slice(0, limit)
+    const sorted = [...merged].sort((a, b) => b.displayPower - a.displayPower || Number(b.playNum) - Number(a.playNum));
+    const picked = sorted.slice(0, limit);
+    const heroes = await Promise.all(picked.map(hero => this.buildHeroCard(hero)));
+    const totalPlay = played.reduce((sum, hero) => sum + Number(hero.playNum || 0), 0);
+    const totalWin = played.reduce((sum, hero) => sum + Number(hero.winNum || 0), 0);
+    const img = segment.image(resourceUrl("base64://" + (await render.render({
+      name: 'MyHeroList',
+      type: getImgType(),
+      file: path.join(ResourcePath, "html", "MyHeroList.html"),
+      data: {
+        ydId: String(ID),
+        heroCount: played.length,
+        ownCount: Number(res?.data?.hasData?.heroNum) || played.length,
+        shownCount: heroes.length,
+        totalPlay,
+        totalRate: totalPlay ? `${(totalWin / totalPlay * 100).toFixed(1)}%` : '—',
+        heroes,
+        _res_path: ResourceUrl
+      },
+      pageGotoParams: {
+        waitUntil: "networkidle2",
+        timeout: 60000
+      }
+    }))));
 
-    const heroes = await Promise.all(picked.map(hero => this.buildHeroCard(hero)))
-
-    const totalPlay = played.reduce((sum, hero) => sum + Number(hero.playNum || 0), 0)
-    const totalWin = played.reduce((sum, hero) => sum + Number(hero.winNum || 0), 0)
-
-    const img = await puppeteer.screenshot('MyHeroList', {
-      imgType: getImgType(),
-      tplFile: 'plugins/GloryOfKings-Plugin/resources/html/MyHeroList.html',
-      _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-      ydId: String(ID),
-      heroCount: played.length,
-      ownCount: Number(res?.data?.hasData?.heroNum) || played.length,
-      shownCount: heroes.length,
-      // 历史接口拿不到时图上要如实标成当前口径，不能默认写「最高战力」
-      powerLabel: history.ok ? '最高战力' : '战力',
-      totalPlay,
-      totalRate: totalPlay ? `${((totalWin / totalPlay) * 100).toFixed(1)}%` : '—',
-      heroes
-    })
-
-    await e.reply([img, Button.heroList(msg ? ID : '')], shouldQuote())
+    // ⚠️ screenshot 失败返回 false 而不抛错，不判空会把 false 当文本发进群（2026-10-06 修）
+    if (!img) return e.reply('我的英雄出图失败，稍后再试', {
+      reply: shouldQuote()
+    });
+    await e.reply([img, Button.heroList(msg ? ID : '')], {
+      reply: shouldQuote()
+    });
   }
 
   /**
@@ -157,49 +177,52 @@ export class MyHeroList extends plugin {
    * @param {string|number} userId 发起查询的机器人用户ID
    * @returns {Promise<{ok: boolean, byHero: Map<string, {maxPower: number, honor: string}>}>}
    */
-  async fetchHistoryPower(ID, userId) {
-    const result = { ok: false, byHero: new Map() }
+  async fetchHistoryPower(ID, userId, requester) {
+    const result = {
+      ok: false,
+      byHero: new Map()
+    };
 
     // roleId 只能从 profile 拿，不是营地ID
-    let roleId = ''
+    let roleId = '';
     try {
-      const profile = await ApiService.getProfile(ID, String(userId))
-      roleId = profile?.data?.targetRoleId || ''
+      const profile = await ApiService.getProfile(ID, requester);
+      roleId = profile?.data?.targetRoleId || '';
     } catch (error) {
-      logger.error(`[我的英雄] 取角色信息失败，战力退回当前值: ${error.message}`)
-      return result
+      logger.error(`[我的英雄] 取角色信息失败，战力退回当前值: ${error.message}`);
+      return result;
     }
-    if (!roleId) return result
-
+    if (!roleId) return result;
     try {
-      const res = await ApiService.getSeasonUsuallyHeroList(roleId, String(userId), 0)
+      const res = await ApiService.getSeasonUsuallyHeroList(roleId, requester, 0);
       for (const item of res?.data?.list || []) {
-        const heroId = String(item?.heroId ?? '')
-        if (!heroId) continue
+        const heroId = String(item?.heroId ?? '');
+        if (!heroId) continue;
         result.byHero.set(heroId, {
           maxPower: Number(item.maxHeroFightPower) || 0,
           honor: String(item?.honorTitle?.desc?.full || '')
-        })
+        });
       }
-      result.ok = result.byHero.size > 0
+      result.ok = result.byHero.size > 0;
     } catch (error) {
-      logger.error(`[我的英雄] 历史最高战力获取失败，战力退回当前值: ${error.message}`)
+      logger.error(`[我的英雄] 历史最高战力获取失败，战力退回当前值: ${error.message}`);
     }
-
-    return result
+    return result;
   }
 
   /** 整理成模板要的结构，头像转 base64 防截图时外链加载失败 */
   async buildHeroCard(hero) {
-    const { name, subName } = splitHeroName(hero.name)
-    const level = Number(hero.skilledLevel) || 0
-
+    const {
+      name,
+      subName
+    } = splitHeroName(hero.name);
+    const level = Number(hero.skilledLevel) || 0;
     return {
       name,
       subName,
       // heroTypes 是数组（瑶是 ["辅助","法师"]），对应营地那页英雄名下面的定位
       heroType: (hero.heroTypes || []).join('/') || hero.heroType || '',
-      skilledText: level ? (SKILLED_NAME[level] ? `${SKILLED_NAME[level]}` : `Lv.${level}`) : '',
+      skilledText: level ? SKILLED_NAME[level] ? `${SKILLED_NAME[level]}` : `Lv.${level}` : '',
       // 称号取的是拿历史最高战力时的那个，原样展示（「中国澳门第58孙权」）
       honorText: hero.honorText || '',
       imgUrl: await this.resolveHeroImage(hero),
@@ -207,23 +230,21 @@ export class MyHeroList extends plugin {
       // 这个接口的 winRate 已经是 "53.8%" 这种字符串，不用再换算
       winRate: hero.winRate || '—',
       fightPower: hero.displayPower,
-      fightColor: fightColor(hero.displayPower)
-    }
+      fightColor: fightColor(hero.displayPower),
+      historyPower: hero.historyPower,
+      historyColor: fightColor(hero.historyPower),
+      seasonPower: hero.seasonPower,
+      seasonColor: fightColor(hero.seasonPower)
+    };
   }
 
   /** 头像优先用战斗页特写图，取不到再用接口给的横版图 */
   async resolveHeroImage(hero) {
-    const candidates = [
-      `${HERO_IMG_BASE}/${hero.heroId}00.jpg?imageMogr2/thumbnail/x170/crop/270x170/gravity/east`,
-      hero.url,
-      hero.heroIcon
-    ].filter(Boolean)
-
+    const candidates = [`${HERO_IMG_BASE}/${hero.heroId}00.jpg?imageMogr2/thumbnail/x170/crop/270x170/gravity/east`, hero.url, hero.heroIcon].filter(Boolean);
     for (const url of candidates) {
-      const img = await getLocalImage(url)
-      if (Buffer.isBuffer(img)) return `data:image/jpeg;base64,${img.toString('base64')}`
+      const img = await getLocalImage(url);
+      if (Buffer.isBuffer(img)) return `data:image/jpeg;base64,${img.toString('base64')}`;
     }
-
-    return candidates[candidates.length - 1] || ''
+    return candidates[candidates.length - 1] || '';
   }
 }

@@ -1,3 +1,4 @@
+import { logger } from "node-karin";
 /**
  * 战绩归档。日报 / 周报的数据层。
  *
@@ -12,21 +13,20 @@
  *
  * 存储：data/BattleArchive.json，按营地ID 分组，battles 按 dtEventTime 倒序（和接口一致）。
  */
-import path from 'path'
-import { readJsonFile, writeJsonFile } from './fileUtils.js'
-import { quarantineCorrupt } from './safeStore.js'
-import ApiService from './api.js'
-import { isProfileHidden } from './hiddenProfiles.js'
-import { PluginData } from '#components'
-
-const ARCHIVE_FILE = path.join(PluginData, 'BattleArchive.json')
+import path from 'path';
+import { readJsonFile, writeJsonFile } from './fileUtils.js';
+import { quarantineCorrupt } from './safeStore.js';
+import ApiService from './api.js';
+import { isProfileHidden } from './hiddenProfiles.js';
+import { PluginData } from '#components';
+const ARCHIVE_FILE = path.join(PluginData, 'BattleArchive.json');
 
 /**
  * 保留多少天。留到 35 天而不是 7 天，是给「月报」留余地，
  * 也让周报在轮询断过几天之后仍有历史可比。
  * 重度玩家一天 30 场 × 35 天 ≈ 1050 场 ≈ 210KB/账号，可以接受。
  */
-export const ARCHIVE_KEEP_DAYS = 35
+export const ARCHIVE_KEEP_DAYS = 35;
 
 /**
  * 落库时只留这些字段。
@@ -37,98 +37,105 @@ export const ARCHIVE_KEEP_DAYS = 35
  * 段位星数那套逻辑（小编号回绕、赛季切换、0 星是真实值）已经踩平了坑，
  * 少存一个字段就得在这边重写一遍。
  */
-const KEEP_FIELDS = [
-  'gameSeq', 'dtEventTime', 'gameresult', 'heroId', 'gradeGame',
-  'mvpcnt', 'losemvp', 'mapName', 'usedTime',
-  'killcnt', 'deadcnt', 'assistcnt',
-  'roleJobName', 'roleJob', 'stars',
-  'oldMasterMatchScore', 'newMasterMatchScore', 'desc'
-]
-
+const KEEP_FIELDS = ['gameSeq', 'dtEventTime', 'gameresult', 'heroId', 'gradeGame', 'mvpcnt', 'losemvp', 'mapName', 'usedTime', 'killcnt', 'deadcnt', 'assistcnt', 'roleJobName', 'roleJob', 'stars', 'oldMasterMatchScore', 'newMasterMatchScore', 'desc'];
 const toInt = value => {
-  const num = Number(value)
-  return Number.isFinite(num) ? Math.trunc(num) : 0
-}
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : 0;
+};
+
+/** 保留小数的数值字段用这个。⚠️ 别拿 toInt 顶：`gradeGame` 是 `11.1` 这种一位小数评分，截成 11 就失真了 */
+const toNum = value => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+};
+
+/** 规整成整数的字段 */
+const INT_FIELDS = /^(dtEventTime|gameresult|heroId|mvpcnt|losemvp|usedTime|killcnt|deadcnt|assistcnt|roleJob|stars|oldMasterMatchScore|newMasterMatchScore)$/;
+/** 规整成数值但**保留小数**的字段 */
+const FLOAT_FIELDS = /^gradeGame$/;
 
 /**
  * 整库的内存缓存。null 表示还没读过盘。
  *
  * 为什么要缓存：这个模块的每个导出函数原来都自己 `loadAll()` 一次，而
- * `collectBattles` 翻一页就要走 `archiveBattles`（读+写）+ `getWatermark`（读），
- * 周报翻 12 页 = 几十次整库 readFileSync/writeFileSync。现在 6 个账号 64KB 还无感，
+ * `collectBattles` 每翻一页就要整库读写一遍，周报翻 12 页 = 几十次整库
+ * readFileSync/writeFileSync。现在 6 个账号 64KB 还无感，
  * 但保留 35 天、订阅涨到 20 个号就是 MB 级，而这些同步 IO 全发生在
  * 2 分钟一次的轮询里，会卡住整个 Bot 的事件循环。
+ * （翻页循环现在也只合并内存、循环结束统一落盘一次，见 collectBattles。）
  *
  * 缓存安全的前提：这个文件**只有本模块写**（全仓库检索确认过没有别处写 ARCHIVE_FILE），
  * 且 Yunzai 是单进程，所以内存里的就是权威副本，不存在别人改了盘而我们不知道的情况。
  * 用户手动改了盘上的文件不会被感知——那是可接受的，重启即生效。
  */
-let cacheAll = null
+let cacheAll = null;
 
 /** 整库读。文件不存在或坏了都返回空表，绝不让定时任务因为归档挂掉 */
-function loadAll () {
-  if (cacheAll) return cacheAll
-
+function loadAll() {
+  if (cacheAll) return cacheAll;
   try {
-    const data = readJsonFile(ARCHIVE_FILE)
-    cacheAll = data && typeof data === 'object' ? data : {}
+    const data = readJsonFile(ARCHIVE_FILE);
+    cacheAll = data && typeof data === 'object' ? data : {};
   } catch (error) {
     // 归档是 35 天攒出来的，翻页补回来要几十次营地请求（还受频控）。
     // 坏了必须留证再按空库继续，否则下一次 saveAll 就把空库写回盘，攒的全没了
-    quarantineCorrupt(ARCHIVE_FILE, error, '[战绩归档]')
-    cacheAll = {}
+    quarantineCorrupt(ARCHIVE_FILE, error, '[战绩归档]');
+    cacheAll = {};
   }
-
-  return cacheAll
+  return cacheAll;
 }
 
 /**
  * 整库写。先更新内存再落盘：盘写失败时内存仍是最新的，
  * 后续读到的是正确数据，下一次写有机会把它持久化。
  */
-function saveAll (data) {
-  cacheAll = data || {}
-
+function saveAll(data) {
+  cacheAll = data || {};
   try {
-    writeJsonFile(ARCHIVE_FILE, cacheAll)
-    return true
+    writeJsonFile(ARCHIVE_FILE, cacheAll);
+    return true;
   } catch (error) {
-    logger.warn(`[战绩归档] 写入失败: ${error.message}`)
-    return false
+    logger.warn(`[战绩归档] 写入失败: ${error.message}`);
+    return false;
   }
 }
 
 /** 裁出要存的字段，顺手把数值字段规整成 number */
-function slim (item) {
-  const out = {}
+function slim(item) {
+  const out = {};
   for (const key of KEEP_FIELDS) {
-    const value = item?.[key]
-    if (value === undefined || value === null) continue
-    out[key] = typeof value === 'number' || /^(dtEventTime|gameresult|heroId|mvpcnt|losemvp|usedTime|killcnt|deadcnt|assistcnt|roleJob|stars|oldMasterMatchScore|newMasterMatchScore)$/.test(key)
-      ? toInt(value)
-      : String(value)
+    const value = item?.[key];
+    if (value === undefined || value === null) continue;
+    // ⚠️ gradeGame 是数值字段（评分），原来不在这个正则里 → 被 String() 存成字符串，
+    //    与同批次的 stars / usedTime 等类型不一致，还留下 `'9.1' > 10 === false` 这种字符串比较陷阱。
+    //    实测线上归档 1859 场里 gradeGame 全是字符串（"11.1"、"9.2"），
+    //    目前每个消费点都各自补了 Number() 所以没出故障（2026-10-06 修）。
+    out[key] = typeof value === 'number' || INT_FIELDS.test(key) ? toInt(value) : FLOAT_FIELDS.test(key) ? toNum(value) : String(value);
   }
-  return out
+  return out;
 }
 
 /** 读单个账号的归档，倒序（最新在前） */
-export function loadArchive (campId) {
-  return loadAll()[String(campId)]?.battles || []
+export function loadArchive(campId) {
+  return loadAll()[String(campId)]?.battles || [];
 }
 
 /**
  * 归档覆盖到什么范围，用来判断日报/周报要不要翻页补齐。
  * @returns {{earliest:number, latest:number, count:number}} 时间戳单位秒，空库全 0
  */
-export function getArchiveRange (campId) {
-  const battles = loadArchive(campId)
-  if (!battles.length) return { earliest: 0, latest: 0, count: 0 }
-
+export function getArchiveRange(campId) {
+  const battles = loadArchive(campId);
+  if (!battles.length) return {
+    earliest: 0,
+    latest: 0,
+    count: 0
+  };
   return {
     earliest: toInt(battles[battles.length - 1]?.dtEventTime),
     latest: toInt(battles[0]?.dtEventTime),
     count: battles.length
-  }
+  };
 }
 
 /**
@@ -138,83 +145,91 @@ export function getArchiveRange (campId) {
  * 库里最早一场可能是三天前，但水位可以是十天前——那段确实翻过，只是没有战绩。
  * 判断「要不要为某个区间发请求」只能看水位。
  */
-export function getWatermark (campId) {
-  return toInt(loadAll()[String(campId)]?.oldestFetched)
+export function getWatermark(campId) {
+  return toInt(loadAll()[String(campId)]?.oldestFetched);
 }
 
 /** 水位只能往更早推进（取 min），并且不能早于裁剪边界——那之前的数据已经被删了 */
-function setWatermark (campId, reachedSec) {
-  const key = String(campId)
-  const reached = toInt(reachedSec)
-  if (!key || reached <= 0) return
-
-  const all = loadAll()
-  const entry = all[key] || { battles: [] }
-  const current = toInt(entry.oldestFetched)
-  const next = current > 0 ? Math.min(current, reached) : reached
-
-  if (next === current) return
-
-  entry.oldestFetched = Math.max(next, cutoffSec())
-  all[key] = entry
-  saveAll(all)
+function setWatermark(campId, reachedSec) {
+  const key = String(campId);
+  const reached = toInt(reachedSec);
+  if (!key || reached <= 0) return;
+  const all = loadAll();
+  const entry = all[key] || {
+    battles: []
+  };
+  const current = toInt(entry.oldestFetched);
+  const next = current > 0 ? Math.min(current, reached) : reached;
+  if (next === current) return;
+  entry.oldestFetched = Math.max(next, cutoffSec());
+  all[key] = entry;
+  saveAll(all);
 }
 
 /** 保留窗口的下边界（秒） */
-function cutoffSec () {
-  return Math.floor(Date.now() / 1000) - ARCHIVE_KEEP_DAYS * 86400
+function cutoffSec() {
+  return Math.floor(Date.now() / 1000) - ARCHIVE_KEEP_DAYS * 86400;
 }
 
 /**
- * 把一批战绩合并进归档。
+ * 把一批战绩合并进**内存缓存**（不落盘）。
  *
- * 幂等：按 gameSeq 去重，同一场重复落库只留一份（轮询每 2 分钟拉的 30 场里
+ * 这是 archiveBattles 去掉 saveAll 的部分。拆出来是给 collectBattles 的翻页循环用：
+ * 原来循环里每页都 archiveBattles → saveAll 整库 writeFileSync 一次，12 页 = 12 次
+ * 整库同步 IO，全卡在事件循环上。拆开后循环内只改内存，结束统一 saveAll 一次；
+ * 单次要落盘的照旧用 archiveBattles（它 = mergeIntoCache + saveAll），语义不变。
+ *
+ * 幂等：按 gameSeq 去重，同一场重复合并只留一份（轮询每 2 分钟拉的 30 场里
  * 绝大多数都是上一轮见过的，全靠这里去重）。
+ *
+ * @returns {number} 本次新增了几场
+ */
+function mergeIntoCache(key, list) {
+  const all = loadAll();
+  const existed = all[key]?.battles || [];
+  const bySeq = new Map();
+  for (const item of existed) {
+    const seq = String(item?.gameSeq || '');
+    if (seq) bySeq.set(seq, item);
+  }
+  const before = bySeq.size;
+  for (const item of list) {
+    const seq = String(item?.gameSeq || '');
+    if (!seq || bySeq.has(seq)) continue;
+    bySeq.set(seq, slim(item));
+  }
+  const added = bySeq.size - before;
+  if (!added) return 0;
+  const cutoff = cutoffSec();
+  const battles = [...bySeq.values()].filter(item => toInt(item?.dtEventTime) >= cutoff).sort((a, b) => toInt(b?.dtEventTime) - toInt(a?.dtEventTime));
+  const prevMark = toInt(all[key]?.oldestFetched);
+  all[key] = {
+    updatedAt: Date.now(),
+    // 水位要跟着写回，别被这次合并覆盖掉；而且裁剪已经把老数据删了，
+    // 水位不能还声称覆盖到裁剪线之前
+    ...(prevMark > 0 ? {
+      oldestFetched: Math.max(prevMark, cutoff)
+    } : {}),
+    battles
+  };
+  return added;
+}
+
+/**
+ * 把一批战绩合并进归档（含落盘）。
  *
  * @param {string|number} campId 营地ID
  * @param {Array<object>} list 战绩列表项（原始的，函数内部自己裁字段）
  * @returns {number} 本次新增了几场
  */
-export function archiveBattles (campId, list) {
-  const key = String(campId || '')
-  if (!key || !Array.isArray(list) || !list.length) return 0
-
-  const all = loadAll()
-  const existed = all[key]?.battles || []
-
-  const bySeq = new Map()
-  for (const item of existed) {
-    const seq = String(item?.gameSeq || '')
-    if (seq) bySeq.set(seq, item)
-  }
-
-  const before = bySeq.size
-  for (const item of list) {
-    const seq = String(item?.gameSeq || '')
-    if (!seq || bySeq.has(seq)) continue
-    bySeq.set(seq, slim(item))
-  }
-
-  const added = bySeq.size - before
+export function archiveBattles(campId, list) {
+  const key = String(campId || '');
+  if (!key || !Array.isArray(list) || !list.length) return 0;
+  const added = mergeIntoCache(key, list);
   // 没有新场次就别写文件：轮询每 2 分钟一次，绝大多数轮次都是这种情况
-  if (!added) return 0
-
-  const cutoff = cutoffSec()
-  const battles = [...bySeq.values()]
-    .filter(item => toInt(item?.dtEventTime) >= cutoff)
-    .sort((a, b) => toInt(b?.dtEventTime) - toInt(a?.dtEventTime))
-
-  const prevMark = toInt(all[key]?.oldestFetched)
-  all[key] = {
-    updatedAt: Date.now(),
-    // 水位要跟着写回，别被这次落库覆盖掉；而且裁剪已经把老数据删了，
-    // 水位不能还声称覆盖到裁剪线之前
-    ...(prevMark > 0 ? { oldestFetched: Math.max(prevMark, cutoff) } : {}),
-    battles
-  }
-  saveAll(all)
-
-  return added
+  if (!added) return 0;
+  saveAll(loadAll());
+  return added;
 }
 
 /**
@@ -245,85 +260,125 @@ export function archiveBattles (campId, list) {
  *   battles 倒序且已按区间过滤；coveredFrom 是实际覆盖到的最早时刻；
  *   truncated 为真表示撞了页数上限、区间起点没够着
  */
-export async function collectBattles (campId, qq, fromSec, { maxPages = 12, toSec = 0 } = {}) {
-  const key = String(campId || '')
-  const from = toInt(fromSec)
-  const to = toInt(toSec)
+export async function collectBattles(campId, qq, fromSec, {
+  maxPages = 12,
+  toSec = 0
+} = {}) {
+  const key = String(campId || '');
+  const from = toInt(fromSec);
+  const to = toInt(toSec);
 
   // 这个玩家隐藏了主页：24 小时内不再主动查（见 utils/hiddenProfiles.js）。
   // 返回空区间而不是抛错——日报/周报/群报/趋势本来就按「这段没数据」处理，
   // coveredFrom 给 0 也不会把调用方的「最差水位」拉低。
   if (isProfileHidden(key)) {
-    return { battles: [], coveredFrom: 0, truncated: false, fetched: 0 }
+    return {
+      battles: [],
+      prevSnapshot: null,
+      coveredFrom: 0,
+      truncated: false,
+      fetched: 0
+    };
   }
   const inRange = list => list.filter(item => {
-    const at = toInt(item?.dtEventTime)
-    return at >= from && (to <= 0 || at <= to)
-  })
+    const at = toInt(item?.dtEventTime);
+    return at >= from && (to <= 0 || at <= to);
+  });
 
   // 落库前库里最新一场。第一页要一直翻到接上它，中间才没有空洞：
   // 库冻了几天的情况下，光拉第一页可能只补上最近几场，和库之间还缺一段
-  const headBefore = toInt(loadArchive(key)[0]?.dtEventTime)
-
-  let lastTime = 0
-  let reached = 0
-  let fetched = 0
-  let truncated = false
-
+  const headBefore = toInt(loadArchive(key)[0]?.dtEventTime);
+  let lastTime = 0;
+  let reached = 0;
+  let fetched = 0;
+  let truncated = false;
+  let pendingFlush = false;
+  // 拉取失败过（抛错 / 非 0 业务码）就是「这次没能补上」，跟「确实翻到底了」必须分开。
+  // 见下面返回值处 `incomplete` 的说明。
+  let failed = false;
   for (let page = 0; page < maxPages; page += 1) {
-    let res
+    let res;
     try {
-      res = await ApiService.getMoreBattleList(key, String(qq), { option: 0, lastTime })
+      res = await ApiService.getMoreBattleList(key, String(qq), {
+        option: 0,
+        lastTime
+      });
     } catch (error) {
-      logger.debug(`[战绩归档] ${key} 第 ${page + 1} 页拉取失败: ${error.message}`)
-      break
+      logger.debug(`[战绩归档] ${key} 第 ${page + 1} 页拉取失败: ${error.message}`);
+      failed = true;
+      break;
     }
-
     if (Number(res?.returnCode || 0) !== 0) {
-      logger.debug(`[战绩归档] ${key} 第 ${page + 1} 页返回异常码 ${res?.returnCode}`)
-      break
+      logger.debug(`[战绩归档] ${key} 第 ${page + 1} 页返回异常码 ${res?.returnCode}`);
+      failed = true;
+      break;
     }
-
-    const data = res?.data || {}
-    const list = data.list || []
-    if (!list.length) break
-
-    fetched += 1
-    archiveBattles(key, list)
-    reached = toInt(list[list.length - 1]?.dtEventTime)
+    const data = res?.data || {};
+    const list = data.list || [];
+    if (!list.length) break;
+    fetched += 1;
+    // 只攒进内存、不落盘：12 页翻下来每页 saveAll 一次整库同步 IO（全卡在事件循环上），
+    // 循环结束统一 flush 一次就够。中途崩了也就是这轮补的页没存，下轮轮询会再补
+    if (mergeIntoCache(key, list) > 0) pendingFlush = true;
+    reached = toInt(list[list.length - 1]?.dtEventTime);
 
     // 这一页已经翻过区间起点，够了
-    if (reached <= from) break
+    if (reached <= from) break;
 
     // 水位说更早的翻过了，而且这一页已经接上了原来库里的头 —— 中间没空洞，可以收工。
     // 顺序很重要：这个判断必须在实拉第一页之后，放在循环外就退化成「只看水位」的旧 bug
-    const watermark = getWatermark(key)
+    const watermark = getWatermark(key);
     if (watermark > 0 && watermark <= from && headBefore > 0 && reached <= headBefore) {
-      reached = watermark
-      break
+      reached = watermark;
+      break;
     }
-
     if (!data.hasMore || !data.lastTime) {
       // 接口说没有更多历史了。再往前也拉不到，把水位直接推到区间起点，
       // 否则下次查同一区间又会为这段不存在的历史白翻一遍
-      reached = from
-      break
+      reached = from;
+      break;
     }
-
-    lastTime = data.lastTime
+    lastTime = data.lastTime;
 
     // 还有页可翻但名额用完了
-    if (page === maxPages - 1) truncated = true
+    if (page === maxPages - 1) truncated = true;
   }
 
-  if (reached > 0) setWatermark(key, reached)
+  // 循环里攒的合并结果统一落盘（整库一次写，setWatermark 还会再写一次带水位的版本）
+  if (pendingFlush) saveAll(loadAll());
+  if (reached > 0) setWatermark(key, reached);
+  const finalMark = getWatermark(key);
 
-  const finalMark = getWatermark(key)
+  // ⚠️⚠️ `incomplete`：这次**没能确认**覆盖到请求的起点（2026-10-06 修）。
+  //
+  // 原先三种情况（抛错 / 非 0 业务码 / 空 list）都只是 `break`，而
+  // `coveredFrom` 在没拿到水位时会**默认等于调用方请求的 `from`** ——
+  // 于是「一页都没拉到」和「真的翻到了 from」返回值一模一样，调用方无从分辨。
+  // 下游 `reportStore` 只在 `truncated && coveredFrom > fromSec` 时才写
+  // 「数据覆盖自…」，所以拉取失败时图上**一个覆盖不足的标注都没有**，
+  // 用户看到的是「今天还没有对局记录」这种确定性结论（其实是没拉到）。
+  // 返回的 `fetched` 全仓也无人读取（grep 确认），等于失败被彻底吞掉。
+  //
+  // 实测：模拟 `-30107` 抛错 / `-10107` / 空列表三种失败，
+  // 修复前输出完全相同的 `{truncated:false, fetched:0, coveredFrom:<请求的 from>}`。
+  //
+  // 判据：请求了 from（说明要这段历史）却一页都没成功拉回来 → 覆盖不足。
+  // 空 list 不算 failed（那是「确实没有更早的了」，第 335 行已把 reached 定成 from）。
+  const incomplete = from > 0 && fetched === 0;
 
+  // 区间开始前最近的一场：summarizeSession 拿它当「这段开始前的段位快照」，
+  // 否则起点只能退到区间第一场打完后的星数，每人第一局的变化都会漏算。
+  // 归档是倒序，第一条早于 from 的就是区间外最近的一场
+  const archive = loadArchive(key);
+  const prevSnapshot = archive.find(item => toInt(item?.dtEventTime) < from) || null;
   return {
-    battles: inRange(loadArchive(key)),
+    battles: inRange(archive),
+    prevSnapshot,
     coveredFrom: finalMark > 0 ? Math.max(finalMark, from) : from,
     truncated,
-    fetched
-  }
+    fetched,
+    // 拉取失败 or 一页都没拿到：让调用方能给出「数据可能不全」的降级文案
+    incomplete,
+    failed
+  };
 }

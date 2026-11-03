@@ -1,3 +1,8 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import path from "node:path";
+import { ResourcePath, ResourceUrl } from "#components";
+import { Plugin, render, segment, logger } from "node-karin";
 /**
  * #巅峰趋势 —— 把巅峰分的涨跌画成折线。
  *
@@ -16,88 +21,100 @@
  *   #巅峰趋势 1580886057 指定营地ID
  *   #巅峰趋势 2          第 2 个绑定账号（1-2 位数字优先当天数，3-4 位当序号）
  */
-import puppeteer from '#puppeteer'
-import path from 'path'
-import {
-  getImgType,
-  resolveCurrentId, readYamlFile, Button, shouldQuote, getUserAvatar,
-  AT_HEAD, stripAtText, resolveTargetUserId, resolveMemberName
-} from '#utils'
-import { loadArchive, collectBattles, ARCHIVE_KEEP_DAYS } from '../utils/battleArchive.js'
-import {
-  pickPeakWindow, buildTrendView, TREND_DEFAULT_DAYS, TREND_TARGET_POINTS
-} from '../utils/scoreTrend.js'
-import { getHeroNameMap, loadPushList } from '../utils/pushStore.js'
-import { heroIconUrl } from '../utils/reportStore.js'
-import { PluginData } from '#components'
 
-export class ScoreTrend extends plugin {
-  constructor () {
+import { getImgType, resolveCurrentId, getBoundIds, Button, shouldQuote, getUserAvatar, AT_HEAD, stripAtText, resolveTargetUserId, resolveMemberName } from '#utils';
+import { loadArchive, collectBattles, ARCHIVE_KEEP_DAYS } from '../utils/battleArchive.js';
+import { pickPeakWindow, buildTrendView, TREND_DEFAULT_DAYS, TREND_TARGET_POINTS } from '../utils/scoreTrend.js';
+import { getHeroNameMap, loadPushList } from '../utils/pushStore.js';
+import { heroIconUrl } from '../utils/reportStore.js';
+import { getNickMap, nickOf, withGroupNick } from '../utils/groupNick.js';
+export class ScoreTrend extends Plugin {
+  constructor() {
     super({
       name: '王者巅峰趋势',
-      dsc: '巅峰分涨跌折线图',
+      desc: '巅峰分涨跌折线图',
       event: 'message',
       priority: 0,
-      rule: [
-        { reg: `${AT_HEAD}#(巅峰(分)?趋势|上分趋势|分数趋势|巅峰曲线)\\s*(.*)$`, fnc: 'trend' }
-      ]
-    })
+      rule: [{
+        reg: `${AT_HEAD}#(巅峰(分)?趋势|上分趋势|分数趋势|巅峰曲线)\\s*(.*)$`,
+        fnc: 'trend'
+      }]
+    });
+    this.priority = 0;
   }
-
-  async trend (e) {
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint, shouldQuote())
-
-    const input = stripAtText(e.msg).replace(/^#(巅峰(分)?趋势|上分趋势|分数趋势|巅峰曲线)\s*/, '').trim()
-    const args = parseArgs(input)
-
-    let campId = args.campId
+  async trend(e) {
+    if (isBlockedEvent(e)) return true;
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint, {
+      reply: shouldQuote()
+    });
+    const input = stripAtText(e.msg).replace(/^#(巅峰(分)?趋势|上分趋势|分数趋势|巅峰曲线)\s*/, '').trim();
+    const args = parseArgs(input);
+    let campId = args.campId;
     if (!campId && args.index) {
-      const ids = (readYamlFile(path.join(PluginData, 'UserData.yaml')) || {})[userId]?.ids || []
-      campId = ids[args.index - 1] || ''
-      if (!campId) return e.reply(`你没有第 ${args.index} 个绑定的营地ID，发送 #营地ID 看看列表`, shouldQuote())
+      // ⚠️ 走 getBoundIds 而不是裸读 YAML（2026-10-06 修，同 rankTrend）：
+      //    readYamlFile 读失败是**原样抛错**，`|| {}` 拦不住 —— 表坏掉时这条指令
+      //    会静默无响应（异常被 loader 吃掉），用户收不到任何提示。
+      const ids = getBoundIds(userId);
+      campId = ids[args.index - 1] || '';
+      if (!campId) return e.reply(`你没有第 ${args.index} 个绑定的营地ID，发送 #营地ID 看看列表`, {
+        reply: shouldQuote()
+      });
     }
     // 本机没绑就问共享库（用户在别的机器人上绑过也能直接用）
     if (!campId) {
-      const resolved = await resolveCurrentId(userId)
-      campId = resolved.campId
+      const resolved = await resolveCurrentId(userId);
+      campId = resolved.campId;
       if (!campId) {
-        return e.reply([resolved.hint, Button.bind()], shouldQuote())
+        return e.reply([resolved.hint, Button.bind()], {
+          reply: shouldQuote()
+        });
       }
     }
-
-    const days = Math.min(Math.max(args.days || TREND_DEFAULT_DAYS, 1), ARCHIVE_KEEP_DAYS)
-    const fromSec = Math.floor(Date.now() / 1000) - days * 86400
-
-    let { list: picked, relaxed } = pickPeakWindow(loadArchive(campId), fromSec)
+    const days = Math.min(Math.max(args.days || TREND_DEFAULT_DAYS, 1), ARCHIVE_KEEP_DAYS);
+    const fromSec = Math.floor(Date.now() / 1000) - days * 86400;
+    let {
+      list: picked,
+      relaxed
+    } = pickPeakWindow(loadArchive(campId), fromSec);
 
     // 库里凑不够 10 场巅峰：现拉几页补上。归档是推送轮询的副产品，没开推送的号库里可能是空的。
     // 补拉下限用整个归档保留期而不是 days —— 要凑的是场次，天数窗口不够就往更早翻
     if (picked.length < TREND_TARGET_POINTS) {
       try {
-        const archiveFrom = Math.floor(Date.now() / 1000) - ARCHIVE_KEEP_DAYS * 86400
-        await collectBattles(String(campId), String(userId), archiveFrom, { maxPages: 8 })
-        ;({ list: picked, relaxed } = pickPeakWindow(loadArchive(campId), fromSec))
+        const archiveFrom = Math.floor(Date.now() / 1000) - ARCHIVE_KEEP_DAYS * 86400;
+        await collectBattles(String(campId), String(e.userId), archiveFrom, {
+          maxPages: 8
+        });
+        ({
+          list: picked,
+          relaxed
+        } = pickPeakWindow(loadArchive(campId), fromSec));
       } catch (error) {
-        logger.debug(`[王者巅峰趋势] ${campId} 补拉战绩失败: ${error.message}`)
+        logger.debug(`[王者巅峰趋势] ${campId} 补拉战绩失败: ${error.message}`);
       }
     }
-
     if (picked.length < 2) {
-      return e.reply([
-        `近 ${days} 天只找到 ${picked.length} 场巅峰赛，画不出趋势。\n` +
-        '· 排位赛不算：排位不影响巅峰分\n' +
-        `· 试试更长的区间，比如 #巅峰趋势 ${Math.min(days * 2, ARCHIVE_KEEP_DAYS)}\n` +
-        '· 开了 #开启战绩推送 之后每天的对局会自动存档，往后趋势会越来越全',
-        Button.push()
-      ], shouldQuote())
+      // ⚠️ 同 rankTrend：relaxed=true 表示上面已经翻到归档最早，再说「近 N 天」就与数据矛盾，
+      //    而「试试更长的区间」必然无效（2026-10-06 修）。第 105 行的图头早就分了这两种口径。
+      return e.reply([`${relaxed ? '本地存档里' : `近 ${days} 天`}只找到 ${picked.length} 场巅峰赛，画不出趋势。\n` + '· 排位赛不算：排位不影响巅峰分\n' + (relaxed ? '· 已经翻到存档最早，攒几天再来\n' : `· 试试更长的区间，比如 #巅峰趋势 ${Math.min(days * 2, ARCHIVE_KEEP_DAYS)}\n`) + '· 开了 #开启战绩推送 之后每天的对局会自动存档，往后趋势会越来越全', Button.push()], {
+        reply: shouldQuote()
+      });
     }
-
-    const heroMap = await getHeroNameMap()
-    const view = buildTrendView(picked, { heroMap, iconOf: heroIconUrl, days, relaxed })
-    if (!view) return e.reply('巅峰赛场次太少，攒几天再看吧', shouldQuote())
-
-    const name = await displayName(e, userId)
+    const heroMap = await getHeroNameMap();
+    const view = buildTrendView(picked, {
+      heroMap,
+      iconOf: heroIconUrl,
+      days,
+      relaxed
+    });
+    if (!view) return e.reply('巅峰赛场次太少，攒几天再看吧', {
+      reply: shouldQuote()
+    });
+    const name = await displayName(e, userId);
     const img = await this.shot({
       ...view,
       title: '巅峰趋势',
@@ -108,48 +125,63 @@ export class ScoreTrend extends plugin {
       trendJson: JSON.stringify(view.trend),
       // 归档只留 35 天，且只覆盖轮询跑过的那段，别让人以为是全赛季
       footText: `数据取自本地战绩存档（最多 ${ARCHIVE_KEEP_DAYS} 天）· 只统计巅峰赛`
-    })
-
-    if (!img) return e.reply('趋势图渲染失败了，稍后再试', shouldQuote())
-    return e.reply([img, Button.trend(campId)], shouldQuote())
+    });
+    if (!img) return e.reply('趋势图渲染失败了，稍后再试', {
+      reply: shouldQuote()
+    });
+    return e.reply([img, Button.trend(campId)], {
+      reply: shouldQuote()
+    });
   }
-
-  async shot (view) {
+  async shot(view) {
     try {
-      return await puppeteer.screenshot('ScoreTrend', {
-        imgType: getImgType(),
-        tplFile: 'plugins/GloryOfKings-Plugin/resources/html/ScoreTrend.html',
-        // 模板里 CSS / 字体都靠 {{_res_path}} 拼相对路径，漏了这项样式表 404，
-        // 出来的是一张没有任何样式的纯文字图
-        _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-        ...view
-      })
+      return segment.image(resourceUrl("base64://" + (await render.render({
+        name: 'ScoreTrend',
+        type: getImgType(),
+        file: path.join(ResourcePath, "html", "ScoreTrend.html"),
+        data: {
+          ...view,
+          _res_path: ResourceUrl
+        },
+        pageGotoParams: {
+          waitUntil: "networkidle2",
+          timeout: 60000
+        }
+      }))));
     } catch (error) {
-      logger.error(`[王者巅峰趋势] 渲染失败: ${error.message}`)
-      return null
+      logger.error(`[王者巅峰趋势] 渲染失败: ${error.message}`);
+      return null;
     }
   }
 }
 
 /** `#巅峰趋势 7 1580886057`：5 位以上是营地ID，1-2 位当天数，3-4 位当绑定序号 */
-function parseArgs (input = '') {
-  const out = { campId: '', index: null, days: null }
+function parseArgs(input = '') {
+  const out = {
+    campId: '',
+    index: null,
+    days: null
+  };
   for (const tok of String(input).split(/[\s,，、]+/).filter(Boolean)) {
-    if (!/^\d+$/.test(tok)) continue
-    if (tok.length >= 5) out.campId = tok
-    else if (tok.length <= 2 && out.days === null) out.days = Number(tok)
-    else if (out.index === null) out.index = Number(tok)
+    if (!/^\d+$/.test(tok)) continue;
+    if (tok.length >= 5) out.campId = tok;else if (tok.length <= 2 && out.days === null) out.days = Number(tok);else if (out.index === null) out.index = Number(tok);
   }
-  return out
+  return out;
 }
 
 /** 展示名兜底：推送订阅里缓存的营地昵称 → 群名片 → QQ 号，都不额外发请求 */
-async function displayName (e, userId) {
-  const cached = String(loadPushList()[String(userId)]?.roleName || '').trim()
-  if (cached) return cached
+async function displayName(e, userId) {
+  const cached = String(loadPushList()[String(userId)]?.roleName || '').trim();
+  if (cached) {
+    // 群里发的图，游戏名后面补该群的群名片；私聊不加
+    const nick = e?.isGroup ? nickOf(await getNickMap(e.groupId, e.bot), userId) : '';
+    return withGroupNick(cached, nick);
+  }
   try {
-    return await resolveMemberName(e, userId) || String(userId)
+    // ⚠️ 第一个形参是**群对象**（utils/adapter.js 里是 `group?.pickMember?.(uid)`），传消息事件 e
+    //    取不到群名片、静默退化成 QQ 号（2026-10-06 修）。同仓其余 5 处调用传的都是 e.group。
+    return (await resolveMemberName(e.bot, e.groupId, userId)) || String(userId);
   } catch {
-    return String(userId)
+    return String(userId);
   }
 }

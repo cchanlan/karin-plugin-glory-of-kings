@@ -1,3 +1,6 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import { Plugin, render, segment, logger } from "node-karin";
 /**
  * 英雄详情：一个英雄的生涯场次胜率、近一个月荣誉、荣耀战力趋势、表现五维、最近对局。
  *
@@ -8,153 +11,155 @@
  * 这个接口要的是**角色 roleId**（`getProfile().data.targetRoleId`），不是营地ID，
  * 所以链路是 profile → pagedetails 两次请求，和其他 roleId 系接口一样。
  */
-import path from 'path'
-import puppeteer from '#puppeteer'
-import {
-  getImgType,
-  ApiService, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData,
-  shouldQuote, getUserAvatar, resolveMemberName, isQQNumber
-} from '#utils'
-import { PluginPath } from '#components'
-import { resolveHero } from '../utils/heroName.js'
-import { buildHeroDetail } from '../utils/heroDetail.js'
-import { privacyScope } from '../utils/seasonFallback.js'
-
-export class HeroDetail extends plugin {
-  constructor () {
+import path from 'path';
+import { getImgType, ApiService, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, getUserAvatar, resolveMemberName, isQQNumber } from '#utils';
+import { PluginPath, ResourcePath, ResourceUrl } from '#components';
+import { resolveHero } from '../utils/heroName.js';
+import { buildHeroDetail } from '../utils/heroDetail.js';
+import { privacyScope } from '../utils/seasonFallback.js';
+export class HeroDetail extends Plugin {
+  constructor() {
     super({
       name: '查询王者英雄详情',
-      dsc: '单个英雄的场次胜率、战力趋势、表现五维与最近对局',
+      desc: '单个英雄的场次胜率、战力趋势、表现五维与最近对局',
       event: 'message',
       // 0 是为了抢在 queryGameStats 那几条宽匹配前面（见该文件顶部注释）
       priority: 0,
-      rule: [
-        {
-          reg: `${AT_HEAD}#(王者)?英雄详情\\s*(.*)$`,
-          fnc: 'heroDetail'
-        }
-      ]
-    })
+      rule: [{
+        reg: `${AT_HEAD}#(王者)?英雄详情\\s*(.*)$`,
+        fnc: 'heroDetail'
+      }]
+    });
+    this.priority = 0;
   }
-
-  async heroDetail (e) {
+  async heroDetail(e) {
+    if (isBlockedEvent(e)) return true;
     // 指令后面可以混着写英雄名和营地ID：营地ID是 5 位以上，4 位以内当绑定列表序号
-    let heroInput = ''
-    let campId = ''
-    let slot = 0
+    let heroInput = '';
+    let campId = '';
+    let slot = 0;
     for (const tok of stripAtText(e.msg).replace(/^#(王者)?英雄详情\s*/, '').trim().split(/[\s,，、]+/).filter(Boolean)) {
       if (/^\d+$/.test(tok)) {
-        if (tok.length >= 5) campId = tok
-        else slot = Number(tok)
-        continue
+        if (tok.length >= 5) campId = tok;else slot = Number(tok);
+        continue;
       }
-      heroInput += tok
+      heroInput += tok;
     }
-
     if (!heroInput) {
-      await e.reply('请输入英雄名称，例如：#英雄详情 孙权', shouldQuote())
-      return
+      await e.reply('请输入英雄名称，例如：#英雄详情 孙权', {
+        reply: shouldQuote()
+      });
+      return;
     }
-
-    let heroId, matchedName
+    let heroId, matchedName;
     try {
-      const hit = await resolveHero(heroInput)
-      heroId = hit.heroId
-      matchedName = hit.matchedName
+      const hit = await resolveHero(heroInput);
+      heroId = hit.heroId;
+      matchedName = hit.matchedName;
     } catch (err) {
-      await e.reply(err.message)
-      return
+      // ⚠️ 按来源分流（2026-10-06 修）：resolveHero 自己抛的两条是给人看的，
+      //    但它第一行 `ApiService.getHeroList()` 没包装，官网 5xx/超时时抛的是 api 层的
+      //    技术文案（「…失败。错误: HTTP 503…」）—— 原样转发就把后者也发给群友了。
+      //    本文件其余异常都规规矩矩走 formatUserFacingError。
+      const friendly = /未找到英雄|请输入英雄名称/.test(String(err?.message || ''));
+      await e.reply(friendly ? err.message : ApiService.formatUserFacingError(err, {
+        isMaster: Boolean(e.isMaster),
+        scene: '英雄详情查询异常'
+      }));
+      return;
     }
-
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint)
-
-    const userData = await resolveUserData(userId)
-    const userInfo = userData[userId]
-
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint);
+    const userData = await resolveUserData(userId);
+    const userInfo = userData[userId];
     if (!campId) {
       if (slot) {
-        campId = userInfo?.ids?.[slot - 1] || ''
+        campId = userInfo?.ids?.[slot - 1] || '';
         if (!campId) {
-          await e.reply(`序号无效，你当前只绑定了 ${userInfo?.ids?.length || 0} 个营地ID`)
-          return
+          await e.reply(`序号无效，你当前只绑定了 ${userInfo?.ids?.length || 0} 个营地ID`);
+          return;
         }
       } else {
-        campId = userInfo?.ids?.[userInfo.current || 0] || ''
+        campId = userInfo?.ids?.[userInfo.current || 0] || '';
       }
     }
-
     if (!campId) {
-      await e.reply([
-        segment.image(path.join(PluginPath, 'resources', 'img', '营地ID获取.png')),
-        Button.bind()
-      ], shouldQuote())
-      return
+      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+        reply: shouldQuote()
+      });
+      return;
     }
-
-    let detail
+    let detail;
     try {
-      detail = await this.fetchDetail(campId, heroId, matchedName, userId, e)
+      detail = await this.fetchDetail(campId, heroId, matchedName, userId, e);
     } catch (error) {
-      logger.error(`[英雄详情] 查询 ${campId}/${matchedName} 失败: ${error.message}`)
+      logger.error(`[英雄详情] 查询 ${campId}/${matchedName} 失败: ${error.message}`);
       await e.reply(ApiService.formatUserFacingError(error, {
         isMaster: Boolean(e.isMaster),
         scene: '英雄详情查询异常'
-      }))
-      return
+      }));
+      return;
     }
-
     if (detail === null) {
-      await e.reply(`该账号没有 ${matchedName} 的对局记录`)
-      return
+      await e.reply(`该账号没有 ${matchedName} 的对局记录`);
+      return;
     }
     if (typeof detail === 'string') {
-      await e.reply(detail, shouldQuote())
-      return
+      await e.reply(detail, {
+        reply: shouldQuote()
+      });
+      return;
     }
+    const qqAvatar = await getUserAvatar(e, userId);
+    const nickname = String(userId) !== String(e.userId) ? await resolveMemberName(e.bot, e.groupId, userId) : e.sender?.card || e.sender?.nick || e.nickname || (isQQNumber(userId) ? String(userId) : '召唤师');
+    const img = segment.image(resourceUrl("base64://" + (await render.render({
+      name: 'HeroDetail',
+      type: getImgType(),
+      file: path.join(ResourcePath, "html", "HeroDetail.html"),
+      data: {
+        qqAvatar,
+        nickname,
+        ydId: String(campId),
+        ...detail,
+        _res_path: ResourceUrl
+      },
+      pageGotoParams: {
+        waitUntil: "networkidle2",
+        timeout: 60000
+      }
+    }))));
 
-    const qqAvatar = await getUserAvatar(e, userId)
-    const nickname = String(userId) !== String(e.user_id)
-      ? await resolveMemberName(e.group, userId)
-      : (e.sender?.card || e.sender?.nickname || e.nickname || (isQQNumber(userId) ? String(userId) : '召唤师'))
-
-    const img = await puppeteer.screenshot('HeroDetail', {
-      imgType: getImgType(),
-      tplFile: 'plugins/GloryOfKings-Plugin/resources/html/HeroDetail.html',
-      _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-      qqAvatar,
-      nickname,
-      ydId: String(campId),
-      ...detail
-    })
-
-    await e.reply([img, Button.heroDetail(matchedName, campId)], shouldQuote())
+    // ⚠️ screenshot 失败返回 false 而不抛错，不判空会把 false 当文本发进群（2026-10-06 修）
+    if (!img) return e.reply('英雄详情出图失败，稍后再试', {
+      reply: shouldQuote()
+    });
+    await e.reply([img, Button.heroDetail(matchedName, campId)], {
+      reply: shouldQuote()
+    });
   }
 
   /**
    * profile → pagedetails，整理成模板数据。
    * @returns {Promise<object|null|string>} 数据 / null（没玩过）/ 字符串（要直接回给用户的话）
    */
-  async fetchDetail (campId, heroId, matchedName, userId, e) {
-    const profile = await ApiService.getProfile(campId, String(userId))
-    const roleId = profile?.data?.targetRoleId
-
+  async fetchDetail(campId, heroId, matchedName, userId, e) {
+    const profile = await ApiService.getProfile(campId, String(e.userId));
+    const roleId = profile?.data?.targetRoleId;
     if (!roleId) {
       // 主页被隐藏时 data 是空的，别一律回「获取角色信息失败」，那会让人以为是插件坏了
-      const hiddenScope = privacyScope(profile?.returnCode)
-      return hiddenScope ? `对方隐藏了${hiddenScope}，英雄详情查不到` : '未获取到角色信息，请检查营地ID是否正确'
+      const hiddenScope = privacyScope(profile?.returnCode);
+      return hiddenScope ? `对方隐藏了${hiddenScope}，英雄详情查不到` : '未获取到角色信息，请检查营地ID是否正确';
     }
-
-    const role = (profile.data.roleList || []).find(r => String(r.roleId) === String(roleId)) || {}
-
-    const res = await ApiService.getHeroRecordDetails(
-      roleId,
-      heroId,
-      { roleName: role.roleName || '', serverId: role.serverId || '' },
-      campId,
-      String(userId)
-    )
-
-    return buildHeroDetail(res?.data, { fallbackName: matchedName })
+    const role = (profile.data.roleList || []).find(r => String(r.roleId) === String(roleId)) || {};
+    const res = await ApiService.getHeroRecordDetails(roleId, heroId, {
+      roleName: role.roleName || '',
+      serverId: role.serverId || ''
+    }, campId, String(e.userId));
+    return buildHeroDetail(res?.data, {
+      fallbackName: matchedName
+    });
   }
 }

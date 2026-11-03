@@ -1,3 +1,4 @@
+import { logger } from "node-karin";
 /**
  * 营地ID 共享库的客户端。
  *
@@ -8,9 +9,11 @@
  *
  * ## 三条硬约束
  *
- * 1. **只在「用户当场发的查询指令」里生效**。推送、排行榜、`#谁在打游戏`、日报周报
+ * 1. **默认只在「用户当场发的查询指令」里生效**。推送、订阅、`#谁在打游戏`、日报周报
  *    一律只认本地绑定：那些路径要么在同步的 read-modify-write 块里（插 `await` 会让它
  *    变成可交错、整表覆盖丢写），要么会把解析出的营地ID 固化进订阅文件。
+ *    例外是 `#排位总排名` / `#巅峰总排名`：它们明确要跨机器人合并，走全库营地ID清单
+ *    （`fetchSharedRoster`），只读不写回本地绑定。
  * 2. **绝不抛异常、绝不阻塞指令**。共享库是别人搭的、随时可能下线，它挂了只能是
  *    「这次查不到」，不能是「王者插件用不了」。所以全程 catch + 熔断 + 缓存兜底。
  * 3. **本地绑定永远优先**。本机绑过的人连一次网络请求都不会发。
@@ -23,16 +26,15 @@
  *         → 落盘 data/share/idcache.yaml（重启后第一条指令也不慢）
  *           → 网络（1.5 秒超时，失败有熔断）
  */
-import path from 'node:path'
-import fetch from 'node-fetch'
-import { PluginData, Config } from '#components'
-import { readYamlFile, writeYamlFile } from './yamlUtils.js'
-import { quarantineCorrupt } from './safeStore.js'
-import { getCurrentId, getBoundIds, readUserData } from './localBind.js'
-import authStore from './authStore.js'
-
-const CACHE_FILE = path.join(PluginData, 'share', 'idcache.yaml')
-const CACHE_SCHEMA = 1
+import path from 'node:path';
+import fetch from 'node-fetch';
+import { PluginData, Config } from '#components';
+import { readYamlFile, writeYamlFile } from './yamlUtils.js';
+import { quarantineCorrupt } from './safeStore.js';
+import { getCurrentId, getBoundIds, readUserData } from './localBind.js';
+import authStore, { isUsableAuth } from './authStore.js';
+const CACHE_FILE = path.join(PluginData, 'share', 'idcache.yaml');
+const CACHE_SCHEMA = 1;
 
 /**
  * 令牌在群里露个形就够，别整串贴出去。
@@ -42,10 +44,18 @@ const CACHE_SCHEMA = 1
  * shareBind 里的私有函数，运行到那行才 `ReferenceError: maskToken is not defined`。
  */
 export const maskToken = token => {
-  const text = String(token || '')
-  if (text.length <= 10) return text ? '已配置' : '未配置'
-  return `${text.slice(0, 6)}…${text.slice(-4)}`
-}
+  const text = String(token || '');
+  if (!text) return '未配置';
+  // ⚠️⚠️ 阈值必须**覆盖截取宽度**（2026-10-06 修）。截出来是 6 + 1 + 4 = 11 个字符，
+  //    原先阈值写成 `<= 10`：长度 11 的令牌输出 10 个原文字符（比输入还长一位），
+  //    长度 12~15 时也会把大半串贴出去。而这些调用点全是**群内回显**
+  //    （shareBind 的 `#营地共享库`、local/distDeploy 的管理密钥），等于把密钥发进群里。
+  //    短到没法安全截取的（≤12）一律只说「已配置」。
+  if (text.length <= 12) return '已配置';
+  const keepStart = Math.min(6, Math.floor(text.length / 3));
+  const keepEnd = Math.min(4, Math.floor(text.length / 4));
+  return `${text.slice(0, keepStart)}…${text.slice(-keepEnd)}`;
+};
 
 /**
  * 本地缓存的存活时间。
@@ -57,24 +67,76 @@ export const maskToken = token => {
  * 刚开启共享，B 机器人最长要等 2 小时才看得到 —— 这个取舍不划算：共享的意义就是
  * 「换个机器人马上能用」，让它等两小时等于把功能的意义削掉一半。
  */
-const CACHE_TTL_MS = 5000
+const CACHE_TTL_MS = 5000;
 
 /** 读请求超时。用户指令在等，宁可查不到也不能卡住 */
-const READ_TIMEOUT_MS = 1500
+const READ_TIMEOUT_MS = 1500;
+/** 全库营地ID清单（管理接口）超时给宽一点：一次要回几十上百个 ID */
+const ROSTER_TIMEOUT_MS = 3000;
+/** 清单 60 秒内复用：排位榜连发两次不必打两遍管理接口 */
+const ROSTER_TTL_MS = 60 * 1000;
+let rosterCache = {
+  at: 0,
+  campIds: []
+};
 
 /** 写请求（上传/撤销）是用户主动触发的，可以多等一会儿 */
-const WRITE_TIMEOUT_MS = 5000
+const WRITE_TIMEOUT_MS = 5000;
 
 /** 连续失败几次开始熔断 */
-const CIRCUIT_THRESHOLD = 3
-const CIRCUIT_BASE_MS = 60 * 1000
-const CIRCUIT_MAX_MS = 10 * 60 * 1000
+const CIRCUIT_THRESHOLD = 3;
+const CIRCUIT_BASE_MS = 60 * 1000;
+const CIRCUIT_MAX_MS = 10 * 60 * 1000;
 
 /** 落盘缓存整份丢弃重建的时限，防止 qq 键无限增长 */
-const DISK_MAX_AGE_MS = 24 * 3600 * 1000
+const DISK_MAX_AGE_MS = 24 * 3600 * 1000;
+
+/**
+ * 落盘条目的存活时间。
+ *
+ * ⚠️⚠️ **必须和 `CACHE_TTL_MS` 分开，而且要远长于 flush 的 30 秒 debounce**
+ *    （2026-10-06 修）。原先落盘条目直接沿用内存的 `until`（= 写入时刻 + 5 秒），
+ *    而 `flushDiskCache` 最早在**首次写入后 30 秒**才跑，于是
+ *    `entry.until <= now` **恒成立** → 每个条目 100% 被过滤掉 → **盘上永远是空表**，
+ *    「重启后第一条指令也不慢」这个设计目标完全没达成。
+ *
+ *    实测（真等 30 秒跑完整周期）：t=0 写内存缓存 1 条，t=30301ms flush 完成，
+ *    盘上 `entries` 条数 = **0**（期望 1）。线上 `data/share/idcache.yaml`
+ *    恒为 45 字节的 `schema: 1 / savedAt: <一直在变> / entries: {}` ——
+ *    说明 flush 在反复落盘，只是每次写的都是空表（顺带 30 秒一次写盘放大）。
+ *
+ *    现在落盘条目按自己的寿命判活（6 小时），而**读回内存时**仍然只给
+ *    `CACHE_TTL_MS` 那么长的可用时间 —— 这样既让重启后的第一条指令吃到缓存，
+ *    又不会让一份旧快照在内存里赖着不走（「换个机器人马上能用」的取舍不变）。
+ */
+const DISK_TTL_MS = 6 * 3600 * 1000;
+
+/**
+ * ⚠️⚠️ 模块级可变状态**全部锚在 `globalThis` 上**（2026-10-06 修）。
+ *
+ * 原因：JiuLi 的热重载会给 `plugins/` 下**每个**模块追加 `?jiuli_reload=<代数>`
+ * 查询串（`lib/core/reload-hooks.js`），把整张模块图重新求值一遍 —— 模块顶层
+ * 每重载一次就跑一次。于是同一个进程里会并存**多份** `shareStore` 实例，
+ * 各有各的 Map。落到落盘缓存上就是**数据丢失**（实测复现）：
+ *
+ *   ① 盘上 3 条 → 模块 A 读进自己的 `memoryCache`
+ *   ② 另一代次 B 落盘，盘上变成 4 条（多了 444444）
+ *   ③ A 的 30 秒 debounce 到期，`flushDiskCache()` 拿 **A 自己那份** `memoryCache`
+ *      整份覆盖 → 盘上只剩 A 知道的 2 条，**444444 被抹掉**
+ *      （实测输出：落盘后 `222222, 333333`）
+ *
+ * 锚定后进程内只剩一份权威内存，`flushDiskCache` 的「整份覆盖」才是正确的
+ * （它本来就是按「缓存内容全在 memoryCache 里」设计的）。
+ *
+ * 下面用「全局 holder + 局部别名」的手法：Map 类状态只被增删改、从不整体重新赋值，
+ * 所以 `const x = (holder.x ||= new Map())` 之后**其余代码一行都不用动**。
+ * 只有会被整体赋值的 `diskLoaded` / `flushTimer` 走 `holder.` 直接访问。
+ */
+const STATE_KEY = '__gokShareStoreState';
+const holder = globalThis[STATE_KEY] ||= {};
 
 /** 当轮已经合并过、不必重复请求的 QQ。查询合并用，见 inflight 的注释 */
-const inflight = new Map()
+const inflight = holder.inflight ||= new Map();
 
 /**
  * 「这个 QQ 在共享库里有记录」的本地标记 —— 也就是「他开过共享」。
@@ -87,49 +149,56 @@ const inflight = new Map()
  * 判据换成「库里还有没有你的记录」就天然自洽了：你一旦关掉共享，服务端会删记录并立墓碑，
  * 别的机器人再查你就是 404，也就不会再替你上传了。
  */
-const knownShared = new Map()
+const knownShared = holder.knownShared ||= new Map();
 
 /** 同一个 QQ 多久对一次账。库里数据变得很慢，每小时一次足够 */
-const RECONCILE_INTERVAL_MS = 60 * 60 * 1000
-const lastReconcileAt = new Map()
+const RECONCILE_INTERVAL_MS = 60 * 60 * 1000;
+const lastReconcileAt = holder.lastReconcileAt ||= new Map();
 
 /** qq -> {campId, until, fetchedAt, updatedAt}。campId 为空串表示「确认没有」 */
-const memoryCache = new Map()
+const memoryCache = holder.memoryCache ||= new Map();
 
 /**
  * 每个 QQ 一个代号。任何「本地绑定被改动」都会把代号加一，
  * 用来丢弃那些「发出时还没撤销、回来时已经撤销」的在途响应。
+ *
+ * 也要锚定：老代次那个在途请求回来时会拿**老代次的**代号比对，
+ * 代号表若是新的，撤销动作就白做了（会把已撤销的营地号又写回缓存）。
  */
-const generation = new Map()
-
-const circuit = { failures: 0, openUntil: 0, backoffMs: CIRCUIT_BASE_MS }
+const generation = holder.generation ||= new Map();
+const circuit = holder.circuit ||= {
+  failures: 0,
+  openUntil: 0,
+  backoffMs: CIRCUIT_BASE_MS
+};
 
 /** 日志节流：一个挂掉的服务端不该把日志刷爆 */
-const warnAt = new Map()
+const warnAt = holder.warnAt ||= new Map();
 
-let diskLoaded = false
-let flushTimer = null
+// 这两个会被整体赋值，所以不用局部别名，直接走 holder（见 STATE_KEY 的注释）
+holder.diskLoaded ??= false;
+holder.flushTimer ??= null;
 
 /* --------------------------------------------------------------- 文案 */
 
 /** 调用点拿到 source === 'none' 时用这句（和插件原有的未绑定提示保持一字不差） */
-export const NOT_BOUND_HINT = '你还没有绑定营地ID，先发送 #绑定营地 [营地ID]'
+export const NOT_BOUND_HINT = '你还没有绑定营地ID，先发送 #绑定营地 [营地ID]';
 
 /**
  * 调用点拿到 source === 'degraded' 时用这句。
  * 按「说人话、不给用户看实现细节、要用户动手的给出可直接照做的指令」来写。
  */
-export const SHARE_DEGRADED_HINT =
-  '共享库暂时用不了，稍后再试。也可以直接发 #绑定营地 [营地ID] 绑到本机'
+export const SHARE_DEGRADED_HINT = '共享库暂时用不了，稍后再试。也可以直接发 #绑定营地 [营地ID] 绑到本机';
 
 /* --------------------------------------------------------------- 基础工具 */
 
-function warnOnce (key, message) {
-  const now = Date.now()
-  if (now - (warnAt.get(key) || 0) < 300000) return
-
-  warnAt.set(key, now)
-  try { logger?.warn?.(message) } catch {}
+function warnOnce(key, message) {
+  const now = Date.now();
+  if (now - (warnAt.get(key) || 0) < 300000) return;
+  warnAt.set(key, now);
+  try {
+    logger?.warn?.(message);
+  } catch {}
 }
 
 /**
@@ -137,9 +206,9 @@ function warnOnce (key, message) {
  *
  * @returns {{enabled: boolean, apiUrl: string, token: string, adminSecret: string}}
  */
-export function readShareConfig () {
+export function readShareConfig() {
   try {
-    const cfg = Config.getDefOrConfig('config') || {}
+    const cfg = Config.getDefOrConfig('config') || {};
     return {
       enabled: cfg.shareEnabled === true,
       apiUrl: String(cfg.shareApiUrl || '').trim().replace(/\/+$/, ''),
@@ -150,9 +219,14 @@ export function readShareConfig () {
       // 远程管理用的钥匙（服务端 GOK_ADMIN_SECRET）。只有运维指令用它，
       // 和接入用的 token 是两码事，缺了只影响发令牌那些，不影响接入
       adminSecret: String(cfg.shareAdminSecret || '').trim()
-    }
+    };
   } catch {
-    return { enabled: false, apiUrl: '', token: '', adminSecret: '' }
+    return {
+      enabled: false,
+      apiUrl: '',
+      token: '',
+      adminSecret: ''
+    };
   }
 }
 
@@ -160,9 +234,9 @@ export function readShareConfig () {
  * 三项都配齐了才算「接入」。缺任何一项都当没接入处理——
  * 那种情况下用户看到的是正常的「你还没有绑定营地ID」，而不是一个莫名其妙的报错。
  */
-export function isShareReady () {
-  const cfg = readShareConfig()
-  return Boolean(cfg.enabled && cfg.apiUrl && cfg.token)
+export function isShareReady() {
+  const cfg = readShareConfig();
+  return Boolean(cfg.enabled && cfg.apiUrl && cfg.token);
 }
 
 /**
@@ -172,86 +246,103 @@ export function isShareReady () {
  * 而加了 memo 就会出现「主人刚扫完码全局登录，
  * 接下来半分钟共享还是判定成用不了」这种说不清的滞后。
  */
-function hasUsableGlobalAccount () {
+function hasUsableGlobalAccount() {
   try {
-    return authStore.listAccounts().some(account => account.isGlobalDefault && !account.authInvalid)
+    // ⚠️⚠️ 判据必须与 authStore.isUsableAuth 一致（2026-10-06 修）。
+    //    原先只判 `isGlobalDefault && !authInvalid`，少了「凭证是否齐全」这一层：
+    //    锅巴面板上建一个只有 userId + 全局开关、凭证留空的号，这里就判「有可用账号」，
+    //    于是共享库下发的营地ID 被认成可用、返回 source:'shared' 并写进本机 UserData.yaml；
+    //    而 api.js 侧的候选池是空的、请求注定失败，用户既拿不到 degraded 提示也恢复不了
+    //    （fromShare 绑定因本地优先会长期压住共享值）。
+    return authStore.listAccounts().some(account => account.isGlobalDefault && isUsableAuth(account));
   } catch {
-    return false
+    return false;
   }
 }
 
 /* --------------------------------------------------------------- 落盘缓存 */
 
-function loadDiskCache () {
-  if (diskLoaded) return
-  diskLoaded = true
-
+function loadDiskCache() {
+  if (holder.diskLoaded) return;
+  holder.diskLoaded = true;
   try {
-    const raw = readYamlFile(CACHE_FILE)
-    if (!raw || raw.schema !== CACHE_SCHEMA) return
-    if (!raw.savedAt || Date.now() - Number(raw.savedAt) > DISK_MAX_AGE_MS) return
-
-    const entries = raw.entries && typeof raw.entries === 'object' ? raw.entries : {}
-
-    const now = Date.now()
+    const raw = readYamlFile(CACHE_FILE);
+    if (!raw || raw.schema !== CACHE_SCHEMA) return;
+    if (!raw.savedAt || Date.now() - Number(raw.savedAt) > DISK_MAX_AGE_MS) return;
+    const entries = raw.entries && typeof raw.entries === 'object' ? raw.entries : {};
+    const now = Date.now();
     for (const [qq, entry] of Object.entries(entries)) {
-      if (!entry || typeof entry !== 'object') continue
-      if (Number(entry.until) <= now) continue
+      if (!entry || typeof entry !== 'object') continue;
+      // 按**落盘寿命**判活（老文件没有 diskUntil，退回 until —— 那种文件本来就是空的）
+      const aliveUntil = Number(entry.diskUntil) || Number(entry.until) || 0;
+      if (aliveUntil <= now) continue;
+      // ⚠️ 读回内存时只给 `CACHE_TTL_MS`，不是给剩余的 diskUntil ——
+      //    缓存的用途是「重启后第一条指令不慢」，不是「这份快照能一直用」。
+      //    给足 6 小时会让「换个机器人马上能用」退化成「最多 6 小时才看到」。
       memoryCache.set(qq, {
         campId: String(entry.campId || ''),
-        until: Number(entry.until) || 0,
+        until: now + CACHE_TTL_MS,
         fetchedAt: Number(entry.fetchedAt) || 0,
         updatedAt: Number(entry.updatedAt) || 0
-      })
+      });
     }
   } catch (error) {
     // 缓存是可再生的，坏了直接丢弃重来，绝不因此阻塞任何指令
     if (error?.code !== 'ENOENT') {
-      quarantineCorrupt(CACHE_FILE, error, '[营地共享]')
+      quarantineCorrupt(CACHE_FILE, error, '[营地共享]');
     }
   }
 }
 
 /** 落盘走 30 秒 debounce：查询是高频路径，没必要每来一条就写一次盘 */
-function scheduleFlush () {
-  if (flushTimer) return
-
-  flushTimer = setTimeout(() => {
-    flushTimer = null
-    flushDiskCache()
-  }, 30000)
-  flushTimer.unref?.()
+function scheduleFlush() {
+  if (holder.flushTimer) return;
+  holder.flushTimer = setTimeout(() => {
+    holder.flushTimer = null;
+    flushDiskCache();
+  }, 30000);
+  holder.flushTimer.unref?.();
 }
-
-function flushDiskCache () {
+function flushDiskCache() {
   try {
-    const now = Date.now()
-    const entries = {}
-
+    const now = Date.now();
+    const entries = {};
     for (const [qq, entry] of memoryCache) {
-      if (entry.until <= now) continue
+      // ⚠️ 这里**不能**再按内存的 `until` 过滤（那是 5 秒），否则 flush 的 30 秒
+      //    debounce 一到期，条目必然已经过期 → 盘上永远是空表（见 DISK_TTL_MS 的说明）。
+      //    落盘寿命从**观测时刻**起算，和内存可用期解耦。
+      const base = Number(entry.fetchedAt) || now;
+      const diskUntil = base + DISK_TTL_MS;
+      if (diskUntil <= now) continue;
       entries[qq] = {
         campId: entry.campId,
+        // until 保留原义（内存可用到什么时候），落盘寿命单独记 diskUntil
         until: entry.until,
+        diskUntil,
         fetchedAt: entry.fetchedAt,
         updatedAt: entry.updatedAt
-      }
+      };
     }
 
-    // 直接整份覆盖：缓存内容全在 memoryCache 里，不需要先读盘再合并
-    writeYamlFile(CACHE_FILE, { schema: CACHE_SCHEMA, savedAt: now, entries })
+    // 整份覆盖是正确的：`memoryCache` 现在是**进程内唯一权威**（锚在 globalThis 上，
+    // 见 STATE_KEY 的注释）。历史上这里是「多份实例各写各的」，那才会互相抹数据。
+    writeYamlFile(CACHE_FILE, {
+      schema: CACHE_SCHEMA,
+      savedAt: now,
+      entries
+    });
   } catch (error) {
-    warnOnce('flush', `[营地共享] 缓存落盘失败：${error.message}`)
+    warnOnce('flush', `[营地共享] 缓存落盘失败：${error.message}`);
   }
 }
 
 /** 进程退出前把脏数据刷下去。pm2 restart 时会走到这里 */
-function flushNow () {
-  if (flushTimer) {
-    clearTimeout(flushTimer)
-    flushTimer = null
+function flushNow() {
+  if (holder.flushTimer) {
+    clearTimeout(holder.flushTimer);
+    holder.flushTimer = null;
   }
-  flushDiskCache()
+  flushDiskCache();
 }
 
 /**
@@ -260,25 +351,42 @@ function flushNow () {
  * 用 'exit' 而不是 SIGINT/SIGTERM：宿主 Yunzai 自己也在监听这两个信号，
  * 多挂一个监听器会让「默认退出行为」失效——两边都不 exit 的话进程就停不下来了。
  * 'exit' 只是被通知，不改变退出流程，而且这里做的全是同步写盘，正好合规。
+ *
+ * ⚠️⚠️ **必须用 globalThis 标记保证只注册一次**（2026-10-06 修）。
+ *    这个模块的顶层语句在 JiuLi 热重载时会**重新求值**（内核给 plugins/ 下每个模块
+ *    追加 `?jiuli_reload=<代数>`，见 STATE_KEY 的注释），于是 `process.once` 每热重载
+ *    一代就多挂一个监听器 —— 实测线上已经报出
+ *    `MaxListenersExceededWarning: Possible EventEmitter memory leak detected.
+ *     11 exit listeners added to [process]. MaxListeners is 10.`
+ *    超过 10 个之后 Node 还会开始丢弃告警，泄漏就彻底隐身了。
+ *    注意 `process.once` 的 once 是「触发一次就摘掉」，**不是**「只注册一次」——
+ *    进程不退出的话它会一直累积。所以判据要挂在一个跟模块实例无关的地方。
  */
-process.once('exit', flushNow)
+const EXIT_HOOK_KEY = '__gokShareStoreExitHook';
+if (!globalThis[EXIT_HOOK_KEY]) {
+  globalThis[EXIT_HOOK_KEY] = true;
+  process.once('exit', flushNow);
+}
 
 /* --------------------------------------------------------------- 缓存读写 */
 
-function readMemory (qq) {
-  loadDiskCache()
-  return memoryCache.get(qq)
+function readMemory(qq) {
+  loadDiskCache();
+  return memoryCache.get(qq);
 }
-
-function writeMemory (qq, { campId, ttlMs, updatedAt }) {
-  const now = Date.now()
+function writeMemory(qq, {
+  campId,
+  ttlMs,
+  updatedAt
+}) {
+  const now = Date.now();
   memoryCache.set(qq, {
     campId: String(campId || ''),
     until: now + ttlMs,
     fetchedAt: now,
     updatedAt: Number(updatedAt) || 0
-  })
-  scheduleFlush()
+  });
+  scheduleFlush();
 }
 
 /**
@@ -288,44 +396,41 @@ function writeMemory (qq, { campId, ttlMs, updatedAt }) {
  * 绑定时是为了让本地值干净地压住缓存值，删除/切换时是必须的——
  * 否则缓存里那份共享值会在用户已经删掉之后继续被解析出来。
  */
-export function invalidateShareCache (userId) {
-  const qq = String(userId || '').trim()
-  if (!qq) return
-
-  generation.set(qq, (generation.get(qq) || 0) + 1)
-  memoryCache.delete(qq)
+export function invalidateShareCache(userId) {
+  const qq = String(userId || '').trim();
+  if (!qq) return;
+  generation.set(qq, (generation.get(qq) || 0) + 1);
+  memoryCache.delete(qq);
   // 盘上的那份不用单独删：flushDiskCache 是拿 memoryCache 整份重建的
-  scheduleFlush()
+  scheduleFlush();
 }
 
 /* --------------------------------------------------------------- 网络 */
 
-function shareHeaders (token) {
+function shareHeaders(token) {
   return {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${token}`
-  }
+  };
 }
 
 /** 熔断期间直接跳过网络，别让每条指令都干等 1.5 秒 */
-function circuitOpen () {
-  return Date.now() < circuit.openUntil
+function circuitOpen() {
+  return Date.now() < circuit.openUntil;
 }
-
-function recordFailure (reason) {
-  circuit.failures += 1
+function recordFailure(reason) {
+  circuit.failures += 1;
   if (circuit.failures >= CIRCUIT_THRESHOLD) {
-    circuit.openUntil = Date.now() + circuit.backoffMs
+    circuit.openUntil = Date.now() + circuit.backoffMs;
     // 指数退避到 10 分钟封顶：服务端长时间不可用时，别每 60 秒就再去试一次
-    circuit.backoffMs = Math.min(circuit.backoffMs * 2, CIRCUIT_MAX_MS)
-    warnOnce(`circuit:${reason}`, `[营地共享] 连续失败 ${circuit.failures} 次，暂停 ${Math.round(circuit.backoffMs / 1000)} 秒后再试`)
+    circuit.backoffMs = Math.min(circuit.backoffMs * 2, CIRCUIT_MAX_MS);
+    warnOnce(`circuit:${reason}`, `[营地共享] 连续失败 ${circuit.failures} 次，暂停 ${Math.round(circuit.backoffMs / 1000)} 秒后再试`);
   }
 }
-
-function recordSuccess () {
-  circuit.failures = 0
-  circuit.backoffMs = CIRCUIT_BASE_MS
-  circuit.openUntil = 0
+function recordSuccess() {
+  circuit.failures = 0;
+  circuit.backoffMs = CIRCUIT_BASE_MS;
+  circuit.openUntil = 0;
 }
 
 /**
@@ -333,8 +438,8 @@ function recordSuccess () {
  * 服务端已经恢复了、但指数退避的时间还没走到时会用得上；
  * 脱机测试跑完「服务端不可达」那组用例后也要靠它接着测正常路径。
  */
-export function resetCircuitBreaker () {
-  recordSuccess()
+export function resetCircuitBreaker() {
+  recordSuccess();
 }
 
 /**
@@ -343,39 +448,43 @@ export function resetCircuitBreaker () {
  * @returns {Promise<{campId: string, updatedAt: number}|{unchanged: true}|null>}
  *   返回 null 表示服务端明确说「这个 QQ 没共享过」
  */
-async function requestShare (cfg, qq, since) {
+async function requestShare(cfg, qq, since) {
   const response = await fetch(`${cfg.apiUrl}/api/v1/bind/query`, {
     method: 'POST',
     headers: shareHeaders(cfg.token),
-    body: JSON.stringify({ qq, since: Number(since) || 0 }),
+    body: JSON.stringify({
+      qq,
+      since: Number(since) || 0
+    }),
     signal: AbortSignal.timeout(READ_TIMEOUT_MS)
-  })
+  });
 
   // 404 = 确认没共享过，是正常结果不是错误
-  if (response.status === 404) return null
-
+  if (response.status === 404) return null;
   if (response.status === 401 || response.status === 403) {
     // 配置问题，重试多少次都一样，用单独的 key 免得和网络故障的日志混在一起
-    const error = new Error(`共享库拒绝了这次请求（${response.status}），检查令牌是否有效`)
-    error.shareAuthFailed = true
-    throw error
+    const error = new Error(`共享库拒绝了这次请求（${response.status}），检查令牌是否有效`);
+    error.shareAuthFailed = true;
+    throw error;
   }
-
   if (!response.ok) {
-    throw new Error(`共享库返回 ${response.status}`)
+    throw new Error(`共享库返回 ${response.status}`);
   }
-
-  const data = await response.json()
-  if (data?.unchanged) return { unchanged: true, updatedAt: Number(data.updatedAt) || 0 }
-
-  const ids = Array.isArray(data?.campIds) ? data.campIds.map(String) : []
-  const picked = String(data?.current || '')
-  const campId = ids.includes(picked) ? picked : (ids[0] || '')
-
-  return { campId, campIds: ids, updatedAt: Number(data?.updatedAt) || Date.now() }
+  const data = await response.json();
+  if (data?.unchanged) return {
+    unchanged: true,
+    updatedAt: Number(data.updatedAt) || 0
+  };
+  const ids = Array.isArray(data?.campIds) ? data.campIds.map(String) : [];
+  const picked = String(data?.current || '');
+  const campId = ids.includes(picked) ? picked : ids[0] || '';
+  return {
+    campId,
+    campIds: ids,
+    updatedAt: Number(data?.updatedAt) || Date.now()
+  };
 }
-
-const USER_DATA_FILE = path.join(PluginData, 'UserData.yaml')
+const USER_DATA_FILE = path.join(PluginData, 'UserData.yaml');
 
 /**
  * 把共享库拿到的绑定**落到本机** `UserData.yaml`，并打上 `fromShare` 标记。
@@ -390,38 +499,86 @@ const USER_DATA_FILE = path.join(PluginData, 'UserData.yaml')
  *
  * 本机**已经有绑定**的不动（本地优先，用户在哪儿绑的以哪儿为准）。
  */
-function adoptSharedBind (qq, campIds, currentCampId) {
+function adoptSharedBind(qq, campIds, currentCampId) {
   try {
-    const data = readUserData()
-    const existing = data[qq]
-    if (existing && Array.isArray(existing.ids) && existing.ids.length) return
-
+    const data = readUserData();
+    const existing = data[qq];
+    if (existing && Array.isArray(existing.ids) && existing.ids.length) return;
     data[qq] = {
       ids: [...campIds],
       current: Math.max(0, campIds.indexOf(currentCampId)),
       // 标记来源：好让「关闭共享」时能把这份清掉，也不跟用户自己绑的混为一谈
       fromShare: true,
+      // ⚠️⚠️ 还要**逐个记下是哪些 id 来自共享库**（2026-10-06 修）。
+      //    只靠条目级的 `fromShare` 不够：用户之后在本机自己绑一个号时，
+      //    `authStore.bindCampUserId` 是**原地改 `entry.ids`**、不动 `fromShare`，
+      //    于是那条里就混了「共享来的」和「自己绑的」，而 `fromShare` 仍是 true。
+      //    关闭共享时按条目整条 `delete`，会把**用户自己绑的号一起删掉**。
+      //    实测：ids=[共享来的1580886057, 自绑的1745513318] → 关共享后整条没了。
+      //    有了这个名单，`dropAdoptedBind` 就能只摘共享来的那些。
+      adoptedIds: [...campIds],
       sharedAt: Date.now()
-    }
-    writeYamlFile(USER_DATA_FILE, data)
-
-    logger?.debug?.(`[营地共享] ${qq} 的绑定已从共享库落到本机（${campIds.length} 个）`)
+    };
+    writeYamlFile(USER_DATA_FILE, data);
+    logger?.debug?.(`[营地共享] ${qq} 的绑定已从共享库落到本机（${campIds.length} 个）`);
   } catch (error) {
-    warnOnce('adopt', `[营地共享] 落地到本机失败：${error?.message || error}`)
+    warnOnce('adopt', `[营地共享] 落地到本机失败：${error?.message || error}`);
   }
 }
 
-/** 把「从共享库落下来的」那份清掉。用户关共享、或者库里没他时调 */
-export function dropAdoptedBind (qq) {
+/**
+ * 把「从共享库落下来的」那份清掉。用户关共享、或者库里没他时调。
+ *
+ * ⚠️⚠️ **只摘共享来的那几个 id，不能整条 delete**（2026-10-06 修）。
+ *    条目的 `fromShare: true` 只说明「这条**最初**是共享落地来的」，
+ *    不代表里面每个 id 都是共享来的 —— 用户后来自己绑的号混在同一条里
+ *    （`bindCampUserId` 原地追加、保留 fromShare）。整条删就等于
+ *    「关掉共享」顺手把用户自己绑的营地号也删了，用户会以为数据丢了。
+ *
+ *    三种情况分别处理：
+ *      · 有 `adoptedIds` 名单：只摘名单里的，剩下的留着（自己绑的那些）
+ *      · 老数据没名单（改动前落地的）：保守起见**整条删**，保持原行为 ——
+ *        没有名单就无法分辨哪个是自己绑的，乱留会让「来自共享库」的脏绑定赖着不走
+ *      · 摘完一个不剩：把整条删掉，不留空壳
+ */
+export function dropAdoptedBind(qq) {
   try {
-    const data = readUserData()
-    if (!data[qq]?.fromShare) return
+    const data = readUserData();
+    const entry = data[qq];
+    if (!entry?.fromShare) return;
+    const adopted = Array.isArray(entry.adoptedIds) ? entry.adoptedIds.map(String) : null;
 
-    delete data[qq]
-    writeYamlFile(USER_DATA_FILE, data)
-    logger?.debug?.(`[营地共享] ${qq} 从共享库落到本机的那份已清除`)
+    // 老数据（没有 adoptedIds 名单）：维持「整条删」的旧行为
+    if (!adopted) {
+      delete data[qq];
+      writeYamlFile(USER_DATA_FILE, data);
+      logger?.debug?.(`[营地共享] ${qq} 从共享库落到本机的那份已清除（无来源名单，整条清）`);
+      return;
+    }
+    const adoptedSet = new Set(adopted);
+    const kept = (Array.isArray(entry.ids) ? entry.ids : []).filter(id => !adoptedSet.has(String(id)));
+    if (!kept.length) {
+      delete data[qq];
+      writeYamlFile(USER_DATA_FILE, data);
+      logger?.debug?.(`[营地共享] ${qq} 的绑定全部来自共享库，整条已清除`);
+      return;
+    }
+
+    // 还有自己绑的号：只摘共享来的，`current` 跟着重算到「当前那个号」的新下标上
+    const currentId = String(entry.ids?.[entry.current] ?? '');
+    const next = {
+      ...entry,
+      ids: kept,
+      current: Math.max(0, kept.indexOf(currentId)),
+      fromShare: false
+    };
+    // 摘干净就把标记和名单一起去掉，这条从此就是「用户自己绑的」
+    delete next.adoptedIds;
+    data[qq] = next;
+    writeYamlFile(USER_DATA_FILE, data);
+    logger?.debug?.(`[营地共享] ${qq} 已摘掉 ${adopted.length} 个共享来的绑定，保留 ${kept.length} 个自己绑的`);
   } catch (error) {
-    warnOnce('adopt-drop', `[营地共享] 清理落地数据失败：${error?.message || error}`)
+    warnOnce('adopt-drop', `[营地共享] 清理落地数据失败：${error?.message || error}`);
   }
 }
 
@@ -445,63 +602,60 @@ export function dropAdoptedBind (qq) {
  *  - 本机没有绑定就什么都不做（没东西可传）
  */
 /** 从共享库落下来的那份，多久回去跟库对一次 */
-const ADOPTED_RECONCILE_MS = 5 * 60 * 1000
+const ADOPTED_RECONCILE_MS = 5 * 60 * 1000;
 
 /** 本机这份绑定是不是「从共享库落下来的」 */
-function isAdoptedBind (qq) {
+function isAdoptedBind(qq) {
   try {
-    return readUserData()[qq]?.fromShare === true
+    return readUserData()[qq]?.fromShare === true;
   } catch {
-    return false
+    return false;
   }
 }
-
-async function reconcileSharedUser (qq, { force = false } = {}) {
+async function reconcileSharedUser(qq, {
+  force = false
+} = {}) {
   try {
-    const now = Date.now()
+    const now = Date.now();
 
     // 落下来的那份要跟紧一点：本地优先会让它一直生效，而用户随时可能在
     // 别的机器人上撤销共享。自己绑的不用管，一小时后对一次就够
-    const interval = isAdoptedBind(qq) ? ADOPTED_RECONCILE_MS : RECONCILE_INTERVAL_MS
-    if (!force && now - (lastReconcileAt.get(qq) || 0) < interval) return
-    lastReconcileAt.set(qq, now)
-
-    const cfg = readShareConfig()
-    if (!cfg.enabled || !cfg.apiUrl || !cfg.token) return
-    if (circuitOpen()) return
-
-    const ids = getBoundIds(qq)
-    if (!ids.length) return
+    const interval = isAdoptedBind(qq) ? ADOPTED_RECONCILE_MS : RECONCILE_INTERVAL_MS;
+    if (!force && now - (lastReconcileAt.get(qq) || 0) < interval) return;
+    lastReconcileAt.set(qq, now);
+    const cfg = readShareConfig();
+    if (!cfg.enabled || !cfg.apiUrl || !cfg.token) return;
+    if (circuitOpen()) return;
+    const ids = getBoundIds(qq);
+    if (!ids.length) return;
 
     // 本机这份要是**从共享库落下来的**，就只确认库里还有他、别把它传回去 ——
     // 那不是他在这台机器上绑的号，传上去等于把自己刚拿到的东西又还回去，来回覆盖
     if (isAdoptedBind(qq)) {
-      const current = await requestShare(cfg, qq, 0)
+      const current = await requestShare(cfg, qq, 0);
       if (!current?.campId) {
-        knownShared.delete(qq)
-        dropAdoptedBind(qq)
+        knownShared.delete(qq);
+        dropAdoptedBind(qq);
       }
-      return
+      return;
     }
-
-    const result = await requestShare(cfg, qq, 0)
+    const result = await requestShare(cfg, qq, 0);
     if (!result?.campId) {
       // 库里没有他了 —— 说明他撤销了共享（服务端会留墓碑，这里也是 404）。
       // 标记要摘、本机那份落下来的也要清，否则本机新绑的号会被一直传上去
-      knownShared.delete(qq)
-      dropAdoptedBind(qq)
-      return
+      knownShared.delete(qq);
+      dropAdoptedBind(qq);
+      return;
     }
-
-    knownShared.set(qq, true)
+    knownShared.set(qq, true);
 
     // 传一次就行：PUT 是「本实例的全量替换」，天然的幂等
-    const pushed = await pushBind(qq, ids, getCurrentId(qq) || '')
+    const pushed = await pushBind(qq, ids, getCurrentId(qq) || '');
     if (pushed.ok) {
-      logger?.debug?.(`[营地共享] ${qq} 在别的机器人上开过共享，本机这 ${ids.length} 个绑定已同步过去`)
+      logger?.debug?.(`[营地共享] ${qq} 在别的机器人上开过共享，本机这 ${ids.length} 个绑定已同步过去`);
     }
   } catch (error) {
-    warnOnce('reconcile', `[营地共享] 对账失败：${error?.message || error}`)
+    warnOnce('reconcile', `[营地共享] 对账失败：${error?.message || error}`);
   }
 }
 
@@ -515,47 +669,43 @@ async function reconcileSharedUser (qq, { force = false } = {}) {
  *   not-shared= 库里没有他（没开共享，或者已经撤销了）
  *   failed    = 连不上或配置不全
  */
-export async function reconcileNow (userId) {
-  const qq = String(userId ?? '').trim()
-  if (!qq) return 'failed'
-
-  const cfg = readShareConfig()
-  if (!cfg.enabled || !cfg.apiUrl || !cfg.token) return 'failed'
-  if (circuitOpen()) return 'failed'
-
-  const ids = getBoundIds(qq)
-  if (!ids.length) return 'not-shared'
+export async function reconcileNow(userId) {
+  const qq = String(userId ?? '').trim();
+  if (!qq) return 'failed';
+  const cfg = readShareConfig();
+  if (!cfg.enabled || !cfg.apiUrl || !cfg.token) return 'failed';
+  if (circuitOpen()) return 'failed';
+  const ids = getBoundIds(qq);
+  if (!ids.length) return 'not-shared';
 
   // 同上：本机这份是从库里落下来的，就别往库里传了
   if (isAdoptedBind(qq)) {
     try {
-      const current = await requestShare(cfg, qq, 0)
+      const current = await requestShare(cfg, qq, 0);
       if (!current?.campId) {
-        knownShared.delete(qq)
-        dropAdoptedBind(qq)
-        return 'not-shared'
+        knownShared.delete(qq);
+        dropAdoptedBind(qq);
+        return 'not-shared';
       }
-      return 'shared'
+      return 'shared';
     } catch (error) {
-      warnOnce('reconcile-now', `[营地共享] 手动对账失败：${error?.message || error}`)
-      return 'failed'
+      warnOnce('reconcile-now', `[营地共享] 手动对账失败：${error?.message || error}`);
+      return 'failed';
     }
   }
-
   try {
-    const result = await requestShare(cfg, qq, 0)
+    const result = await requestShare(cfg, qq, 0);
     if (!result?.campId) {
-      knownShared.delete(qq)
-      dropAdoptedBind(qq)
-      return 'not-shared'
+      knownShared.delete(qq);
+      dropAdoptedBind(qq);
+      return 'not-shared';
     }
-
-    knownShared.set(qq, true)
-    const pushed = await pushBind(qq, ids, getCurrentId(qq) || '')
-    return pushed.ok ? 'shared' : 'failed'
+    knownShared.set(qq, true);
+    const pushed = await pushBind(qq, ids, getCurrentId(qq) || '');
+    return pushed.ok ? 'shared' : 'failed';
   } catch (error) {
-    warnOnce('reconcile-now', `[营地共享] 手动对账失败：${error?.message || error}`)
-    return 'failed'
+    warnOnce('reconcile-now', `[营地共享] 手动对账失败：${error?.message || error}`);
+    return 'failed';
   }
 }
 
@@ -563,8 +713,24 @@ export async function reconcileNow (userId) {
  * 这个 QQ 是不是「开过共享的人」。
  * 供 utils/shareUsers.js 判断「本机绑定变了要不要往上传」。
  */
-export function isKnownShared (userId) {
-  return knownShared.get(String(userId ?? '').trim()) === true
+export function isKnownShared(userId) {
+  return knownShared.get(String(userId ?? '').trim()) === true;
+}
+
+/**
+ * 抹掉「这个 QQ 开过共享」的本地镜像。
+ *
+ * ⚠️ 用户**显式关闭共享**时必须调它（`shareUsers.disableSharing`）。
+ *    原先唯一的清理点在下面网络分支里（查询返回 404 才删），而「关闭共享」走的是
+ *    `revokeBind`，不经过那条分支 —— 于是 `knownShared` 一直留着 true，
+ *    `syncUserBind` 的第二个判据继续成立，用户下次绑号时**开关自己弹回 true**
+ *    并把数据重新上传（实测复现：关闭后 knownShared 仍为 true，
+ *    再发 `#绑定营地` → 真的发出 PUT /api/v1/bind，开关变 enabled:true）。
+ *    用户明确 opt-out 过，绝不能因为一次网络路径没走到就复活。
+ */
+export function forgetKnownShared(userId) {
+  const qq = String(userId ?? '').trim();
+  if (qq) knownShared.delete(qq);
 }
 
 /* --------------------------------------------------------------- 对外主函数 */
@@ -580,10 +746,13 @@ export function isKnownShared (userId) {
  *   source='degraded' 本机没有、且共享库不可用 / 本机缺公共登录态 —— 提示语必须不一样，
  *                     否则用户会被引导去重新绑定，而绑定之后本机值会盖住共享值，共享就永远失效了
  */
-export async function resolveCurrentId (userId, options = {}) {
-  const result = await resolveCurrentIdInner(userId, options)
+export async function resolveCurrentId(userId, options = {}) {
+  const result = await resolveCurrentIdInner(userId, options);
   // 把「该说哪句话」一并带出去，省得十几个调用点各自写一遍 source 判断
-  return { ...result, hint: result.source === 'degraded' ? SHARE_DEGRADED_HINT : NOT_BOUND_HINT }
+  return {
+    ...result,
+    hint: result.source === 'degraded' ? SHARE_DEGRADED_HINT : NOT_BOUND_HINT
+  };
 }
 
 /**
@@ -600,127 +769,162 @@ export async function resolveCurrentId (userId, options = {}) {
  *
  * 「本机已有绑定」的零网络开销：`getBoundIds` 命中就直接返回，连内存缓存都不查。
  */
-export async function resolveUserData (userId) {
-  const qq = String(userId ?? '').trim()
-
+export async function resolveUserData(userId) {
+  const qq = String(userId ?? '').trim();
   if (qq && !getBoundIds(qq).length) {
     try {
-      const { campId } = await resolveCurrentId(qq)
+      const {
+        campId
+      } = await resolveCurrentId(qq);
       // 拿到就说明 adoptSharedBind 已经写进文件了，重读一次即可
-      if (campId) return readUserData()
+      if (campId) return readUserData();
     } catch {
       // 共享库是别人搭的、随时可能下线：它出任何事都只能是「这次查不到」，
       // 不能让用户的指令跟着失败。读不到就按本机没有处理
     }
   }
-
-  return readUserData()
+  return readUserData();
 }
-
-async function resolveCurrentIdInner (userId, { share = true } = {}) {
-  const qq = String(userId ?? '').trim()
-  if (!qq) return { campId: null, source: 'none' }
+async function resolveCurrentIdInner(userId, {
+  share = true
+} = {}) {
+  const qq = String(userId ?? '').trim();
+  if (!qq) return {
+    campId: null,
+    source: 'none'
+  };
 
   // 本地永远优先。本机绑过的人连缓存都不用查
-  const local = getCurrentId(qq)
+  const local = getCurrentId(qq);
   if (local) {
     // 顺手后台对一次账：他在别的机器人上开过共享的话，本机这组绑定也该传上去。
     // 不 await —— 用户这条指令该多快还多快，对账是它自己的事
-    reconcileSharedUser(qq).catch(() => {})
-    return { campId: local, source: 'local' }
+    reconcileSharedUser(qq).catch(() => {});
+    return {
+      campId: local,
+      source: 'local'
+    };
   }
-
-  if (!share) return { campId: null, source: 'none' }
-
-  const cfg = readShareConfig()
+  if (!share) return {
+    campId: null,
+    source: 'none'
+  };
+  const cfg = readShareConfig();
   if (!cfg.enabled || !cfg.apiUrl || !cfg.token) {
     // 没接入就当没这回事，用户看到的是正常的「你还没有绑定营地ID」
-    return { campId: null, source: 'none' }
+    return {
+      campId: null,
+      source: 'none'
+    };
   }
-
-  const now = Date.now()
-  const cached = readMemory(qq)
-
+  const now = Date.now();
+  const cached = readMemory(qq);
   if (cached && cached.until > now) {
-    return cached.campId
-      ? { campId: cached.campId, source: 'cache' }
-      : { campId: null, source: 'none' }
+    return cached.campId ? {
+      campId: cached.campId,
+      source: 'cache'
+    } : {
+      campId: null,
+      source: 'none'
+    };
   }
-
   if (circuitOpen()) {
-    return fallback(cached, 'circuit')
+    return fallback(cached, 'circuit');
   }
 
   // 并发同 QQ 合并成一次请求（冷启动时同一批指令会撞在这里）
-  const pending = inflight.get(qq)
-  if (pending) return pending
-
-  const startedAtGeneration = generation.get(qq) || 0
+  const pending = inflight.get(qq);
+  if (pending) return pending;
+  const startedAtGeneration = generation.get(qq) || 0;
   const task = (async () => {
     try {
-      const result = await requestShare(cfg, qq, cached?.updatedAt || 0)
+      const result = await requestShare(cfg, qq, cached?.updatedAt || 0);
 
       // 期间用户改过本地绑定或撤销了共享，这次响应已经过期，丢掉不写缓存
       if ((generation.get(qq) || 0) !== startedAtGeneration) {
-        return { campId: null, source: 'none' }
+        return {
+          campId: null,
+          source: 'none'
+        };
       }
-
-      recordSuccess()
-
+      recordSuccess();
       if (result?.unchanged) {
         // 服务端说没变，把缓存里的值续命
         if (cached) {
-          writeMemory(qq, { campId: cached.campId, ttlMs: CACHE_TTL_MS, updatedAt: cached.updatedAt })
-          return cached.campId ? { campId: cached.campId, source: 'cache' } : { campId: null, source: 'none' }
+          writeMemory(qq, {
+            campId: cached.campId,
+            ttlMs: CACHE_TTL_MS,
+            updatedAt: cached.updatedAt
+          });
+          return cached.campId ? {
+            campId: cached.campId,
+            source: 'cache'
+          } : {
+            campId: null,
+            source: 'none'
+          };
         }
-        return { campId: null, source: 'none' }
+        return {
+          campId: null,
+          source: 'none'
+        };
       }
-
       if (!result) {
         // 库里没有他（或者他已经撤销了）—— 把「开过共享」的标记摘掉，
         // 否则本机新绑的号还会被一直传上去；顺带清掉之前落下来的那份
-        knownShared.delete(qq)
-        dropAdoptedBind(qq)
-        writeMemory(qq, { campId: '', ttlMs: CACHE_TTL_MS })
-        return { campId: null, source: 'none' }
+        knownShared.delete(qq);
+        dropAdoptedBind(qq);
+        writeMemory(qq, {
+          campId: '',
+          ttlMs: CACHE_TTL_MS
+        });
+        return {
+          campId: null,
+          source: 'none'
+        };
       }
-
-      knownShared.set(qq, true)
+      knownShared.set(qq, true);
 
       // 拿到了营地ID，但本机没有能查别人号的公共登录态 —— 给了也用不了，
       // 这时候必须说成 degraded，否则用户会照着「未绑定」的提示去重新绑一遍
       if (result.campId && !hasUsableGlobalAccount()) {
-        writeMemory(qq, { campId: result.campId, ttlMs: CACHE_TTL_MS, updatedAt: result.updatedAt })
-        return { campId: null, source: 'degraded', reason: 'no_global_account' }
+        writeMemory(qq, {
+          campId: result.campId,
+          ttlMs: CACHE_TTL_MS,
+          updatedAt: result.updatedAt
+        });
+        return {
+          campId: null,
+          source: 'degraded',
+          reason: 'no_global_account'
+        };
       }
-
       writeMemory(qq, {
         campId: result.campId,
         ttlMs: CACHE_TTL_MS,
         updatedAt: result.updatedAt
-      })
+      });
 
       // 「库里下发到同步端」那一步。落到本机之后，所有直接读 UserData.yaml 的指令
       // （#查询战绩、#皮肤墙、排行榜…）也自动认了 —— 详见 adoptSharedBind 的说明
-      if (result.campIds?.length) adoptSharedBind(qq, result.campIds, result.campId)
-
-      return result.campId
-        ? { campId: result.campId, source: 'shared' }
-        : { campId: null, source: 'none' }
+      if (result.campIds?.length) adoptSharedBind(qq, result.campIds, result.campId);
+      return result.campId ? {
+        campId: result.campId,
+        source: 'shared'
+      } : {
+        campId: null,
+        source: 'none'
+      };
     } catch (error) {
-      recordFailure(error?.shareAuthFailed ? 'auth' : 'network')
-      warnOnce(
-        `read:${error?.shareAuthFailed ? 'auth' : 'net'}`,
-        `[营地共享] 查询失败：${error?.message || error}`
-      )
-      return fallback(cached, error?.shareAuthFailed ? 'auth' : 'network')
+      recordFailure(error?.shareAuthFailed ? 'auth' : 'network');
+      warnOnce(`read:${error?.shareAuthFailed ? 'auth' : 'net'}`, `[营地共享] 查询失败：${error?.message || error}`);
+      return fallback(cached, error?.shareAuthFailed ? 'auth' : 'network');
     } finally {
-      inflight.delete(qq)
+      inflight.delete(qq);
     }
-  })()
-
-  inflight.set(qq, task)
-  return task
+  })();
+  inflight.set(qq, task);
+  return task;
 }
 
 /**
@@ -728,9 +932,16 @@ async function resolveCurrentIdInner (userId, { share = true } = {}) {
  * 缓存里有过期的正值也照用（stale-while-error）——旧数据总比让用户白跑一趟强，
  * 而且这个值本来就是「别人上次共享的地址」，不会因为服务端挂了就变得有害。
  */
-function fallback (cached, reason) {
-  if (cached?.campId) return { campId: cached.campId, source: 'cache' }
-  return { campId: null, source: 'degraded', reason }
+function fallback(cached, reason) {
+  if (cached?.campId) return {
+    campId: cached.campId,
+    source: 'cache'
+  };
+  return {
+    campId: null,
+    source: 'degraded',
+    reason
+  };
 }
 
 /* --------------------------------------------------------------- 上传与撤销 */
@@ -743,21 +954,27 @@ function fallback (cached, reason) {
  *
  * @returns {Promise<{ok: boolean, message?: string, count?: number}>}
  */
-export async function pushBind (userId, campIds, currentCampId = '') {
-  const qq = String(userId ?? '').trim()
-  const ids = Array.isArray(campIds) ? campIds.map(String).filter(Boolean) : []
-
-  if (!qq) return { ok: false, message: '缺少 QQ 号' }
-  if (!ids.length) return { ok: true, count: 0 }
-
-  const cfg = readShareConfig()
+export async function pushBind(userId, campIds, currentCampId = '') {
+  const qq = String(userId ?? '').trim();
+  const ids = Array.isArray(campIds) ? campIds.map(String).filter(Boolean) : [];
+  if (!qq) return {
+    ok: false,
+    message: '缺少 QQ 号'
+  };
+  if (!ids.length) return {
+    ok: true,
+    count: 0
+  };
+  const cfg = readShareConfig();
   if (!cfg.enabled || !cfg.apiUrl || !cfg.token) {
-    return { ok: false, message: '还没接入共享库' }
+    return {
+      ok: false,
+      message: '还没接入共享库'
+    };
   }
 
   // 上传失败了缓存里那份旧的共享值就不该再留着
-  invalidateShareCache(qq)
-
+  invalidateShareCache(qq);
   try {
     const response = await fetch(`${cfg.apiUrl}/api/v1/bind`, {
       method: 'PUT',
@@ -768,19 +985,158 @@ export async function pushBind (userId, campIds, currentCampId = '') {
         current: ids.includes(String(currentCampId)) ? String(currentCampId) : ids[0]
       }),
       signal: AbortSignal.timeout(WRITE_TIMEOUT_MS)
-    })
-
+    });
     if (response.status === 401 || response.status === 403) {
-      return { ok: false, message: '共享库拒绝了这次请求，检查一下令牌' }
+      return {
+        ok: false,
+        message: '共享库拒绝了这次请求，检查一下令牌'
+      };
     }
     if (!response.ok) {
-      return { ok: false, message: `共享库返回 ${response.status}` }
+      return {
+        ok: false,
+        message: `共享库返回 ${response.status}`
+      };
+    }
+    return {
+      ok: true,
+      count: ids.length
+    };
+  } catch (error) {
+    warnOnce('push', `[营地共享] 上传失败：${error?.message || error}`);
+    return {
+      ok: false,
+      message: '连不上共享库'
+    };
+  }
+}
+
+/**
+ * 机器人级批量上报：把本机 `UserData.yaml` 里**自己绑的**整表传到共享库。
+ *
+ * 跟 `pushBind` 的区别：
+ *   · `pushBind` 是用户手动 `#开启营地ID共享` 时传单个 QQ；
+ *   · 这里是机器人主人级别的一次性全量上报，目的是让 `#排位总排名` /
+ *     `#巅峰总排名` 能合并所有接入机器人的用户，而不是只合并开了共享的那几个。
+ *
+ * **必须排除 `fromShare: true` 的条目**：那些是从共享库借到本机的别人的号，
+ * 再传回去会把「借来的」洗成「本机绑的」，污染来源、也会让撤销失效。
+ *
+ * 10 分钟节流 + 并发合并：排位榜连发不会反复打接口，也不占 write 配额。
+ *
+ * @param {boolean} [force] 跳过节流（测试/手动同步用）
+ * @returns {Promise<{ok: boolean, count?: number, skipped?: boolean, message?: string}>}
+ */
+const ROSTER_UPLOAD_MIN_GAP_MS = 10 * 60 * 1000;
+const rosterUploadState = (() => {
+  const key = '__gokRosterUploadState';
+  if (!globalThis[key]) globalThis[key] = {
+    at: 0,
+    running: null,
+    lastCount: 0
+  };
+  return globalThis[key];
+})();
+export async function uploadLocalBindings(force = false) {
+  const cfg = readShareConfig();
+  if (!cfg.enabled || !cfg.apiUrl || !cfg.token) {
+    return {
+      ok: false,
+      message: '还没接入共享库'
+    };
+  }
+  if (!force && Date.now() - rosterUploadState.at < ROSTER_UPLOAD_MIN_GAP_MS) {
+    return {
+      ok: true,
+      skipped: true,
+      count: rosterUploadState.lastCount
+    };
+  }
+  if (rosterUploadState.running) return rosterUploadState.running;
+  const task = (async () => {
+    const data = readUserData();
+    const binds = [];
+    for (const [qq, entry] of Object.entries(data || {})) {
+      if (!entry || entry.fromShare === true) continue;
+      if (!Array.isArray(entry.ids) || !entry.ids.length) continue;
+      if (!/^\d{5,12}$/.test(String(qq))) continue;
+      const ids = entry.ids.map(String).filter(id => /^\d{5,12}$/.test(id));
+      if (!ids.length) continue;
+
+      // 服务端单个 QQ 上限 20 个营地ID；超过就截前 20，别让一个人把整批顶掉
+      if (ids.length > 20) {
+        warnOnce(`roster-limit:${qq}`, `[营地共享] ${qq} 绑定超过 20 个营地ID，只上报前 20 个`);
+      }
+      const index = Number(entry.current) || 0;
+      const campIds = ids.slice(0, 20);
+      binds.push({
+        qq: String(qq),
+        campIds,
+        current: campIds.includes(ids[index]) ? ids[index] : campIds[0]
+      });
+    }
+    if (!binds.length) {
+      rosterUploadState.at = Date.now();
+      rosterUploadState.lastCount = 0;
+      return {
+        ok: true,
+        count: 0
+      };
     }
 
-    return { ok: true, count: ids.length }
-  } catch (error) {
-    warnOnce('push', `[营地共享] 上传失败：${error?.message || error}`)
-    return { ok: false, message: '连不上共享库' }
+    // 请求体上限 64KB、接口单次上限 500 条；按 100 条分片，第一片带 replace 做全量快照，
+    // 后续分片追加。这样本机解绑/删号后，库里不会一直留着旧营地ID。
+    const CHUNK = 100;
+    let entries = 0;
+    let count = 0;
+    try {
+      for (let offset = 0; offset < binds.length; offset += CHUNK) {
+        const chunk = binds.slice(offset, offset + CHUNK);
+        const response = await fetch(`${cfg.apiUrl}/api/v1/binds`, {
+          method: 'PUT',
+          headers: shareHeaders(cfg.token),
+          body: JSON.stringify({
+            binds: chunk,
+            replace: offset === 0
+          }),
+          signal: AbortSignal.timeout(10 * 1000)
+        });
+        if (response.status === 401 || response.status === 403) {
+          return {
+            ok: false,
+            message: '共享库拒绝了批量上报，检查一下令牌'
+          };
+        }
+        if (!response.ok) {
+          return {
+            ok: false,
+            message: `共享库返回 ${response.status}`
+          };
+        }
+        const payload = await response.json().catch(() => ({}));
+        entries += Number(payload.entries) || chunk.length;
+        count += Number(payload.count) || chunk.reduce((n, item) => n + item.campIds.length, 0);
+      }
+      rosterUploadState.at = Date.now();
+      rosterUploadState.lastCount = binds.length;
+      return {
+        ok: true,
+        count,
+        entries
+      };
+    } catch (error) {
+      warnOnce('rosterUpload', `[营地共享] 批量上报失败：${error?.message || error}`);
+      return {
+        ok: false,
+        message: '连不上共享库'
+      };
+    }
+  })();
+  rosterUploadState.running = task;
+  try {
+    return await task;
+  } finally {
+    rosterUploadState.running = null;
   }
 }
 
@@ -790,36 +1146,50 @@ export async function pushBind (userId, campIds, currentCampId = '') {
  *
  * @returns {Promise<{ok: boolean, message?: string}>}
  */
-export async function revokeBind (userId) {
-  const qq = String(userId ?? '').trim()
-  if (!qq) return { ok: false, message: '缺少 QQ 号' }
-
-  const cfg = readShareConfig()
+export async function revokeBind(userId) {
+  const qq = String(userId ?? '').trim();
+  if (!qq) return {
+    ok: false,
+    message: '缺少 QQ 号'
+  };
+  const cfg = readShareConfig();
   if (!cfg.enabled || !cfg.apiUrl || !cfg.token) {
-    return { ok: false, message: '还没接入共享库' }
+    return {
+      ok: false,
+      message: '还没接入共享库'
+    };
   }
-
-  invalidateShareCache(qq)
-
+  invalidateShareCache(qq);
   try {
     const response = await fetch(`${cfg.apiUrl}/api/v1/bind`, {
       method: 'DELETE',
       headers: shareHeaders(cfg.token),
-      body: JSON.stringify({ qq }),
+      body: JSON.stringify({
+        qq
+      }),
       signal: AbortSignal.timeout(WRITE_TIMEOUT_MS)
-    })
-
+    });
     if (response.status === 401 || response.status === 403) {
-      return { ok: false, message: '共享库拒绝了这次请求，检查一下令牌' }
+      return {
+        ok: false,
+        message: '共享库拒绝了这次请求，检查一下令牌'
+      };
     }
     if (!response.ok) {
-      return { ok: false, message: `共享库返回 ${response.status}` }
+      return {
+        ok: false,
+        message: `共享库返回 ${response.status}`
+      };
     }
-
-    return { ok: true }
+    return {
+      ok: true
+    };
   } catch (error) {
-    warnOnce('revoke', `[营地共享] 撤销失败：${error?.message || error}`)
-    return { ok: false, message: '连不上共享库' }
+    warnOnce('revoke', `[营地共享] 撤销失败：${error?.message || error}`);
+    return {
+      ok: false,
+      message: '连不上共享库'
+    };
   }
 }
 
@@ -831,27 +1201,50 @@ export async function revokeBind (userId) {
  *
  * @returns {Promise<{ok: boolean, message: string}>}
  */
-export async function probeShare (cfg = readShareConfig()) {
-  if (!cfg.apiUrl) return { ok: false, message: '还没填共享库地址' }
-  if (!cfg.token) return { ok: false, message: '还没填共享库令牌' }
-
+export async function probeShare(cfg = readShareConfig()) {
+  if (!cfg.apiUrl) return {
+    ok: false,
+    message: '还没填共享库地址'
+  };
+  if (!cfg.token) return {
+    ok: false,
+    message: '还没填共享库令牌'
+  };
   try {
     const response = await fetch(`${cfg.apiUrl}/api/v1/bind/query`, {
       method: 'POST',
       headers: shareHeaders(cfg.token),
-      body: JSON.stringify({ qq: '10000000000' }),
+      body: JSON.stringify({
+        qq: '10000000000'
+      }),
       signal: AbortSignal.timeout(WRITE_TIMEOUT_MS)
-    })
-
-    if (response.status === 404) return { ok: true, message: '连接正常，令牌有效' }
-    if (response.status === 401) return { ok: false, message: '令牌无效，找共享库主人要一个新的' }
-    if (response.status === 403) return { ok: false, message: '令牌已被吊销' }
-    if (response.status === 429) return { ok: true, message: '连接正常（当前被限流，稍后会自动恢复）' }
-
-    return { ok: false, message: `共享库返回了 ${response.status}` }
+    });
+    if (response.status === 404) return {
+      ok: true,
+      message: '连接正常，令牌有效'
+    };
+    if (response.status === 401) return {
+      ok: false,
+      message: '令牌无效，找共享库主人要一个新的'
+    };
+    if (response.status === 403) return {
+      ok: false,
+      message: '令牌已被吊销'
+    };
+    if (response.status === 429) return {
+      ok: true,
+      message: '连接正常（当前被限流，稍后会自动恢复）'
+    };
+    return {
+      ok: false,
+      message: `共享库返回了 ${response.status}`
+    };
   } catch (error) {
-    warnOnce('probe', `[营地共享] 试连失败：${error?.message || error}`)
-    return { ok: false, message: '连不上，检查地址和网络' }
+    warnOnce('probe', `[营地共享] 试连失败：${error?.message || error}`);
+    return {
+      ok: false,
+      message: '连不上，检查地址和网络'
+    };
   }
 }
 
@@ -863,74 +1256,194 @@ export async function probeShare (cfg = readShareConfig()) {
  *
  * @returns {Promise<{found: boolean, campIds?: string[], current?: string, updatedAt?: number, error?: string}>}
  */
-export async function querySharedBind (userId) {
-  const qq = String(userId ?? '').trim()
-  if (!qq) return { found: false, error: '缺少 QQ 号' }
-
-  const cfg = readShareConfig()
+export async function querySharedBind(userId) {
+  const qq = String(userId ?? '').trim();
+  if (!qq) return {
+    found: false,
+    error: '缺少 QQ 号'
+  };
+  const cfg = readShareConfig();
   if (!cfg.enabled || !cfg.apiUrl || !cfg.token) {
-    return { found: false, error: '这台还没接入共享库' }
+    return {
+      found: false,
+      error: '这台还没接入共享库'
+    };
   }
-
   try {
     const response = await fetch(`${cfg.apiUrl}/api/v1/bind/query`, {
       method: 'POST',
       headers: shareHeaders(cfg.token),
-      body: JSON.stringify({ qq }),
+      body: JSON.stringify({
+        qq
+      }),
       signal: AbortSignal.timeout(READ_TIMEOUT_MS)
-    })
-
-    if (response.status === 404) return { found: false }
-    if (response.status === 401) return { found: false, error: '令牌无效' }
-    if (response.status === 403) return { found: false, error: '令牌已被吊销' }
-    if (!response.ok) return { found: false, error: `共享库返回 ${response.status}` }
-
-    const data = await response.json()
+    });
+    if (response.status === 404) return {
+      found: false
+    };
+    if (response.status === 401) return {
+      found: false,
+      error: '令牌无效'
+    };
+    if (response.status === 403) return {
+      found: false,
+      error: '令牌已被吊销'
+    };
+    if (!response.ok) return {
+      found: false,
+      error: `共享库返回 ${response.status}`
+    };
+    const data = await response.json();
     return {
       found: true,
       campIds: Array.isArray(data?.campIds) ? data.campIds.map(String) : [],
       current: String(data?.current || ''),
       updatedAt: Number(data?.updatedAt) || 0
-    }
+    };
   } catch (error) {
-    warnOnce('lookup', `[营地共享] 查询失败：${error?.message || error}`)
-    return { found: false, error: '连不上共享库' }
+    warnOnce('lookup', `[营地共享] 查询失败：${error?.message || error}`);
+    return {
+      found: false,
+      error: '连不上共享库'
+    };
+  }
+}
+
+/**
+ * 拉共享库里**所有**出现过的营地ID（管理面只读接口）。
+ *
+ * 排行榜专用：各机器人本地只知道自己绑过的人，靠 QQ 逐个问永远补不全 ——
+ * 别的机器人独有的用户，本机根本没出现过那个 QQ，问不到。
+ * 这个接口直接回全库并集，客户端再逐个拉营地资料。
+ *
+ * 鉴权用**普通令牌**（`distToken`）：名单里没有 QQ、没有来源 client，是全库共享的公共数据。
+ * 老的 `shareAdminSecret` 只在服务端不支持新接口时作退路，不再是必需项。
+ * 故意不抛异常：共享库挂了只能是「这次没补到人」，不能是排行榜用不了。
+ *
+ * @returns {Promise<{ok: boolean, campIds: string[], total?: number, error?: string}>}
+ */
+export async function fetchSharedRoster() {
+  const cfg = readShareConfig();
+  if (!cfg.enabled || !cfg.apiUrl || !cfg.token) {
+    return {
+      ok: false,
+      campIds: [],
+      error: '还没接入共享库'
+    };
+  }
+  const now = Date.now();
+  if (rosterCache.campIds.length && now - rosterCache.at < ROSTER_TTL_MS) {
+    return {
+      ok: true,
+      campIds: rosterCache.campIds,
+      total: rosterCache.campIds.length
+    };
+  }
+  try {
+    // ⚠️⚠️ 全库名单是**公共数据**，必须走普通令牌接口（`GET /api/v1/roster`）。
+    //    原先只认 `GET /api/v1/admin/roster` + 管理密钥，结果是「只有配了密钥的那一台
+    //    能拉全库」——别人机器人的总排名只能退回按本机 QQ 逐个问，永远只有自己那点人。
+    //    管理密钥能签令牌/吊销/删库，不可能发给每个接入方，所以这个口子必须开在令牌上。
+    //    老服务端没有新接口（404）：配了密钥就退回 admin 接口，只是向后兼容的退路。
+    let response = await fetch(`${cfg.apiUrl}/api/v1/roster`, {
+      method: 'GET',
+      headers: shareHeaders(cfg.token),
+      signal: AbortSignal.timeout(ROSTER_TIMEOUT_MS)
+    });
+    if (response.status === 404 && cfg.adminSecret) {
+      response = await fetch(`${cfg.apiUrl}/api/v1/admin/roster`, {
+        method: 'GET',
+        headers: {
+          'X-Admin-Secret': cfg.adminSecret
+        },
+        signal: AbortSignal.timeout(ROSTER_TIMEOUT_MS)
+      });
+    }
+
+    // 老服务端没这个接口：静默退回按 QQ 查，不打扰用户
+    if (response.status === 404) return {
+      ok: false,
+      campIds: [],
+      error: '服务端版本旧'
+    };
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        campIds: [],
+        error: '令牌无效或已吊销'
+      };
+    }
+    if (!response.ok) return {
+      ok: false,
+      campIds: [],
+      error: `共享库返回 ${response.status}`
+    };
+    const data = await response.json();
+    const campIds = Array.isArray(data?.campIds) ? data.campIds.map(String).filter(Boolean) : [];
+    rosterCache = {
+      at: now,
+      campIds
+    };
+    return {
+      ok: true,
+      campIds,
+      total: Number(data?.total) || campIds.length
+    };
+  } catch (error) {
+    warnOnce('roster', `[营地共享] 拉全库营地ID失败：${error?.message || error}`);
+    return {
+      ok: false,
+      campIds: [],
+      error: '连不上共享库'
+    };
   }
 }
 
 /* --------------------------------------------------------------- 状态 */
 
 /** 给 `#营地ID共享状态` 和 `#营地共享库` 用的运行时状态 */
-export function getShareStatus () {
-  loadDiskCache()
-
-  const now = Date.now()
-  let cached = 0
+export function getShareStatus() {
+  loadDiskCache();
+  const now = Date.now();
+  let cached = 0;
   for (const entry of memoryCache.values()) {
-    if (entry.until > now) cached += 1
+    if (entry.until > now) cached += 1;
   }
-
   return {
     cachedCount: cached,
     circuitOpen: circuitOpen(),
     circuitUntil: circuit.openUntil,
     consecutiveFailures: circuit.failures,
     inflight: inflight.size
-  }
+  };
 }
 
 /** 某个 QQ 的缓存元信息，用来解释「撤销为什么在别的机器人上还没生效」 */
-export function getCacheInfo (userId) {
-  const qq = String(userId ?? '').trim()
-  if (!qq) return null
-
-  const entry = readMemory(qq)
-  if (!entry) return null
-
+export function getCacheInfo(userId) {
+  const qq = String(userId ?? '').trim();
+  if (!qq) return null;
+  const entry = readMemory(qq);
+  if (!entry) return null;
   return {
     campId: entry.campId,
     fetchedAt: entry.fetchedAt,
     expireAt: entry.until,
     expired: entry.until <= Date.now()
-  }
+  };
+}
+
+// 进了共享库的机器人要主动上报全量营地ID：启动 15 秒后一次，之后每小时一次。
+// 挂在 shareStore 而不是某个 app 上：只要插件用到共享库就会加载本模块，
+// 不依赖有没有人发排位/英雄指令。globalThis 标记防热重载重复起定时器，
+// unref 不拖住进程退出；上传本身有 10 分钟节流。
+const ROSTER_REPORT_INTERVAL_MS = 60 * 60 * 1000;
+if (!globalThis.__gokRosterReportStarted) {
+  globalThis.__gokRosterReportStarted = true;
+  const report = () => {
+    uploadLocalBindings().catch(() => {});
+  };
+  const first = setTimeout(report, 15000);
+  first.unref?.();
+  const timer = setInterval(report, ROSTER_REPORT_INTERVAL_MS);
+  timer.unref?.();
 }

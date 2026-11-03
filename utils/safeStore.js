@@ -1,3 +1,4 @@
+import { logger } from "node-karin";
 /**
  * 落盘的两条保命规则：原子写 + 坏文件隔离。零外部依赖，可脱机单测。
  *
@@ -29,16 +30,18 @@
  * 所以解析失败时要做三件事：把坏文件挪走留证、打 error 日志、让下次写从干净状态开始。
  * 挪走而不是删掉——用户的订阅/绑定是攒出来的资产，手工还能从 `.corrupt-*` 里捞回来。
  */
-import fs from 'node:fs'
-import path from 'node:path'
+import fs from 'node:fs';
+import path from 'node:path';
 
 /** 同一个文件最多留几份坏文件快照。反复损坏时不至于把 data/ 塞满 */
-const MAX_CORRUPT_COPIES = 3
+const MAX_CORRUPT_COPIES = 3;
 
 /** 目录不存在就建出来。rename 的目标目录必须存在 */
-function ensureDir (filePath) {
-  const dir = path.dirname(filePath)
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+function ensureDir(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, {
+    recursive: true
+  });
 }
 
 /**
@@ -48,17 +51,18 @@ function ensureDir (filePath) {
  * @param {string} content 要写入的完整内容
  * @throws 写盘失败时原样抛出，调用方决定是重试还是降级（临时文件已清掉）
  */
-export function writeFileAtomic (filePath, content) {
-  ensureDir(filePath)
-
-  const tmpFile = `${filePath}.${process.pid}.tmp`
+export function writeFileAtomic(filePath, content) {
+  ensureDir(filePath);
+  const tmpFile = `${filePath}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(tmpFile, content, 'utf8')
-    fs.renameSync(tmpFile, filePath)
+    fs.writeFileSync(tmpFile, content, 'utf8');
+    fs.renameSync(tmpFile, filePath);
   } catch (error) {
     // 失败要把临时文件清掉，否则 data/ 下会攒一堆 .tmp
-    try { fs.unlinkSync(tmpFile) } catch {}
-    throw error
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
+    throw error;
   }
 }
 
@@ -67,11 +71,9 @@ export function writeFileAtomic (filePath, content) {
  * 带上毫秒是必要的：同一秒内连续隔离两次（比如轮询和指令同时读到坏文件）
  * 如果只到秒，第二份会 rename 覆盖掉第一份，把证据弄丢。
  */
-function stamp (now = new Date()) {
-  const p = n => String(n).padStart(2, '0')
-  return `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}` +
-    `-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}` +
-    `-${String(now.getMilliseconds()).padStart(3, '0')}`
+function stamp(now = new Date()) {
+  const p = n => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}` + `-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}` + `-${String(now.getMilliseconds()).padStart(3, '0')}`;
 }
 
 /**
@@ -79,29 +81,26 @@ function stamp (now = new Date()) {
  * 时间戳到毫秒已经够散，但撞上了就必须让路——rename 到已存在的名字是静默覆盖，
  * 那等于把上一份证据弄丢了，而留证是这个函数存在的全部意义。
  */
-function pickBackupPath (filePath) {
-  const base = `${filePath}.corrupt-${stamp()}`
-  if (!fs.existsSync(base)) return base
-
+function pickBackupPath(filePath) {
+  const base = `${filePath}.corrupt-${stamp()}`;
+  if (!fs.existsSync(base)) return base;
   for (let i = 2; i < 100; i++) {
-    const candidate = `${base}-${i}`
-    if (!fs.existsSync(candidate)) return candidate
+    const candidate = `${base}-${i}`;
+    if (!fs.existsSync(candidate)) return candidate;
   }
-  return `${base}-${process.hrtime.bigint()}`
+  return `${base}-${process.hrtime.bigint()}`;
 }
 
 /** 只留最近 MAX_CORRUPT_COPIES 份坏文件快照 */
-function pruneCorruptCopies (filePath) {
-  const dir = path.dirname(filePath)
-  const prefix = `${path.basename(filePath)}.corrupt-`
-
+function pruneCorruptCopies(filePath) {
+  const dir = path.dirname(filePath);
+  const prefix = `${path.basename(filePath)}.corrupt-`;
   try {
-    const olds = fs.readdirSync(dir)
-      .filter(name => name.startsWith(prefix))
-      .sort()
-      .slice(0, -MAX_CORRUPT_COPIES)
+    const olds = fs.readdirSync(dir).filter(name => name.startsWith(prefix)).sort().slice(0, -MAX_CORRUPT_COPIES);
     for (const name of olds) {
-      try { fs.unlinkSync(path.join(dir, name)) } catch {}
+      try {
+        fs.unlinkSync(path.join(dir, name));
+      } catch {}
     }
   } catch {}
 }
@@ -117,36 +116,29 @@ function pruneCorruptCopies (filePath) {
  * @param {string} [tag] 日志前缀，例如 `[王者推送]`
  * @returns {string} 隔离后的路径；文件不存在或挪不动时返回空串
  */
-export function quarantineCorrupt (filePath, error, tag = '[王者插件]') {
+export function quarantineCorrupt(filePath, error, tag = '[王者插件]') {
   try {
-    if (!filePath || !fs.existsSync(filePath)) return ''
+    if (!filePath || !fs.existsSync(filePath)) return '';
 
     // 空文件不值得留证：它多半就是上一次写盘被打断的残留，留一堆 0 字节快照没意义，
     // 但日志还是要打——「文件是空的」和「文件没坏」对排查是两件事
-    const empty = fs.statSync(filePath).size === 0
-    const reason = error?.message || String(error || '解析失败')
-
+    const empty = fs.statSync(filePath).size === 0;
+    const reason = error?.message || String(error || '解析失败');
     if (empty) {
-      fs.unlinkSync(filePath)
-      logger?.error?.(`${tag} ${path.basename(filePath)} 是空文件（可能上次写盘被打断），已删除并按空数据继续`)
-      return ''
+      fs.unlinkSync(filePath);
+      logger?.error?.(`${tag} ${path.basename(filePath)} 是空文件（可能上次写盘被打断），已删除并按空数据继续`);
+      return '';
     }
-
-    const backup = pickBackupPath(filePath)
-    fs.renameSync(filePath, backup)
-    pruneCorruptCopies(filePath)
-
-    logger?.error?.(
-      `${tag} ${path.basename(filePath)} 解析失败（${reason}），` +
-      `已隔离到 ${path.basename(backup)} 并按空数据继续。` +
-      '里面的数据可以手工捞回来，别直接删'
-    )
-    return backup
+    const backup = pickBackupPath(filePath);
+    fs.renameSync(filePath, backup);
+    pruneCorruptCopies(filePath);
+    logger?.error?.(`${tag} ${path.basename(filePath)} 解析失败（${reason}），` + `已隔离到 ${path.basename(backup)} 并按空数据继续。` + '里面的数据可以手工捞回来，别直接删');
+    return backup;
   } catch (err) {
     // 连挪都挪不动（权限/文件系统问题），那就只留一行日志
     try {
-      logger?.error?.(`${tag} 隔离损坏文件 ${filePath} 失败: ${err.message}`)
+      logger?.error?.(`${tag} 隔离损坏文件 ${filePath} 失败: ${err.message}`);
     } catch {}
-    return ''
+    return '';
   }
 }

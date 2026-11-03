@@ -11,67 +11,82 @@
  *
  * 用户不发指令开启就永远不上传。这是上传个人信息的功能，默认必须是关的。
  */
-import path from 'node:path'
-import { PluginData } from '#components'
-import { readYamlFile, writeYamlFile } from './yamlUtils.js'
-import { getBoundIds, getCurrentId } from './localBind.js'
-import { pushBind, revokeBind, isShareReady, isKnownShared, dropAdoptedBind } from './shareStore.js'
-
-const USERS_FILE = path.join(PluginData, 'share', 'users.yaml')
-const USERS_SCHEMA = 1
-
-function normalize (userId) {
-  return String(userId ?? '').trim()
+import path from 'node:path';
+import { PluginData } from '#components';
+import { readYamlFile, writeYamlFile } from './yamlUtils.js';
+import { getBoundIds, getCurrentId } from './localBind.js';
+import { pushBind, revokeBind, isShareReady, isKnownShared, dropAdoptedBind, forgetKnownShared } from './shareStore.js';
+const USERS_FILE = path.join(PluginData, 'share', 'users.yaml');
+const USERS_SCHEMA = 1;
+function normalize(userId) {
+  return String(userId ?? '').trim();
 }
 
 /**
  * 读某个用户的共享开关。
  * @returns {{enabled: boolean, campIds: string[], updatedAt: number}}
  */
-export function getUserShareState (userId) {
-  const qq = normalize(userId)
-  if (!qq) return { enabled: false, campIds: [], updatedAt: 0 }
-
+export function getUserShareState(userId) {
+  const qq = normalize(userId);
+  if (!qq) return {
+    enabled: false,
+    campIds: [],
+    updatedAt: 0
+  };
   try {
-    const data = readYamlFile(USERS_FILE) || {}
-    if (data.schema !== USERS_SCHEMA) return { enabled: false, campIds: [], updatedAt: 0 }
-
-    const entry = data.users?.[qq]
+    const data = readYamlFile(USERS_FILE) || {};
+    if (data.schema !== USERS_SCHEMA) return {
+      enabled: false,
+      campIds: [],
+      updatedAt: 0
+    };
+    const entry = data.users?.[qq];
     return {
       enabled: entry?.enabled === true,
+      // ⚠️ 这个字段目前是**只写不读**的（2026-10-06 审计结论，暂不改动）：
+      //    写它的地方有三处（:101 开共享、:160 同步成功、setUserShareState），
+      //    读它的只有本函数，而 `getUserShareState(...).campIds` 在全插件**没有消费方**
+      //    （`isUserSharing` 只取 `.enabled`）。
+      //    保留是有道理的：它是「上次上传的是哪几个号」的留档，排查时有用；
+      //    删掉会让 users.yaml 少一列、也不影响任何行为。留着不动。
       campIds: Array.isArray(entry?.campIds) ? entry.campIds.map(String) : [],
       updatedAt: Number(entry?.updatedAt) || 0
-    }
+    };
   } catch {
-    return { enabled: false, campIds: [], updatedAt: 0 }
+    return {
+      enabled: false,
+      campIds: [],
+      updatedAt: 0
+    };
   }
 }
-
-export function isUserSharing (userId) {
-  return getUserShareState(userId).enabled
+export function isUserSharing(userId) {
+  return getUserShareState(userId).enabled;
 }
-
-function setUserShareState (userId, { enabled, campIds = [] }) {
-  const qq = normalize(userId)
-  if (!qq) return
-
-  let data
+function setUserShareState(userId, {
+  enabled,
+  campIds = []
+}) {
+  const qq = normalize(userId);
+  if (!qq) return;
+  let data;
   try {
-    data = readYamlFile(USERS_FILE) || {}
+    data = readYamlFile(USERS_FILE) || {};
   } catch {
-    data = {}
+    data = {};
   }
   if (data.schema !== USERS_SCHEMA || typeof data.users !== 'object' || !data.users) {
-    data = { schema: USERS_SCHEMA, users: {} }
+    data = {
+      schema: USERS_SCHEMA,
+      users: {}
+    };
   }
-
   data.users[qq] = {
     enabled: Boolean(enabled),
     campIds: campIds.map(String),
     updatedAt: Date.now()
-  }
-
-  writeYamlFile(USERS_FILE, data)
+  };
+  writeYamlFile(USERS_FILE, data);
 }
 
 /**
@@ -82,24 +97,35 @@ function setUserShareState (userId, { enabled, campIds = [] }) {
  *
  * @returns {Promise<{ok: boolean, message?: string, count?: number}>}
  */
-export async function enableSharing (userId) {
-  const qq = normalize(userId)
-  if (!qq) return { ok: false, message: '缺少 QQ 号' }
-
+export async function enableSharing(userId) {
+  const qq = normalize(userId);
+  if (!qq) return {
+    ok: false,
+    message: '缺少 QQ 号'
+  };
   if (!isShareReady()) {
-    return { ok: false, message: '本机器人还没接入营地ID共享库。进群 972915804 找主人要地址和令牌' }
+    return {
+      ok: false,
+      message: '本机器人还没接入营地ID共享库。进群 972915804 找主人要地址和令牌'
+    };
   }
-
-  const ids = getBoundIds(qq)
+  const ids = getBoundIds(qq);
   if (!ids.length) {
-    return { ok: false, message: '你还没有绑定营地ID，先发 #绑定营地 [营地ID]' }
+    return {
+      ok: false,
+      message: '你还没有绑定营地ID，先发 #绑定营地 [营地ID]'
+    };
   }
-
-  const result = await pushBind(qq, ids, getCurrentId(qq) || '')
-  if (!result.ok) return result
-
-  setUserShareState(qq, { enabled: true, campIds: ids })
-  return { ok: true, count: ids.length }
+  const result = await pushBind(qq, ids, getCurrentId(qq) || '');
+  if (!result.ok) return result;
+  setUserShareState(qq, {
+    enabled: true,
+    campIds: ids
+  });
+  return {
+    ok: true,
+    count: ids.length
+  };
 }
 
 /**
@@ -110,23 +136,40 @@ export async function enableSharing (userId) {
  *
  * @returns {Promise<{ok: boolean, message?: string}>}
  */
-export async function disableSharing (userId) {
-  const qq = normalize(userId)
-  if (!qq) return { ok: false, message: '缺少 QQ 号' }
-
+export async function disableSharing(userId) {
+  const qq = normalize(userId);
+  if (!qq) return {
+    ok: false,
+    message: '缺少 QQ 号'
+  };
   if (!isShareReady()) {
-    return { ok: false, message: '本机器人还没接入营地ID共享库。进群 972915804 找主人要地址和令牌' }
+    return {
+      ok: false,
+      message: '本机器人还没接入营地ID共享库。进群 972915804 找主人要地址和令牌'
+    };
   }
-
-  const result = await revokeBind(qq)
-  if (!result.ok) return result
+  const result = await revokeBind(qq);
+  if (!result.ok) return result;
 
   // 顺带把之前从库里落到本机的那份清掉 —— 用户都说不要共享了，
   // 本机还留着一份「来自共享库」的绑定说不过去
-  dropAdoptedBind(qq)
+  dropAdoptedBind(qq);
 
-  setUserShareState(qq, { enabled: false })
-  return { ok: true }
+  // ⚠️⚠️ **必须同时抹掉「他开过共享」这个本地镜像**（2026-10-06 修）。
+  //    上面 `syncUserBind` 的判据是「本机开关开着 **或** 库里有他的记录」，
+  //    而 `knownShared` 原先唯一的清理点在 shareStore 的网络分支（查询 404 才删），
+  //    `revokeBind` 走不到那儿。于是用户关了共享、`knownShared` 还是 true，
+  //    下次他绑一个号时第二个判据继续成立 → 绕过开关判断 → 重新 PUT 上传，
+  //    开关自己弹回 `enabled: true`。用户明确 opt-out 过，这绝不能复活。
+  //    实测：关闭后 knownShared 仍为 true，再发 `#绑定营地` 真的发出了
+  //    `PUT /api/v1/bind`，共享开关变回 true（期望 skipped=not-sharing、什么都不发）。
+  forgetKnownShared(qq);
+  setUserShareState(qq, {
+    enabled: false
+  });
+  return {
+    ok: true
+  };
 }
 
 /**
@@ -134,9 +177,12 @@ export async function disableSharing (userId) {
  *
  * @returns {Promise<{ok: boolean, skipped?: string, count?: number, message?: string}>}
  */
-export async function syncUserBind (userId) {
-  const qq = normalize(userId)
-  if (!qq) return { ok: true, skipped: 'no-user' }
+export async function syncUserBind(userId) {
+  const qq = normalize(userId);
+  if (!qq) return {
+    ok: true,
+    skipped: 'no-user'
+  };
 
   // 两个判据任一成立就同步：
   //  - 本机开关开着：用户在这台机器上明确开过
@@ -144,19 +190,28 @@ export async function syncUserBind (userId) {
   //    少了后一条，用户在 A 机器人上开的共享，B 机器人上新绑的号就永远传不上去 ——
   //    「我开了共享」是跨机器人的意愿，不该看在哪儿开的
   if (!getUserShareState(qq).enabled && !isKnownShared(qq)) {
-    return { ok: true, skipped: 'not-sharing' }
+    return {
+      ok: true,
+      skipped: 'not-sharing'
+    };
   }
-
-  if (!isShareReady()) return { ok: true, skipped: 'not-connected' }
-
-  const ids = getBoundIds(qq)
+  if (!isShareReady()) return {
+    ok: true,
+    skipped: 'not-connected'
+  };
+  const ids = getBoundIds(qq);
 
   // 本机一个号都不剩了：什么都不做。
   // **不要**在这里发 DELETE —— 那是「撤销共享」，会把别的实例贡献的记录一起删掉；
   // 而「我在本机删光了自己的绑定」和「我不想再共享了」是两件不同的事。
-  if (!ids.length) return { ok: true, skipped: 'no-local-bind' }
-
-  const result = await pushBind(qq, ids, getCurrentId(qq) || '')
-  if (result.ok) setUserShareState(qq, { enabled: true, campIds: ids })
-  return result
+  if (!ids.length) return {
+    ok: true,
+    skipped: 'no-local-bind'
+  };
+  const result = await pushBind(qq, ids, getCurrentId(qq) || '');
+  if (result.ok) setUserShareState(qq, {
+    enabled: true,
+    campIds: ids
+  });
+  return result;
 }

@@ -1,165 +1,197 @@
-import path from 'path'
-import puppeteer from '#puppeteer'
-import { getImgType, ApiService, readYamlFile, Button, parsePerfArgs, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils'
-import { PluginData, PluginPath } from '#components'
-import { privacyScope } from '../utils/seasonFallback.js'
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resourceUrl } from "../utils/message.js";
+import { Plugin, render, segment } from "node-karin";
+import path from 'path';
+import { getImgType, ApiService, readYamlFile, Button, parsePerfArgs, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
+import { privacyScope } from '../utils/seasonFallback.js';
+import { getNickMap, nickOf, withGroupNick } from '../utils/groupNick.js';
 
 // 默认一屏放几个赛季总结。营地那边是全部赛季无限滚动，这里默认按 3 个赛季控制图片长度，
 // 指令后可跟数量（#全部排位表现5）或 all（#全部排位表现all）覆盖
-const SEASON_LIMIT = 3
-const SEASON_LIMIT_MAX = 30
+const SEASON_LIMIT = 3;
+const SEASON_LIMIT_MAX = 30;
+
+// 巅峰赛**起始分**。接口给每个赛季都回一个 masterScore，没打过的赛季就是 1200 ——
+// 所以「masterScore > 0」不能用来判断「这个赛季打过巅峰赛」，必须用 > 1200。
+// 真实数据（402082480）：11 个「场次 0」的赛季里 10 个是 1200 的纯噪音，只有 S45 1254 是真的。
+const PEAK_BASE_SCORE = 1200;
 
 // 段位配色。roleJob 是段位 ID 不是等级（17=荣耀黄金IV 却比 16=最强王者 大），只能按段位名判断
-const JOB_COLORS = [
-  [/王者/, '#f5d76e'],
-  [/星耀/, '#c97bdb'],
-  [/钻石/, '#6ab0f5'],
-  [/铂金|白金/, '#57c98a'],
-  [/黄金/, '#f0932b'],
-  [/白银/, '#c3cddd'],
-  [/青铜/, '#b07d5a']
-]
-
-export class AllSeasonPerformance extends plugin {
+const JOB_COLORS = [[/王者/, '#f5d76e'], [/星耀/, '#c97bdb'], [/钻石/, '#6ab0f5'], [/铂金|白金/, '#57c98a'], [/黄金/, '#f0932b'], [/白银/, '#c3cddd'], [/青铜/, '#b07d5a']];
+export class AllSeasonPerformance extends Plugin {
   constructor() {
     super({
       name: '查询王者全部赛季表现',
-      dsc: '全部赛季的排位/巅峰历史数据',
+      desc: '全部赛季的排位/巅峰历史数据',
       event: 'message',
       priority: 1,
       rule: [
-        // #全部赛季表现 是改名前的旧触发词，与 #排位表现/#赛季表现 一起保留别名
-        { reg: `${AT_HEAD}#全部(?:排位|赛季)表现\\s*(.*)$`, fnc: 'allRank' },
-        { reg: `${AT_HEAD}#全部巅峰表现\\s*(.*)$`, fnc: 'allPeak' }
-      ]
-    })
+      // #全部赛季表现 是改名前的旧触发词，与 #排位表现/#赛季表现 一起保留别名
+      {
+        reg: `${AT_HEAD}#全部(?:排位|赛季)表现\\s*(.*)$`,
+        fnc: 'allRank'
+      }, {
+        reg: `${AT_HEAD}#全部巅峰表现\\s*(.*)$`,
+        fnc: 'allPeak'
+      }]
+    });
   }
-
   allRank(e) {
-    return this.render(e, '排位')
+    if (isBlockedEvent(e)) return true;
+    return this.render(e, '排位');
   }
-
   allPeak(e) {
-    return this.render(e, '巅峰')
+    if (isBlockedEvent(e)) return true;
+    return this.render(e, '巅峰');
   }
-
   async render(e, mode) {
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint)
-    const userData = await resolveUserData(userId)
-    const input = stripAtText(e.msg).replace(new RegExp(`^#全部${mode === '排位' ? '(?:排位|赛季)' : mode}表现\\s*`), '').trim()
-    const userInfo = userData[userId]
-    const args = parsePerfArgs(input)
-
-    const campId = args.campId || userInfo?.ids?.[userInfo.current ?? 0]
-
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint);
+    const userData = await resolveUserData(userId);
+    const input = stripAtText(e.msg).replace(new RegExp(`^#全部${mode === '排位' ? '(?:排位|赛季)' : mode}表现\\s*`), '').trim();
+    const userInfo = userData[userId];
+    const args = parsePerfArgs(input);
+    const campId = args.campId || userInfo?.ids?.[userInfo.current ?? 0];
     if (!campId) {
-      await e.reply([
-        segment.image(path.join(PluginPath, 'resources', 'img', '营地ID获取.png')),
-        Button.bind()
-      ], shouldQuote())
-      return
+      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+        reply: shouldQuote()
+      });
+      return;
     }
-
-    const scene = `全部${mode}表现查询异常`
-    let profileData
+    const scene = `全部${mode}表现查询异常`;
+    let profileData;
     try {
-      profileData = await ApiService.getProfile(campId, String(userId))
+      profileData = await ApiService.getProfile(campId, String(e.userId));
     } catch (err) {
-      await e.reply(ApiService.formatUserFacingError(err, { isMaster: Boolean(e.isMaster), scene }))
-      return
+      await e.reply(ApiService.formatUserFacingError(err, {
+        isMaster: Boolean(e.isMaster),
+        scene
+      }));
+      return;
     }
-
-    const roleId = profileData?.data?.targetRoleId
+    const roleId = profileData?.data?.targetRoleId;
     if (!roleId) {
       // 主页被隐藏时 profileData.data 是空的，别一律回「获取角色信息失败」——
       // 那会让人以为是插件坏了，其实对方只是关了主页
-      const hiddenScope = privacyScope(profileData?.returnCode)
-      await e.reply(hiddenScope
-        ? `对方隐藏了${hiddenScope}，全部${mode}表现查不到`
-        : '获取角色信息失败，请稍后再试')
-      return
+      const hiddenScope = privacyScope(profileData?.returnCode);
+      await e.reply(hiddenScope ? `对方隐藏了${hiddenScope}，全部${mode}表现查不到` : '获取角色信息失败，请稍后再试');
+      return;
     }
 
     // seasonId=0 时 headCard 是「全赛季」汇总（最高段位、最高巅峰分、王者印记数、总场次/胜率/分路偏好），
     // historyList 则带齐每个赛季的 rankInfo（排位）与 masterInfo（巅峰），一次请求就够，不用逐赛季拉。
-    let res
+    let res;
     try {
-      res = await ApiService.getSeasonpage(roleId, String(userId), 0)
+      res = await ApiService.getSeasonpage(roleId, String(e.userId), 0);
     } catch (err) {
-      await e.reply(ApiService.formatUserFacingError(err, { isMaster: Boolean(e.isMaster), scene }))
-      return
+      await e.reply(ApiService.formatUserFacingError(err, {
+        isMaster: Boolean(e.isMaster),
+        scene
+      }));
+      return;
     }
-
-    const data = res?.data
-    const history = data?.historyList
+    const data = res?.data;
+    const history = data?.historyList;
     if (!data || !history?.length) {
-      await e.reply('暂无赛季数据')
-      return
+      await e.reply('暂无赛季数据');
+      return;
     }
-
-    const currentSeasonId = history[0].seasonId
-    const all = history.map(s => this.buildSeason(s, mode, currentSeasonId)).filter(Boolean)
-    const played = all.filter(s => s.games > 0)
-
+    const currentSeasonId = history[0].seasonId;
+    const all = history.map(s => this.buildSeason(s, mode, currentSeasonId)).filter(Boolean);
+    // ⚠️⚠️ 巅峰模式的判据：`games > 0 || 真的有巅峰战绩`（2026-10-06 修，两轮才定下来）
+    //
+    //    【第一轮的错误结论，必须记下来】原先只看 `games > 0`，会把「有巅峰分、场次 0」
+    //    的赛季整条丢掉。当时想改成 `masterScore > 0`，但**那是错的** ——
+    //    `masterScore = 1200` 是**巅峰赛起始分**，接口给每个赛季都回一个 1200，
+    //    包括从没打过的赛季。放宽成 `> 0` 会把「没打过」的赛季全塞进图里（实测 3 个号
+    //    能多出 22 个这样的赛季，其中 20 个是 1200 的纯噪音），
+    //    用户会看到一堆「0 场 0 胜 1200 分」的空赛季 —— 那不是修复是倒退。
+    //
+    //    【真实数据给出的正确判据】1200 分 0 场的赛季，`heros` 是**空数组**、
+    //    `maxContinuousWinCnt` / `averageScore` / `goldCnt` 全是 0，原始字段就长这样：
+    //      { masterScore: 1200, totalCnt: 0, totalWinCnt: 0, maxContinuousWinCnt: 0,
+    //        winRate: 0, averageScore: 0, goldCnt: 0, silverCnt: 0, heros: [] }
+    //    而真正打过、只是 `totalCnt` 没回对的赛季（如 S45 1254 分）带着
+    //    `maxContinuousWinCnt: 2` 和 **2 个英雄**（含 winCnt/gameCnt/heroFightPower）。
+    //    所以「场次 0 但有分」里要**排除掉纯 1200 起始分**那批，用 `masterScore > 1200`
+    //    正好把它们滤掉（实测 402082480：11 个「有分无场次」里只有 S45 1254 是真的，
+    //    另外 10 个都是 1200）。
+    const played = all.filter(s => s.games > 0 || mode === '巅峰' && Number(s.masterScore) > PEAK_BASE_SCORE);
     if (!played.length) {
-      await e.reply(mode === '巅峰' ? '暂无巅峰赛数据（没打过或对方隐藏了）' : '暂无排位赛数据')
-      return
+      await e.reply(mode === '巅峰' ? '暂无巅峰赛数据（没打过或对方隐藏了）' : '暂无排位赛数据');
+      return;
     }
 
     // all 取全部，数字取最近 N 个（上限 30，防止图片过长），都没写按默认 3 个
-    const limit = args.all
-      ? played.length
-      : Math.min(Math.max(args.count || SEASON_LIMIT, 1), SEASON_LIMIT_MAX)
-    const seasons = played.slice(0, limit)
+    const limit = args.all ? played.length : Math.min(Math.max(args.count || SEASON_LIMIT, 1), SEASON_LIMIT_MAX);
+    const seasons = played.slice(0, limit);
     // 趋势图用全部有数据的赛季（从旧到新），只有总结卡片受 SEASON_LIMIT 限制
     const trend = played.slice().reverse().map(s => ({
       label: s.seasonName,
       value: mode === '巅峰' ? s.masterScore : s.star,
       tip: mode === '巅峰' ? String(s.masterScore) : `${s.shortJobName} ${s.rankingStar}星`
-    }))
+    }));
+    const hc = data.headCard || {};
+    // 群里发的图，游戏名后面补该群的群名片；私聊不加
+    let roleName = hc.roleName || '召唤师';
+    if (e.isGroup) {
+      const nickMap = await getNickMap(e.groupId, e.bot);
+      roleName = withGroupNick(roleName, nickOf(nickMap, userId));
+    }
+    const img = segment.image(resourceUrl("base64://" + (await render.render({
+      name: 'AllSeasonPerformance',
+      type: getImgType(),
+      file: path.join(ResourcePath, "html", "AllSeasonPerformance.html"),
+      data: {
+        mode,
+        modeLabel: mode === '巅峰' ? '巅峰赛' : '排位赛',
+        isPeak: mode === '巅峰',
+        roleName,
+        roleIcon: hc.roleIcon || '',
+        serverName: hc.serverName || hc.areaName || '王者荣耀',
+        topJob: hc.jobName ? `${hc.jobName}${hc.rankingStar ? ` ${hc.rankingStar}星` : ''}` : '—',
+        topMasterScore: hc.masterScore || '—',
+        wangzheCnt: hc.wangzheCnt || 0,
+        totalGameCnt: hc.gameCnt || 0,
+        totalWinRate: hc.winRate ? `${(hc.winRate * 100).toFixed(1)}%` : '—',
+        branch: hc.branch || '—',
+        seasonCnt: played.length,
+        shownCnt: seasons.length,
+        rangeText: seasons.length >= played.length ? `共 ${played.length} 个赛季有记录，已全部展示` : `共 ${played.length} 个赛季有记录，展示最近 ${seasons.length} 个`,
+        seasons,
+        trend,
+        trendJson: JSON.stringify(trend),
+        _res_path: ResourceUrl
+      },
+      pageGotoParams: {
+        waitUntil: "networkidle2",
+        timeout: 60000
+      }
+    }))));
 
-    const hc = data.headCard || {}
-    const img = await puppeteer.screenshot('AllSeasonPerformance', {
-      imgType: getImgType(),
-      tplFile: 'plugins/GloryOfKings-Plugin/resources/html/AllSeasonPerformance.html',
-      _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-      mode,
-      modeLabel: mode === '巅峰' ? '巅峰赛' : '排位赛',
-      isPeak: mode === '巅峰',
-      roleName: hc.roleName || '召唤师',
-      roleIcon: hc.roleIcon || '',
-      serverName: hc.serverName || hc.areaName || '王者荣耀',
-      topJob: hc.jobName ? `${hc.jobName}${hc.rankingStar ? ` ${hc.rankingStar}星` : ''}` : '—',
-      topMasterScore: hc.masterScore || '—',
-      wangzheCnt: hc.wangzheCnt || 0,
-      totalGameCnt: hc.gameCnt || 0,
-      totalWinRate: hc.winRate ? `${(hc.winRate * 100).toFixed(1)}%` : '—',
-      branch: hc.branch || '—',
-      seasonCnt: played.length,
-      shownCnt: seasons.length,
-      rangeText: seasons.length >= played.length
-        ? `共 ${played.length} 个赛季有记录，已全部展示`
-        : `共 ${played.length} 个赛季有记录，展示最近 ${seasons.length} 个`,
-      seasons,
-      trend,
-      trendJson: JSON.stringify(trend)
-    })
-
-    await e.reply([img, Button.allPerformance(campId, mode)], shouldQuote())
+    // ⚠️ screenshot 失败返回 false 而不抛错，不判空会把 false 当文本发进群（2026-10-06 修）
+    if (!img) return e.reply('全赛季表现出图失败，稍后再试', {
+      reply: shouldQuote()
+    });
+    await e.reply([img, Button.allPerformance(campId, mode)], {
+      reply: shouldQuote()
+    });
   }
 
   /** 把 historyList 里的一个赛季整理成模板需要的结构，无对应模式数据时返回 null */
   buildSeason(season, mode, currentSeasonId) {
-    const info = mode === '巅峰' ? season.masterInfo : season.rankInfo
-    if (!info) return null
-
-    const games = Number(info.totalCnt) || 0
-    const wins = Number(info.totalWinCnt) || 0
-    const winRate = info.winRate
-      ? `${Math.round(info.winRate * 100)}%`
-      : (games ? `${Math.round((wins / games) * 100)}%` : '0%')
-
+    const info = mode === '巅峰' ? season.masterInfo : season.rankInfo;
+    if (!info) return null;
+    const games = Number(info.totalCnt) || 0;
+    const wins = Number(info.totalWinCnt) || 0;
+    // ⚠️ 场次为 0 时**不能**报「0%」胜率（2026-10-06 修）。
+    //    这类赛季是被上面 `played` 的放宽条件放进来的（有巅峰分、没场次），
+    //    0 场 0 胜说成「胜率 0%」是凭空给用户扣了个最差战绩。给「—」表示无数据。
+    const winRate = info.winRate ? `${Math.round(info.winRate * 100)}%` : games ? `${Math.round(wins / games * 100)}%` : '—';
     return {
       seasonId: season.seasonId,
       seasonName: season.seasonName,
@@ -173,9 +205,7 @@ export class AllSeasonPerformance extends plugin {
       silver: Number(info.silverCnt) || 0,
       avgScore: Number(info.averageScore) || 0,
       // S44 起对局评分换成百分制，之前是 10 分制（接口原样返回，营地 App 也是这个值），跨赛季不可比，给旧赛季标一下口径
-      scoreLabel: (Number(info.averageScore) || 0) > 0 && Number(info.averageScore) <= 20
-        ? '平均分数 · 旧10分制'
-        : '平均分数',
+      scoreLabel: (Number(info.averageScore) || 0) > 0 && Number(info.averageScore) <= 20 ? '平均分数 · 旧10分制' : '平均分数',
       // 排位看段位，巅峰看积分
       jobName: info.jobName || '',
       shortJobName: info.shortJobName || info.jobName || '',
@@ -191,15 +221,13 @@ export class AllSeasonPerformance extends plugin {
         winCnt: Number(h.winCnt) || 0,
         winRate: `${Math.round((Number(h.winRate) || 0) * 100)}%`
       }))
-    }
+    };
   }
-
   fmtMonth(ts) {
-    const d = new Date(Number(ts) * 1000)
-    return Number.isNaN(d.getTime()) ? '—' : `${d.getFullYear()}.${d.getMonth() + 1}`
+    const d = new Date(Number(ts) * 1000);
+    return Number.isNaN(d.getTime()) ? '—' : `${d.getFullYear()}.${d.getMonth() + 1}`;
   }
-
   jobColor(jobName) {
-    return (JOB_COLORS.find(([re]) => re.test(jobName || '')) || [, '#9aa7bd'])[1]
+    return (JOB_COLORS.find(([re]) => re.test(jobName || '')) || [, '#9aa7bd'])[1];
   }
 }

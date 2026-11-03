@@ -1,3 +1,8 @@
+import { isBlockedEvent } from "../utils/blackList.js";
+import { resolveGroupBot, sendGroup } from "../utils/group.js";
+import { resourceUrl } from "../utils/message.js";
+import path from "node:path";
+import { Plugin, render, segment, logger, karin } from "node-karin";
 /**
  * 王者战绩日报 / 周报 / 月报。
  *
@@ -20,24 +25,16 @@
  * 段位星数与巅峰分变化复用 pushStore 的 formatStarChange / formatScoreDelta，
  * 和收工总结同一套判据 —— 那里面的坑（小编号回绕、赛季切换、0 星是真实值）已经踩平了。
  */
-import puppeteer from '#puppeteer'
-import path from 'path'
-import { collectBattles } from '../utils/battleArchive.js'
-import {
-  summarizeReport,
-  buildReportView,
-  getHeroNameMap,
-  resolveRange,
-  isMonthlyPushDay
-} from '../utils/reportStore.js'
-import { loadPushList, savePushList, mergeSubState, disableSubFlag, subGroups, withSubGroup, withoutSubGroup, sleep, REQUEST_INTERVAL } from '../utils/pushStore.js'
-import { fetchRoleNames } from '../utils/roleName.js'
-import {
-  getImgType,
-  resolveCurrentId, getCurrentId, getUserAvatar, Button, shouldQuote, readYamlFile, parsePerfArgs,
-  AT_HEAD, stripAtText, resolveTargetUserId, pickGroupSafe, isBlackUser
-} from '#utils'
-import { Config, PluginData } from '#components'
+
+import { collectBattles } from '../utils/battleArchive.js';
+import { summarizeReport, buildReportView, getHeroNameMap, resolveRange, isMonthlyPushDay } from '../utils/reportStore.js';
+import { loadPushList, savePushList, mergeSubState, disableSubFlag, subGroups, withSubGroup, withoutSubGroup, sweepLeftGroups, sleep, REQUEST_INTERVAL } from '../utils/pushStore.js';
+import { getNickMap, nickOf, withGroupNick } from '../utils/groupNick.js';
+import { fetchRoleNames } from '../utils/roleName.js';
+// 并发锁跨热重载共享：模块级 `let` 在热重载后是新变量，锁会被架空（见 utils/hotState.js）
+import { hotBox } from '../utils/hotState.js';
+import { getImgType, resolveCurrentId, getCurrentId, getBoundIds, getUserAvatar, Button, shouldQuote, parsePerfArgs, AT_HEAD, stripAtText, resolveTargetUserId, isBlackUser } from '#utils';
+import { Config, ResourcePath, ResourceUrl } from '#components';
 
 /**
  * 补页上限。日报只要盖住今天（实测单日最多 28 场，30+10+10=50 场足够）；
@@ -46,142 +43,226 @@ import { Config, PluginData } from '#components'
  * 月报同理但更极端（一个月可能 900 场），15 页 ≈ 170 场，剩下的全靠轮询长期攒库，
  * 不在一次指令里硬翻——月报本来就是「看趋势」，不是对账。
  */
-const MAX_PAGES = { daily: 3, weekly: 12, monthly: 15 }
+const MAX_PAGES = {
+  daily: 3,
+  weekly: 12,
+  monthly: 15
+};
 
 /** 三路报告的中文名，文案里到处要用 */
-const LABEL = { daily: '日报', weekly: '周报', monthly: '月报' }
+const LABEL = {
+  daily: '日报',
+  weekly: '周报',
+  monthly: '月报'
+};
 
 /**
  * 区间口径由 reportStore.resolveRange 定：今天 00:00 起 / 本周一 00:00 起 / 本月 1 号 00:00 起，
  * 但周一查周报、1 号查月报会退回上一个完整周期——不然那张图只有一天数据（见 resolveRange 的注释）
  */
 /** 每路对应的配置字段名（cron） */
-const CRON_KEY = { daily: 'dailyReportCron', weekly: 'weeklyReportCron', monthly: 'monthlyReportCron' }
+const CRON_KEY = {
+  daily: 'dailyReportCron',
+  weekly: 'weeklyReportCron',
+  monthly: 'monthlyReportCron'
+};
 
 /** 定时推送时每个订阅之间的间隔。出图本身就要一秒多，这里只防接口补页扎堆 */
-const PUSH_GAP = REQUEST_INTERVAL
+const PUSH_GAP = REQUEST_INTERVAL;
 
-/** 轮询并发锁，三个 task 共用一把：都要出图，撞在一起会把 puppeteer 拖垮 */
-let pushing = false
-
-export class BattleReport extends plugin {
-  constructor () {
+/**
+ * 轮询并发锁，三个 task 共用一把：都要出图，撞在一起会把 puppeteer 拖垮。
+ *
+ * ⚠️ 必须跨热重载共享（见 `utils/hotState.js`）：模块级 `let` 在热重载后是**新变量**，
+ *    而旧实例那一轮（要出图，好几秒）还在跑 —— 新实例看到 `false` 就会并发再来一轮，
+ *    两轮同时压 puppeteer，正是这把锁当初要防的事。
+ */
+const S = hotBox('battleReport.pushing', {
+  pushing: false
+});
+export class BattleReport extends Plugin {
+  constructor() {
     super({
       name: '王者战绩日报',
-      dsc: '按天 / 按周 / 按月汇总战绩',
+      desc: '按天 / 按周 / 按月汇总战绩',
       event: 'message',
       // 和 gameRecordPush 一样用 0：queryGameStats 的 `#?(查询|王者)战绩\s*(.*)$` 是宽匹配，
       // 虽然验证过「日报」「周报」不会被它吞掉，但抢先匹配更稳，也符合插件里新指令的惯例
       priority: 0,
-      rule: [
-        { reg: `${AT_HEAD}#(王者|战绩)日报\\s*(.*)$`, fnc: 'daily' },
-        { reg: `${AT_HEAD}#(王者|战绩)周报\\s*(.*)$`, fnc: 'weekly' },
-        { reg: `${AT_HEAD}#(王者|战绩)月报\\s*(.*)$`, fnc: 'monthly' },
-        { reg: '^#(开启|关闭)(王者|战绩)?日报推送$', fnc: 'toggleDaily' },
-        { reg: '^#(开启|关闭)(王者|战绩)?周报推送$', fnc: 'toggleWeekly' },
-        { reg: '^#(开启|关闭)(王者|战绩)?月报推送$', fnc: 'toggleMonthly' }
-      ]
-    })
-
-    const cfg = readConfig()
+      rule: [{
+        reg: `${AT_HEAD}#(王者|战绩)日报\\s*(.*)$`,
+        fnc: 'daily'
+      }, {
+        reg: `${AT_HEAD}#(王者|战绩)周报\\s*(.*)$`,
+        fnc: 'weekly'
+      }, {
+        reg: `${AT_HEAD}#(王者|战绩)月报\\s*(.*)$`,
+        fnc: 'monthly'
+      }, {
+        reg: '^#(开启|关闭)(王者|战绩)?日报推送$',
+        fnc: 'toggleDaily'
+      }, {
+        reg: '^#(开启|关闭)(王者|战绩)?周报推送$',
+        fnc: 'toggleWeekly'
+      }, {
+        reg: '^#(开启|关闭)(王者|战绩)?月报推送$',
+        fnc: 'toggleMonthly'
+      }]
+    });
+    this.priority = 0;
+    const cfg = readConfig();
     // collectTask 支持数组（lib/plugins/loader.js:492），且只收集 cron 和 fnc 都有值的项，
     // 所以配置里把 cron 留空就等于关掉这一路推送
-    this.task = [
-      { name: '王者战绩日报', cron: cfg.dailyReportCron, fnc: () => this.pushAll('daily'), log: false },
-      { name: '王者战绩周报', cron: cfg.weeklyReportCron, fnc: () => this.pushAll('weekly'), log: false },
-      { name: '王者战绩月报', cron: cfg.monthlyReportCron, fnc: () => this.pushAll('monthly'), log: false }
-    ]
   }
-
-  daily (e) {
-    return this.render(e, 'daily')
+  daily(e) {
+    if (isBlockedEvent(e)) return true;
+    return this.render(e, 'daily');
   }
-
-  weekly (e) {
-    return this.render(e, 'weekly')
+  weekly(e) {
+    if (isBlockedEvent(e)) return true;
+    return this.render(e, 'weekly');
   }
-
-  monthly (e) {
-    return this.render(e, 'monthly')
+  monthly(e) {
+    if (isBlockedEvent(e)) return true;
+    return this.render(e, 'monthly');
   }
 
   /** 指令查询 */
-  async render (e, kind) {
-    const label = LABEL[kind]
+  async render(e, kind) {
+    const label = LABEL[kind];
 
     // 支持 @某人 / 序号 / 直接给营地ID，和 #排位表现 那套一致
-    const { userId, hint } = await resolveTargetUserId(e)
-    if (hint) return e.reply(hint, shouldQuote())
-
-    const input = stripAtText(e.msg).replace(/^#(王者|战绩)(日报|周报|月报)\s*/, '').trim()
+    const {
+      userId,
+      hint
+    } = await resolveTargetUserId(e);
+    if (hint) return e.reply(hint, {
+      reply: shouldQuote()
+    });
+    const input = stripAtText(e.msg).replace(/^#(王者|战绩)(日报|周报|月报)\s*/, '').trim();
     // parsePerfArgs 的分法正好够用：5 位以上当营地ID（营地ID都是 8~10 位），4 位以内当序号
-    const args = parsePerfArgs(input)
-    let campId = args.campId
-
+    const args = parsePerfArgs(input);
+    let campId = args.campId;
     if (!campId && args.count) {
       // 指定序号：#王者日报 2 看第 2 个绑定的号。getCurrentId 只认「当前号」，序号得自己查
-      const ids = (readYamlFile(path.join(PluginData, 'UserData.yaml')) || {})[userId]?.ids || []
-      campId = ids[args.count - 1] || ''
+      // ⚠️ 走 getBoundIds 而不是裸读 YAML（2026-10-06 修）：readYamlFile 的契约是
+      //    「文件不存在 / 内容坏了**原样抛错**」，`|| {}` 拦不住 throw —— 手工编辑坏
+      //    UserData.yaml 之后 `#王者日报 2` 会整条抛异常、连一句回复都没有。
+      //    getBoundIds 读的就是同一个文件（带指纹缓存），读失败按空表处理。
+      const ids = getBoundIds(userId);
+      campId = ids[args.count - 1] || '';
       if (!campId) {
-        return e.reply(`你没有第 ${args.count} 个绑定的营地ID，发送 #营地ID 看看列表`, shouldQuote())
+        return e.reply(`你没有第 ${args.count} 个绑定的营地ID，发送 #营地ID 看看列表`, {
+          reply: shouldQuote()
+        });
       }
     }
 
     // 本机没绑就问共享库（用户在别的机器人上绑过也能直接用）。
     // 上面的序号路径不走共享——序号指的是「本机绑定的第 N 个」
     if (!campId) {
-      const resolved = await resolveCurrentId(userId)
-      campId = resolved.campId
+      const resolved = await resolveCurrentId(userId);
+      campId = resolved.campId;
       if (!campId) {
-        return e.reply([resolved.hint, Button.bind()], shouldQuote())
+        return e.reply([resolved.hint, Button.bind()], {
+          reply: shouldQuote()
+        });
       }
     }
 
     // 月报第一次查很可能要翻十几页（约 20 秒），先给个回执，不然用户以为指令没响应
-    const { scopeText, isPrev } = resolveRange(kind)
+    const {
+      scopeText,
+      isPrev
+    } = resolveRange(kind);
     if (kind === 'monthly') {
-      await e.reply(`正在汇总${isPrev ? '上个月' : '本月'}战绩，数据多的话要十几秒，请稍候...`, shouldQuote())
+      await e.reply(`正在汇总${isPrev ? '上个月' : '本月'}战绩，数据多的话要十几秒，请稍候...`, {
+        reply: shouldQuote()
+      });
     }
+    const view = await this.buildView(String(campId), String(e.userId), kind, {
+      qq: userId,
+      e
+    });
 
-    const view = await this.buildView(String(campId), String(userId), kind, { qq: userId, e })
-
-    if (!view) {
-      return e.reply(
-        isPrev
-          ? `${scopeText}没有对局记录`
-          : { daily: '今天还没有对局记录', weekly: '本周还没有对局记录', monthly: '本月还没有对局记录' }[kind],
-        shouldQuote()
-      )
+    // ⚠️ 拉取失败时**不能**说「没有对局记录」（2026-10-06 修）：那是把「没拉到」
+    //    讲成了「你没打」，用户会当成事实。degraded 是 buildView 专门为这种情况回的标记。
+    if (!view || view.degraded) {
+      return e.reply(view?.degraded ? '这次没拉到完整战绩，暂时出不了这张报告，稍后再试' : isPrev ? `${scopeText}没有对局记录` : {
+        daily: '今天还没有对局记录',
+        weekly: '本周还没有对局记录',
+        monthly: '本月还没有对局记录'
+      }[kind], {
+        reply: shouldQuote()
+      });
     }
-
-    const image = await this.shot(view)
-    if (!image) return e.reply(`${label}出图失败，请稍后再试`, shouldQuote())
-
-    return e.reply(image, shouldQuote())
+    const image = await this.shot(view);
+    if (!image) return e.reply(`${label}出图失败，请稍后再试`, {
+      reply: shouldQuote()
+    });
+    return e.reply(image, {
+      reply: shouldQuote()
+    });
   }
 
   /**
    * 组装一份报告的模板数据。
-   * @returns {Promise<object|null>} 区间内没有对局时返回 null（不出空图）
+   * @returns {Promise<object|null|{degraded:true}>} 区间内没有对局时返回 null（不出空图）；
+   *          战绩**没拉全**时返回 `{ degraded: true }` —— 与「确实没打」必须分开，
+   *          否则用户拿到的是「今天还没有对局记录」这种确定性结论（见下方 collectBattles 处注释）
    */
-  async buildView (campId, qq, kind, { roleName = '', qq: ownerQQ = '', e = null } = {}) {
-    const nowMs = Date.now()
-    const { fromSec, toSec, scopeText } = resolveRange(kind, nowMs)
-
-    let collected
+  async buildView(campId, qq, kind, {
+    roleName = '',
+    qq: ownerQQ = '',
+    e = null
+  } = {}) {
+    const nowMs = Date.now();
+    const {
+      fromSec,
+      toSec,
+      scopeText
+    } = resolveRange(kind, nowMs);
+    let collected;
     try {
-      collected = await collectBattles(campId, qq, fromSec, { maxPages: MAX_PAGES[kind] || 3, toSec })
+      collected = await collectBattles(campId, qq, fromSec, {
+        maxPages: MAX_PAGES[kind] || 3,
+        toSec
+      });
     } catch (error) {
-      logger.error(`[王者${LABEL[kind]}] ${campId} 取战绩失败: ${error.message}`)
-      return null
+      logger.error(`[王者${LABEL[kind]}] ${campId} 取战绩失败: ${error.message}`);
+      return null;
     }
 
-    if (!collected.battles.length) return null
+    // ⚠️⚠️ 拉取失败要和「确实没打」分开（2026-10-06 修）：collectBattles 内部把接口
+    //    异常自己 catch 掉了（不向外抛），失败时 battles 就是空数组 —— 跟「今天真没打」
+    //    返回值一模一样。于是用户看到的是「今天还没有对局记录」这种**确定性结论**，
+    //    而真实原因是「这次没拉到」。battleArchive 已经为这件事返回了 incomplete / failed，
+    //    但全仓没有调用方读它，注释里承诺的降级文案一直没落地。
+    if (collected.incomplete || collected.failed) {
+      logger.warn(`[王者${LABEL[kind]}] ${campId} 战绩拉取不完整（failed=${collected.failed} fetched=${collected.fetched}），按数据不全处理`);
+      // 用明确的标记对象回给调用方：`null` 已经被「区间内没对局」占用了
+      return {
+        degraded: true
+      };
+    }
+    if (!collected.battles.length) return null;
+    const heroMap = await getHeroNameMap();
+    const report = summarizeReport(collected.battles, {
+      fromSec,
+      toSec,
+      heroMap,
+      prevSnapshot: collected.prevSnapshot
+    });
+    if (!report.count) return null;
 
-    const heroMap = await getHeroNameMap()
-    const report = summarizeReport(collected.battles, { fromSec, toSec, heroMap })
-    if (!report.count) return null
-
+    // 发到群里的报告，游戏名后面补群名片；私聊没有群名片，保持原样。
+    // 推送是多群共用一张图，只能取主群的名片（和 gameRecordPush 的口径一致）
+    const baseName = roleName || this.cachedName(ownerQQ || qq);
+    let displayName = baseName;
+    if (e?.isGroup) {
+      const nickMap = await getNickMap(e.groupId, e.bot);
+      displayName = withGroupNick(baseName, nickOf(nickMap, ownerQQ || qq));
+    }
     return buildReportView(report, {
       kind,
       fromSec,
@@ -190,95 +271,115 @@ export class BattleReport extends plugin {
       nowMs,
       coveredFrom: collected.coveredFrom,
       truncated: collected.truncated,
-      roleName: roleName || this.cachedName(ownerQQ || qq),
+      roleName: displayName,
       // 营地头像要多一次 profile 请求，日报的重点是战绩不是头像，用平台头像就够。
       // 走 getUserAvatar 而不是裸拼 qlogo：官方机器人的 user_id 是 openid，拼出来是张默认图
       roleIcon: await getUserAvatar(e, ownerQQ || qq, 100)
-    })
+    });
   }
 
   /** 订阅项里缓存过的营地昵称（推送轮询和出详情图时会更新），没有就退回空串让模板兜底 */
-  cachedName (qq) {
-    return String(loadPushList()[String(qq)]?.roleName || '')
+  cachedName(qq) {
+    return String(loadPushList()[String(qq)]?.roleName || '');
   }
-
-  async shot (view) {
+  async shot(view) {
     try {
-      return await puppeteer.screenshot('BattleReport', {
-        imgType: getImgType(),
-        tplFile: 'plugins/GloryOfKings-Plugin/resources/html/BattleReport.html',
-        // 模板里 CSS / 字体都靠 {{_res_path}} 拼相对路径，漏了这项样式表 404，
-        // 出来的是一张没有任何样式的纯文字图（插件里其它 app 也都传这一串）
-        _res_path: '../../../plugins/GloryOfKings-Plugin/resources/',
-        ...view
-      })
+      return segment.image(resourceUrl("base64://" + (await render.render({
+        name: 'BattleReport',
+        type: getImgType(),
+        file: path.join(ResourcePath, "html", "BattleReport.html"),
+        data: {
+          ...view,
+          _res_path: ResourceUrl
+        },
+        pageGotoParams: {
+          waitUntil: "networkidle2",
+          timeout: 60000
+        }
+      }))));
     } catch (error) {
-      logger.error(`[王者战报] 渲染失败: ${error.message}`)
-      return null
+      logger.error(`[王者战报] 渲染失败: ${error.message}`);
+      return null;
     }
   }
 
   /* ---------------------------------------------------------- 订阅开关 */
 
-  toggleDaily (e) {
-    return this.toggle(e, 'daily')
+  toggleDaily(e) {
+    if (isBlockedEvent(e)) return true;
+    return this.toggle(e, 'daily');
   }
-
-  toggleWeekly (e) {
-    return this.toggle(e, 'weekly')
+  toggleWeekly(e) {
+    if (isBlockedEvent(e)) return true;
+    return this.toggle(e, 'weekly');
   }
-
-  toggleMonthly (e) {
-    return this.toggle(e, 'monthly')
+  toggleMonthly(e) {
+    if (isBlockedEvent(e)) return true;
+    return this.toggle(e, 'monthly');
   }
 
   /**
    * 开关一路推送。订阅表复用 GameRecordPush.yaml 的 pushList——
    * group / campId / roleName 都是现成的，没必要再存一份。
    */
-  async toggle (e, kind) {
-    const label = LABEL[kind]
-    const enable = e.msg.includes('开启')
-    const qq = String(e.user_id)
-
+  async toggle(e, kind) {
+    const label = LABEL[kind];
+    const enable = e.msg.includes('开启');
+    const qq = String(e.userId);
     if (!enable) {
-      const list = loadPushList()
-      const sub = list[qq]
+      const list = loadPushList();
+      const sub = list[qq];
       if (!sub || sub[kind] !== true) {
-        return e.reply(`你还没有开启战绩${label}推送`, shouldQuote())
+        return e.reply(`你还没有开启战绩${label}推送`, {
+          reply: shouldQuote()
+        });
       }
 
       // 多群订阅下「在哪个群关」是有意义的：只摘掉当前这个群，别的群照推
-      const groups = subGroups(sub)
-      const here = String(e.group_id || '')
+      const groups = subGroups(sub);
+      const here = String(e.groupId || '');
       if (e.isGroup && groups.length > 1 && groups.includes(here)) {
-        const { groups: rest, group } = withoutSubGroup(sub, here)
-        list[qq] = { ...sub, groups: rest, group }
-        savePushList(list)
-        return e.reply(
-          `已停止在本群推送${label}，其余 ${rest.length} 个群不变`,
-          shouldQuote()
-        )
+        const {
+          groups: rest,
+          group
+        } = withoutSubGroup(sub, here);
+        list[qq] = {
+          ...sub,
+          groups: rest,
+          group
+        };
+        savePushList(list);
+        return e.reply(`已停止在本群推送${label}，其余 ${rest.length} 个群不变`, {
+          reply: shouldQuote()
+        });
       }
 
       // 走 disableSubFlag 而不是 mergeSubState：所有开关全关了要把整条订阅删掉，
       // 否则留个空壳一直占着 pushList 的名额
-      disableSubFlag(qq, kind)
-      return e.reply(`已关闭战绩${label}推送`, shouldQuote())
+      disableSubFlag(qq, kind);
+      return e.reply(`已关闭战绩${label}推送`, {
+        reply: shouldQuote()
+      });
     }
-
     if (!e.isGroup) {
-      return e.reply(`${label}推送需要在群里开启，报告会发到你开启时所在的群`, shouldQuote())
+      return e.reply(`${label}推送需要在群里开启，报告会发到你开启时所在的群`, {
+        reply: shouldQuote()
+      });
     }
-
-    const campId = getCurrentId(qq)
+    const campId = getCurrentId(qq);
     if (!campId) {
-      return e.reply(['你还没有绑定营地ID，先发送 #绑定营地 [营地ID]', Button.bind()], shouldQuote())
+      return e.reply(['你还没有绑定营地ID，先发送 #绑定营地 [营地ID]', Button.bind()], {
+        reply: shouldQuote()
+      });
     }
 
     // 订阅项可能还不存在（没开过战绩推送），mergeSubState 只改已有项，所以这里要兜底建一条
-    const list = loadPushList()
-    const { groups, group, added } = withSubGroup(list[qq], e.group_id)
+    const list = loadPushList();
+    const {
+      groups,
+      group,
+      added
+    } = withSubGroup(list[qq], e.groupId);
     if (!list[qq]) {
       list[qq] = {
         // 不能顺手把战绩推送/上下线提醒打开，那是两个独立的开关
@@ -288,40 +389,53 @@ export class BattleReport extends plugin {
         group,
         campId: String(campId),
         enabledAt: Date.now()
-      }
-      savePushList(list)
+      };
+      savePushList(list);
     }
+    const alreadyOn = list[qq][kind] === true;
 
-    const alreadyOn = list[qq][kind] === true
-    mergeSubState(qq, { [kind]: true, groups, group, campId: String(campId) })
+    // 营地ID旁边带上昵称，用户才认得出推的是哪个号。
+    // ⚠️⚠️ 这一步要**提前到这里并顺手落表**（2026-10-06 修）：原来它在 alreadyOn 的
+    //    提前 return 之后，昵称只用在回复文案里 —— 而推送路径（pushOne → buildView）
+    //    只从订阅表的 `sub.roleName` 读昵称。于是「只开日报/周报/月报、没开战绩推送」
+    //    的用户表里永远没有 roleName，图上玩家名固定落到模板兜底的「召唤师」，
+    //    而这一刻其实已经把真名查到手了，等于查了不用。
+    const roleName = (await fetchRoleNames([campId], qq))[campId] || '';
+    mergeSubState(qq, {
+      [kind]: true,
+      groups,
+      group,
+      campId: String(campId),
+      ...(roleName ? {
+        roleName
+      } : {})
+    });
 
     // 已经开着、只是换个群再开一次：说清楚现在推几个群就行，别再重复一遍完整说明
     if (alreadyOn) {
-      return e.reply(
-        added
-          ? `✅ 本群已加入${label}推送，现在会推到 ${groups.length} 个群`
-          : `${label}推送本来就在本群开着，无需重复开启`,
-        shouldQuote()
-      )
+      return e.reply(added ? `✅ 本群已加入${label}推送，现在会推到 ${groups.length} 个群` : `${label}推送本来就在本群开着，无需重复开启`, {
+        reply: shouldQuote()
+      });
     }
-
-    const cron = readConfig()[CRON_KEY[kind]] || ''
-    const period = { daily: '每天', weekly: '每周', monthly: '每月' }[kind]
-    const unit = { daily: '天', weekly: '周', monthly: '月' }[kind]
-    const scope = { daily: '当日', weekly: '整周', monthly: '本月' }[kind]
-    // 营地ID旁边带上昵称，用户才认得出推的是哪个号
-    const roleName = (await fetchRoleNames([campId], qq))[campId] || ''
-
-    return e.reply([
-      [
-        `✅ 已开启战绩${label}推送（营地ID ${campId}${roleName ? ` ${roleName}` : ''}）`,
-        `${period}会在本群发一张${scope}战绩总结`,
-        cron ? `推送时间：${cron}` : '（主人还没配推送时间，暂时不会自动发）',
-        `没有对局的${unit}不会推送。想立刻看发送 #王者${label}`,
-        '想在别的群也收，去那个群再发一次这条指令'
-      ].join('\n'),
-      Button.push(true)
-    ], shouldQuote())
+    const cron = readConfig()[CRON_KEY[kind]] || '';
+    const period = {
+      daily: '每天',
+      weekly: '每周',
+      monthly: '每月'
+    }[kind];
+    const unit = {
+      daily: '天',
+      weekly: '周',
+      monthly: '月'
+    }[kind];
+    const scope = {
+      daily: '当日',
+      weekly: '整周',
+      monthly: '本月'
+    }[kind];
+    return e.reply([[`✅ 已开启战绩${label}推送（营地ID ${campId}${roleName ? ` ${roleName}` : ''}）`, `${period}会在本群发一张${scope}战绩总结`, cron ? `推送时间：${cron}` : '（主人还没配推送时间，暂时不会自动发）', `没有对局的${unit}不会推送。想立刻看发送 #王者${label}`, '想在别的群也收，去那个群再发一次这条指令'].join('\n'), Button.push(true)], {
+      reply: shouldQuote()
+    });
   }
 
   /* ---------------------------------------------------------- 定时推送 */
@@ -330,102 +444,124 @@ export class BattleReport extends plugin {
    * 遍历订阅推送报告。
    * @param {'daily'|'weekly'|'monthly'} kind
    */
-  async pushAll (kind) {
-    const label = LABEL[kind]
+  async pushAll(kind) {
+    const label = LABEL[kind];
 
     // 月报的 cron 是 28-31 号每晚触发，只有真正的月末才推完整的一个月
     if (kind === 'monthly' && !isMonthlyPushDay()) {
-      logger.debug(`[王者${label}] 今天不是本月最后一天，跳过`)
-      return
+      logger.debug(`[王者${label}] 今天不是本月最后一天，跳过`);
+      return;
     }
 
-    // 被拉黑的人跳过，订阅不删（移出黑名单就恢复）
-    const subs = Object.entries(loadPushList())
-      .filter(([qq, sub]) => !isBlackUser(qq) && sub?.[kind] === true && subGroups(sub).length > 0)
-    if (!subs.length) return
-
-    if (pushing) {
-      logger.warn(`[王者${label}] 上一轮推送还在跑，本轮跳过`)
-      return
+    // ⭐ 退群闸门。这一路走的是 battleReport 自己的三个 cron task（见 constructor 的
+    // `this.task`），**不经过 gameRecordPush.checkAll** —— 而 checkAll 的 task 还可能
+    // 因为 `battleResultCron` 留空而压根不注册（日历推送照跑）。所以这里必须自己扫一次，
+    // 否则退群的人会一直收到日报/周报/月报发到那个群（出图用的就是他自己的号）。
+    // 判据与口径全在 pushStore.sweepLeftGroups，和 checkAll 是同一份实现。
+    const list = loadPushList();
+    const swept = sweepLeftGroups(list);
+    if (swept.cleared || swept.stopped) {
+      logger.mark(`[王者${label}] 退群清理：摘掉 ${swept.cleared} 个推送群${swept.stopped ? `，停掉 ${swept.stopped} 条订阅` : ''}`);
     }
 
-    pushing = true
+    // 被拉黑的人跳过，订阅不删（移出黑名单就恢复）。
+    // ⚠️ 读的是上面那份**已被就地清理过**的 `list`，不能重新 loadPushList —— 那会拿回旧表
+    const subs = Object.entries(list).filter(([qq, sub]) => !isBlackUser(qq) && sub?.[kind] === true && subGroups(sub).length > 0);
+    if (!subs.length) return;
+    if (S.pushing) {
+      logger.warn(`[王者${label}] 上一轮推送还在跑，本轮跳过`);
+      return;
+    }
+    S.pushing = true;
     try {
       for (const [qq, sub] of subs) {
         try {
-          await this.pushOne(qq, sub, kind)
+          await this.pushOne(qq, sub, kind);
         } catch (error) {
-          logger.error(`[王者${label}] 推送 ${qq} 失败: ${error.message}`)
+          logger.error(`[王者${label}] 推送 ${qq} 失败: ${error.message}`);
         }
-        await sleep(PUSH_GAP)
+        await sleep(PUSH_GAP);
       }
     } finally {
-      pushing = false
+      S.pushing = false;
     }
   }
-
-  async pushOne (qq, sub, kind) {
-    const label = LABEL[kind]
+  async pushOne(qq, sub, kind) {
+    const label = LABEL[kind];
 
     // 营地ID 动态取，用户 #切换营地 后跟着换
-    const campId = getCurrentId(qq) || sub.campId
-    if (!campId) return
+    const campId = getCurrentId(qq) || sub.campId;
+    if (!campId) return;
 
     // 群提前取：发消息要用，取头像也要用（getUserAvatar 靠 group.pickMember 认 openid）。
     // 顺带把「群都取不到」挡在补页和出图之前，省掉注定发不出去的那几次请求。
     // 多群订阅只出一张图，发到每个还在的群；一个群没了不影响其它群
-    const targets = subGroups(sub)
-      .map(id => ({ id, group: pickGroupSafe(id) }))
-      .filter(item => item.group?.sendMsg)
-
+    const targets = (await Promise.all(subGroups(sub).map(async id => ({
+      id,
+      group: await resolveGroupBot(id)
+    })))).filter(item => item.group);
     if (!targets.length) {
-      logger.warn(`[王者${label}] 取不到群 ${subGroups(sub).join('、') || '—'}，跳过 ${qq}`)
-      return
+      logger.warn(`[王者${label}] 取不到群 ${subGroups(sub).join('、') || '—'}，跳过 ${qq}`);
+      return;
     }
-
     const view = await this.buildView(String(campId), String(qq), kind, {
       roleName: sub.roleName || '',
       qq,
-      // 推送没有真实消息事件，拿群拼个最小壳子够 getUserAvatar 用
-      e: { group: targets[0].group }
-    })
+      // 推送没有真实消息事件，拿群拼个最小壳子够 getUserAvatar 和群名片用。
+      // isGroup/group_id 是给 buildView 判断「要贴群名片」用的
+      e: {
+        isGroup: true,
+        group_id: targets[0].id,
+        group: targets[0].group
+      }
+    });
 
     // 这段时间没打就不发。推一张「0 场」的图纯属刷屏
-    if (!view) {
-      logger.debug(`[王者${label}] ${qq} ${resolveRange(kind).scopeText}无对局，跳过`)
-      return
+    // ⚠️ degraded（拉取不全）同样不发 —— 但日志要跟「真没打」分开，否则排查时
+    //    只看到一句「无对局」，会以为是用户没上线（2026-10-06 修）
+    if (!view || view.degraded) {
+      if (view?.degraded) logger.warn(`[王者${label}] ${qq} 战绩拉取不完整，本轮跳过`);else logger.debug(`[王者${label}] ${qq} ${resolveRange(kind).scopeText}无对局，跳过`);
+      return;
     }
-
-    const image = await this.shot(view)
-    if (!image) return
-
-    for (const { id, group } of targets) {
+    const image = await this.shot(view);
+    if (!image) return;
+    for (const {
+      id,
+      group
+    } of targets) {
       try {
         // 这里 @ 本人，和战绩/上下线播报的「不 @」是故意不一致的：那几条是打完那一刻的即时播报，
         // 本人最清楚，@ 只是多刷个红点；日报周报是定时发的总结，本人未必在看群，得叫一下。
         // 名字仍然留在文案和图上，群里其他人不点 @ 也认得出是谁
         // 图在前、文案在后：报告本身是主体，一行说明放图下面当图注读着更顺，
         // 文案在上会把图挤到第二屏，群里滑过去先看到一行字反而抓不住重点
-        await group.sendMsg([
-          image,
-          // 直接给字符串：各适配器内部都会 String(qq)（如 OneBotv11.js 的 makeMsg），
-          // 而官bot 的 user_id 是 `appid:openid` 形态，Number() 出来是 NaN，转数字反而会坏
-          segment.at(qq),
-          ` 📊 ${view.roleName} 的${label}（${view.rangeText}）`
-        ])
-        logger.mark(`[王者${label}] 已推送给 ${qq}@群${id}`)
+        await sendGroup(id, [image,
+        // 直接给字符串：各适配器内部都会 String(qq)（如 OneBotv11.js 的 makeMsg），
+        // 而官bot 的 user_id 是 `appid:openid` 形态，Number() 出来是 NaN，转数字反而会坏
+        segment.at(qq), ` 📊 ${view.roleName} 的${label}（${view.rangeText}）`], group);
+        logger.mark(`[王者${label}] 已推送给 ${qq}@群${id}`);
       } catch (error) {
-        logger.error(`[王者${label}] 发送失败 ${qq}@群${id}: ${error.message}`)
+        logger.error(`[王者${label}] 发送失败 ${qq}@群${id}: ${error.message}`);
       }
     }
   }
 }
 
 /** 读配置，读不到时返回空对象，和 gameRecordPush 的兜底思路一致 */
-function readConfig () {
+function readConfig() {
   try {
-    return Config.getDefOrConfig('config') || {}
+    return Config.getDefOrConfig('config') || {};
   } catch {
-    return {}
+    return {};
   }
 }
+const runner = new BattleReport();
+export const dailyReportTask = readConfig().dailyReportCron ? karin.task("王者战绩日报", String(readConfig().dailyReportCron), () => runner.pushAll('daily'), {
+  log: false
+}) : [];
+export const weeklyReportTask = readConfig().weeklyReportCron ? karin.task("王者战绩周报", String(readConfig().weeklyReportCron), () => runner.pushAll('weekly'), {
+  log: false
+}) : [];
+export const monthlyReportTask = readConfig().monthlyReportCron ? karin.task("王者战绩月报", String(readConfig().monthlyReportCron), () => runner.pushAll('monthly'), {
+  log: false
+}) : [];

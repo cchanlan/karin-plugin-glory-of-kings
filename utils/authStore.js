@@ -1,69 +1,164 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { PluginData } from '#components'
-import { readYamlFile, writeYamlFile } from './yamlUtils.js'
-import { writeFileAtomic, quarantineCorrupt } from './safeStore.js'
+import { logger } from "node-karin";
+/**
+ * 账号池存储 —— 营地登录态（`AuthPool.json`）与机器人用户的营地绑定（`UserData.yaml`）。
+ *
+ * ## 这一层负责什么
+ *
+ *   · 读写上面两份数据文件，并且**坏文件绝不静默清空**（隔离留证交给 safeStore）
+ *   · 账号的增删改查：字段归一化、按优先级排序、失效标记、去重
+ *   · 给接口层挑「这次请求用哪个号」（`getAuthCandidates`）
+ *   · 给锅巴面板读写账号快照（`getGuobaAccounts` / `replaceAccountsFromGuoba`）
+ *
+ * ## 两条不能动的约定
+ *
+ *   ① **落盘的字段名与键顺序**。`AuthPool.json` 是主人手工救数据时照着看的文件，
+ *      字段表 `ACCOUNT_FIELDS` 的顺序就是文件里的键顺序 —— 重排会让整份文件 diff 全红。
+ *   ② **导出的名字**。`isUsableAuth` / `authStore` 被 api.js、锅巴、apps/ 多处引用，
+ *      改名等于全线报错。
+ *
+ * ## 为什么按「字段表 + 取值器」写
+ *
+ * 账号有 40 来个字段，其中三十多个都是同一套「新值取到就用、取不到沿用池里的旧值」。
+ * 原先每个字段抄一行，加字段漏一行就是**静默丢数据**，而且光看代码看不出来。
+ * 现在取值语义集中在 `FIELD_RESOLVERS` 里，加字段只加一行。
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { PluginData } from '#components';
+import { readYamlFile, writeYamlFile } from './yamlUtils.js';
+import { writeFileAtomic, quarantineCorrupt } from './safeStore.js';
 
-const AUTH_POOL_FILE = path.join(PluginData, 'AuthPool.json')
-const LEGACY_AUTH_POOL_FILE = path.join(PluginData, 'AuthPool.yaml')
-const USER_DATA_FILE = path.join(PluginData, 'UserData.yaml')
+// ────────────────────────────────────────────────────────────────────────
+// 文件位置与常量
+// ────────────────────────────────────────────────────────────────────────
 
-function ensureDirectory(filePath) {
-  const dir = path.dirname(filePath)
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true })
-  }
-}
+const AUTH_POOL_FILE = path.join(PluginData, 'AuthPool.json');
+const LEGACY_AUTH_POOL_FILE = path.join(PluginData, 'AuthPool.yaml');
+const USER_DATA_FILE = path.join(PluginData, 'UserData.yaml');
 
-function normalizeUserId(value) {
-  if (value === null || typeof value === 'undefined' || value === '') {
-    return ''
-  }
+/** 本模块日志的统一前缀。原先散在七八处手写，写歪一处就搜不到了 */
+const LOG_TAG = '[营地账号池]';
 
-  return String(value)
-}
+/**
+ * 隔离坏文件时的日志前缀。
+ *
+ * ⚠️ 它和 `LOG_TAG` 不一样是**故意的**：这两个值都出现在日志里，
+ * 主人排查时按前缀搜，改一个字就搜不到了。所以抽成具名常量、值照旧，
+ * 而不是顺手统一成 `LOG_TAG`（差分测试会当场拦下来）。
+ */
+const QUARANTINE_TAG = '[王者账号]';
 
-function toStringValue(value) {
+/**
+ * 空池 / 空绑定表。
+ * 交出去之前一律 `structuredClone` —— 直接给常量的话，调用方一改就把默认值改了，
+ * 下一次回落读到的就是被污染的那份。
+ */
+const EMPTY_POOL = {
+  accounts: {}
+};
+const EMPTY_USER_DATA = {};
+
+/** 没写 priority 的账号默认排在这一档（数字越小越先试） */
+const DEFAULT_PRIORITY = 100;
+
+/**
+ * 健康账号的 `lastSuccessAt` 最少隔多久才落盘一次。
+ * 它只剩锅巴面板展示这一个消费方（见 markAuthSuccess 的注释），
+ * 10 分钟的颗粒度足够「看看这个号最近活没活」。
+ */
+const LAST_SUCCESS_FLUSH_MS = 10 * 60 * 1000;
+
+// ────────────────────────────────────────────────────────────────────────
+// 基础转换
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * 转字符串，`null` / `undefined` 一律给空串。
+ *
+ * 上游这里是两个函数（`toStringValue` 和 `normalizeUserId`），但两者的结果对
+ * **任何**输入都相同（`''` 走 `String('')` 还是 `''`），分成两个名字只会让人
+ * 以为它们有区别、进而怀疑某个调用点用错了。合成一个。
+ */
+function toText(value) {
   if (value === null || typeof value === 'undefined') {
-    return ''
+    return '';
   }
-
-  return String(value)
+  return String(value);
 }
 
-function readJsonSafe(filePath, fallback = {}) {
+/** 转数字；转不出有限数就用 fallback（`Number('abc')` 是 NaN，不能直接落盘） */
+function toNumber(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+/**
+ * 打日志用的脱敏：只留头尾，中间一律 `...`。
+ * 令牌 / 密钥进日志前**都要**过这里，别在调用点手拼 —— 漏一处就是明文进日志。
+ */
+function maskSecret(value, keepStart = 6, keepEnd = 4) {
+  const text = toText(value);
+  if (!text) {
+    return '';
+  }
+  if (text.length <= keepStart + keepEnd) {
+    return text;
+  }
+  return `${text.slice(0, keepStart)}...${text.slice(-keepEnd)}`;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// 安全读写
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * 「读文件 → 解析 → 出错隔离」的公共骨架，JSON / YAML 共用。
+ *
+ * 两种格式的容错要求**完全一样**：
+ *   · 文件不在        → 回落默认值（深拷一份，别把常量递出去）
+ *   · 解析抛错        → 先把坏文件挪走留证，再回落（见 safeStore 的说明）
+ * 所以只把「怎么解析」当参数传进来，别的逻辑只写一遍。
+ *
+ * ⚠️ 解析成 `null` 时**不在这里兜底** —— 两个格式对它的处理历来不同
+ *    （JSON 原样返回，YAML 回落默认值），兜底写在各 `parse` 里保持原样。
+ *
+ * @param {string} filePath
+ * @param {object} fallback 文件缺失 / 解析失败时的回落值
+ * @param {(filePath: string, fallback: object) => object} parse
+ */
+function readSafe(filePath, fallback, parse) {
   try {
     if (!fs.existsSync(filePath)) {
-      return structuredClone(fallback)
+      return structuredClone(fallback);
     }
-
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    return parse(filePath, fallback);
   } catch (error) {
-    // AuthPool.json 存的是所有人的登录态，坏了就是全员重新扫码。
-    // 静默按默认值继续会让下一次写把默认值固化下来，所以先把坏文件挪走留证。
-    quarantineCorrupt(filePath, error, '[王者账号]')
-    return structuredClone(fallback)
+    // AuthPool.json 存的是所有人的登录态、UserData.yaml 是绑定关系：
+    // 坏了就是全员重新扫码 / 重新绑定。静默按默认值继续会让下一次写把默认值
+    // 固化下来，所以先把坏文件挪走留证，再按空数据继续。
+    quarantineCorrupt(filePath, error, QUARANTINE_TAG);
+    return structuredClone(fallback);
   }
+}
+
+/** 读 JSON。解析成 `null` 时**原样返回**（老行为，别顺手改成回落） */
+function readJsonSafe(filePath, fallback = EMPTY_POOL) {
+  return readSafe(filePath, fallback, file => JSON.parse(fs.readFileSync(file, 'utf8')));
+}
+
+/** 读 YAML。解析成 `null`（空文件）时回落默认值 */
+function readYamlSafe(filePath, fallback = EMPTY_USER_DATA) {
+  return readSafe(filePath, fallback, (file, empty) => readYamlFile(file) ?? structuredClone(empty));
 }
 
 /** JSON 带缩进落盘（人可读，方便手工救数据），走原子写 */
 function writeJsonPretty(filePath, data) {
-  writeFileAtomic(filePath, `${JSON.stringify(data, null, 2)}\n`)
+  writeFileAtomic(filePath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
-function readYamlSafe(filePath, fallback = {}) {
-  try {
-    if (!fs.existsSync(filePath)) {
-      return structuredClone(fallback)
-    }
-
-    return readYamlFile(filePath) ?? structuredClone(fallback)
-  } catch (error) {
-    // UserData.yaml 是绑定关系，同上：坏了要留证，不能静默清空
-    quarantineCorrupt(filePath, error, '[王者账号]')
-    return structuredClone(fallback)
-  }
-}
+// ────────────────────────────────────────────────────────────────────────
+// 对外契约
+// ────────────────────────────────────────────────────────────────────────
 
 /**
  * 这份登录态有没有资格发请求（token / userId / 密钥三样齐）。
@@ -71,336 +166,429 @@ function readYamlSafe(filePath, fallback = {}) {
  * 两边各写一份迟早漂移。
  */
 export function isUsableAuth(auth) {
-  return Boolean(auth?.token && auth?.userId && (auth?.userKey || auth?.encodeRes))
+  return Boolean(auth?.token && auth?.userId && (auth?.userKey || auth?.encodeRes));
 }
 
-function toNumberValue(value, fallback = 0) {
-  const numeric = Number(value)
-  return Number.isFinite(numeric) ? numeric : fallback
+// ────────────────────────────────────────────────────────────────────────
+// 账号字段表
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * 每种字段的取值方式。签名统一为 `(字段名, 新数据, 池里的旧数据, 当前时间戳)`。
+ *
+ *   text     —— `??` 语义：只有 `null` / `undefined` 算缺失
+ *   id       —— `||` 语义：空串也算缺失（`userId` / `ownerBotUserId` 历来如此）
+ *   flag     —— 新数据里是**显式布尔值**才改，否则沿用旧值的布尔化
+ *   priority —— 数字，缺失落到 `DEFAULT_PRIORITY`
+ *   count    —— 数字，缺失落到 0
+ *   created  —— 旧值优先，没有就取当前时间
+ *   updated  —— 恒为当前时间（每次归一化都算一次「动过」）
+ *   login    —— 旧值优先，再退当前时间
+ */
+const FIELD_RESOLVERS = {
+  text: (key, account, existing) => toText(account[key] ?? existing[key]),
+  id: (key, account, existing) => toText(account[key] || existing[key]),
+  flag: (key, account, existing) => typeof account[key] === 'boolean' ? account[key] : Boolean(existing[key]),
+  priority: (key, account, existing) => toNumber(account[key] ?? existing[key] ?? DEFAULT_PRIORITY, DEFAULT_PRIORITY),
+  count: (key, account, existing) => Number(account[key] ?? existing[key] ?? 0),
+  created: (key, account, existing, timestamp) => existing[key] || timestamp,
+  updated: (key, account, existing, timestamp) => timestamp,
+  login: (key, account, existing, timestamp) => toText(account[key] ?? existing[key] ?? timestamp)
+};
+
+/**
+ * 账号的全部字段：`[字段名, 取值方式]`。
+ *
+ * ⚠️⚠️ **这个顺序就是 `AuthPool.json` 里的键顺序，不许动。**
+ *    写盘用的是给人看的缩进 JSON，重排会让整份文件 diff 全红
+ *    （内容等价，但主人手工救数据时得照着它读）。
+ *
+ * 加字段就加一行；删字段要连锅巴快照（`getGuobaAccounts`）和
+ * `replaceAccountsFromGuoba` 一起看，否则会出现「读得出来、存不回去」。
+ */
+const ACCOUNT_FIELDS = [['userId', 'id'], ['token', 'text'], ['userKey', 'text'], ['encodeRes', 'text'], ['openId', 'text'], ['gameOpenId', 'text'], ['gameRoleId', 'text'], ['gameServerId', 'text'], ['gameAreaId', 'text'], ['gameUserSex', 'text'], ['kohDimGender', 'text'], ['xLogUid', 'text'], ['traceparent', 'text'], ['accessToken', 'text'], ['refreshToken', 'text'], ['appOpenid', 'text'], ['avatar', 'text'], ['bigAvatar', 'text'], ['icon', 'text'], ['nickname', 'text'], ['snsnickname', 'text'], ['userName', 'text'], ['sex', 'text'], ['expires', 'text'], ['uin', 'text'], ['userSig', 'text'], ['realRegisterTime', 'text'], ['ownerBotUserId', 'id'], ['loginPlatform', 'text'], ['remark', 'text'], ['isGlobalDefault', 'flag'], ['priority', 'priority'], ['authInvalid', 'flag'], ['authErrorCount', 'count'], ['lastAuthErrorAt', 'text'], ['lastAuthErrorMessage', 'text'], ['lastSuccessAt', 'text'], ['createdAt', 'created'], ['updatedAt', 'updated'], ['lastLoginAt', 'login']];
+
+/**
+ * 账号摘要 —— 清理失效账号时「已删掉」和「跳过」两个名单共用这一份形状。
+ * 原先两处各抄了一遍，改一处漏一处就会让返回值和日志对不上。
+ */
+function summarizeAccount(account) {
+  return {
+    userId: account.userId,
+    ownerBotUserId: account.ownerBotUserId || '',
+    nickname: account.nickname || account.userName || '',
+    lastAuthErrorMessage: account.lastAuthErrorMessage || ''
+  };
 }
-
-function maskValue(value, keepStart = 6, keepEnd = 4) {
-  const text = toStringValue(value)
-  if (!text) {
-    return ''
-  }
-
-  if (text.length <= keepStart + keepEnd) {
-    return text
-  }
-
-  return `${text.slice(0, keepStart)}...${text.slice(-keepEnd)}`
-}
-
 class AuthStore {
-  #getDefaultPool() {
-    return { accounts: {} }
-  }
-
-  #getDefaultUserData() {
-    return {}
-  }
-
   /**
    * 全局账号轮询游标。只活在进程内存里，重启后从优先级最高的号重新开始。
    *
-   * 关键约束：**只有全局账号多于一个时它才会被推进**（见 #rotateGlobals 的调用点），
-   * 所以单账号场景下它恒为 0，候选顺序与引入轮询之前逐字节一致。
+   * ⚠️ 当前**没有任何调用方**：`getAuthCandidates` 刻意不轮转（见那里的说明），
+   *    轮转由 api.js 自己的游标做。这里留着是历史残留，行为上恒为 0。
    */
-  #globalCursor = 0
+  #globalCursor = 0;
 
   /**
    * 把本轮该用的全局账号转到队首，其余按原优先级跟在其后，并推进游标。
    *
-   * 是「旋转」而不是「只返回一个」：轮到的号万一失效，调用方（api.js 的候选循环）
-   * 还能顺着后面的号继续回退，现有的 failover 能力原样保留。
+   * ⚠️ 死代码：本类里没有调用点（`getAuthCandidates` 明确不轮转），
+   *    实际轮转在 `utils/api.js` 的 `#rotateGlobals`。保留原样待主人定去留。
    */
   #rotateGlobals(accounts = []) {
     if (accounts.length <= 1) {
-      return accounts
+      return accounts;
     }
-
-    const offset = this.#globalCursor % accounts.length
-    this.#globalCursor = (offset + 1) % accounts.length
-    return [...accounts.slice(offset), ...accounts.slice(0, offset)]
+    const offset = this.#globalCursor % accounts.length;
+    this.#globalCursor = (offset + 1) % accounts.length;
+    return [...accounts.slice(offset), ...accounts.slice(0, offset)];
   }
 
+  /** 全局账号排前面，然后按 priority 升序，最后用 userId 兜底成全序（排序结果必须稳定可预期） */
   #sortAccountsByPriority(accounts = []) {
     return [...accounts].sort((left, right) => {
-      const globalCompare = Number(Boolean(right.isGlobalDefault)) - Number(Boolean(left.isGlobalDefault))
+      const globalCompare = Number(Boolean(right.isGlobalDefault)) - Number(Boolean(left.isGlobalDefault));
       if (globalCompare !== 0) {
-        return globalCompare
+        return globalCompare;
       }
-
-      const priorityCompare = Number(left.priority || 0) - Number(right.priority || 0)
+      const priorityCompare = Number(left.priority || 0) - Number(right.priority || 0);
       if (priorityCompare !== 0) {
-        return priorityCompare
+        return priorityCompare;
       }
-
-      return String(left.userId).localeCompare(String(right.userId))
-    })
+      return String(left.userId).localeCompare(String(right.userId));
+    });
   }
+
+  /**
+   * 把一个账号归一化成落盘形状：字段类型收口、缺的字段按旧值补。
+   *
+   * 先 `{ ...existing, ...account }` 保住**老字段和键顺序**（池里手工加过的字段
+   * 不能因为这次归一化就丢掉），再按 `ACCOUNT_FIELDS` 逐字段覆盖 ——
+   * 覆盖已存在的键不会改变它在对象里的位置，所以最终键顺序 = 旧对象顺序 + 表里新增的键。
+   *
+   * @param {object} account 新数据
+   * @param {object} existing 池里已有的同号数据（新建账号时传空对象）
+   */
   #normalizeAccount(account = {}, existing = {}) {
-    const userId = normalizeUserId(account.userId || existing.userId)
-    const timestamp = new Date().toISOString()
-    const isGlobalDefault = typeof account.isGlobalDefault === 'boolean'
-      ? account.isGlobalDefault
-      : Boolean(existing.isGlobalDefault)
-    const authInvalid = typeof account.authInvalid === 'boolean'
-      ? account.authInvalid
-      : Boolean(existing.authInvalid)
-    const authErrorCount = Number(account.authErrorCount ?? existing.authErrorCount ?? 0)
-    const priority = toNumberValue(account.priority ?? existing.priority ?? 100, 100)
-
-    return {
+    const timestamp = new Date().toISOString();
+    const normalized = {
       ...existing,
-      ...account,
-      userId,
-      token: toStringValue(account.token ?? existing.token),
-      userKey: toStringValue(account.userKey ?? existing.userKey),
-      encodeRes: toStringValue(account.encodeRes ?? existing.encodeRes),
-      openId: toStringValue(account.openId ?? existing.openId),
-      gameOpenId: toStringValue(account.gameOpenId ?? existing.gameOpenId),
-      gameRoleId: toStringValue(account.gameRoleId ?? existing.gameRoleId),
-      gameServerId: toStringValue(account.gameServerId ?? existing.gameServerId),
-      gameAreaId: toStringValue(account.gameAreaId ?? existing.gameAreaId),
-      gameUserSex: toStringValue(account.gameUserSex ?? existing.gameUserSex),
-      kohDimGender: toStringValue(account.kohDimGender ?? existing.kohDimGender),
-      xLogUid: toStringValue(account.xLogUid ?? existing.xLogUid),
-      traceparent: toStringValue(account.traceparent ?? existing.traceparent),
-      accessToken: toStringValue(account.accessToken ?? existing.accessToken),
-      refreshToken: toStringValue(account.refreshToken ?? existing.refreshToken),
-      appOpenid: toStringValue(account.appOpenid ?? existing.appOpenid),
-      avatar: toStringValue(account.avatar ?? existing.avatar),
-      bigAvatar: toStringValue(account.bigAvatar ?? existing.bigAvatar),
-      icon: toStringValue(account.icon ?? existing.icon),
-      nickname: toStringValue(account.nickname ?? existing.nickname),
-      snsnickname: toStringValue(account.snsnickname ?? existing.snsnickname),
-      userName: toStringValue(account.userName ?? existing.userName),
-      sex: toStringValue(account.sex ?? existing.sex),
-      expires: toStringValue(account.expires ?? existing.expires),
-      uin: toStringValue(account.uin ?? existing.uin),
-      userSig: toStringValue(account.userSig ?? existing.userSig),
-      realRegisterTime: toStringValue(account.realRegisterTime ?? existing.realRegisterTime),
-      ownerBotUserId: normalizeUserId(account.ownerBotUserId || existing.ownerBotUserId),
-      loginPlatform: toStringValue(account.loginPlatform ?? existing.loginPlatform),
-      remark: toStringValue(account.remark ?? existing.remark),
-      isGlobalDefault,
-      priority,
-      authInvalid,
-      authErrorCount,
-      lastAuthErrorAt: toStringValue(account.lastAuthErrorAt ?? existing.lastAuthErrorAt),
-      lastAuthErrorMessage: toStringValue(account.lastAuthErrorMessage ?? existing.lastAuthErrorMessage),
-      lastSuccessAt: toStringValue(account.lastSuccessAt ?? existing.lastSuccessAt),
-      createdAt: existing.createdAt || timestamp,
-      updatedAt: timestamp,
-      lastLoginAt: toStringValue(account.lastLoginAt ?? existing.lastLoginAt ?? timestamp)
+      ...account
+    };
+    for (const [key, kind] of ACCOUNT_FIELDS) {
+      normalized[key] = FIELD_RESOLVERS[kind](key, account, existing, timestamp);
     }
+    return normalized;
   }
 
+  /** 整池归一化：丢掉空 userId 的条目，其余逐个走 #normalizeAccount */
   #normalizePool(pool = {}) {
-    const sourceAccounts = pool.accounts && typeof pool.accounts === 'object' ? pool.accounts : {}
-    const accounts = {}
-
+    const sourceAccounts = pool.accounts && typeof pool.accounts === 'object' ? pool.accounts : {};
+    const accounts = {};
     for (const [userId, account] of Object.entries(sourceAccounts)) {
-      const normalizedUserId = normalizeUserId(userId || account?.userId)
+      const normalizedUserId = toText(userId || account?.userId);
       if (!normalizedUserId) {
-        continue
+        continue;
       }
 
+      // ⚠️⚠️ 必须把**原账号**当 `existing` 传进去（2026-10-06 修）。
+      //    原先漏了这第三个参数，`#normalizeAccount(account, existing = {})` 于是拿到空对象，
+      //    `FIELD_RESOLVERS.created` 里的 `existing[key]` 恒为 undefined →
+      //    每次都走 `|| timestamp` 分支 → **`createdAt` 每次落盘都被刷成当前时间**。
+      //    `#patchAccount`（另一条路径）是传了 `previous` 的，所以两条路径行为不一致，
+      //    这个不一致正是它能长期藏住的原因。
+      //
+      //    实测：两个账号 createdAt 分别是 2026-01-01 / 2026-02-02，
+      //    过一次 `#savePool` 后**都变成 2026-03-03**；
+      //    对照组走 `#patchAccount` 的旧值原样保留。
+      //    线上 `data/AuthPool.json` 5 个账号的 `createdAt` **完全相同**、
+      //    `updatedAt` 也完全相同，而 `lastLoginAt` 各不相同 —— 只有这两个被抹平了。
+      //
+      //    影响：代码里明确写着「出事后只能靠翻 createdAt 反推」，这个字段的用途
+      //    就是事后追查；它恒等于「最后一次落盘时间」等于追查能力没了。
+      //    ⚠️ 循环里先读后写：`pool.accounts[normalizedUserId]` 此时还是旧值
+      //    （我们写的是新建的 `accounts`，不碰 `sourceAccounts`）。
+      const existing = sourceAccounts[normalizedUserId] || {};
       accounts[normalizedUserId] = this.#normalizeAccount({
         ...account,
         userId: normalizedUserId
-      })
+      }, existing);
     }
-
-    return { accounts }
+    return {
+      accounts
+    };
   }
-
   #savePool(pool) {
-    writeJsonPretty(AUTH_POOL_FILE, this.#normalizePool(pool))
+    writeJsonPretty(AUTH_POOL_FILE, this.#normalizePool(pool));
   }
-
   #saveUserData(userData) {
-    ensureDirectory(USER_DATA_FILE)
-    writeYamlFile(USER_DATA_FILE, userData)
+    // 目录由 writeFileAtomic 负责建，这里不用再来一次
+    writeYamlFile(USER_DATA_FILE, userData);
   }
 
+  /** 老的 `AuthPool.yaml` 只在「json 还没有、yaml 还在」时迁移一次 */
   #migrateLegacyPoolIfNeeded() {
     if (fs.existsSync(AUTH_POOL_FILE) || !fs.existsSync(LEGACY_AUTH_POOL_FILE)) {
-      return
+      return;
     }
-
-    const legacyPool = readYamlSafe(LEGACY_AUTH_POOL_FILE, this.#getDefaultPool())
-    this.#savePool(legacyPool)
+    const legacyPool = readYamlSafe(LEGACY_AUTH_POOL_FILE, EMPTY_POOL);
+    this.#savePool(legacyPool);
   }
 
-  getPool() {
-    this.#migrateLegacyPoolIfNeeded()
-    return this.#normalizePool(readJsonSafe(AUTH_POOL_FILE, this.#getDefaultPool()))
-  }
-
-  getAccount(userId) {
-    const normalizedUserId = normalizeUserId(userId)
+  /**
+   * 「找到账号 → 打补丁 → 落盘」的公共骨架。
+   *
+   * `markAuthFailure` / `markAuthSuccess` / `unmarkAuthFailure` 的补丁+落盘部分
+   * 一模一样（空 userId 给 null、账号不存在给 null、归一化、写回、存盘），
+   * 差别只在补丁内容与各自的前置判据（markAuthSuccess 有「无事早退」节流，
+   * 见它自己的注释），所以骨架收在这里。
+   *
+   * 补丁用**回调**而不是现成对象：`authErrorCount` 要拿池里的旧值 +1，
+   * 调用方必须先看到旧值才能算出来。
+   *
+   * @param {string} userId
+   * @param {(previous: object) => object} makeChanges 基于旧值算出要改的字段
+   * @returns {{ previous: object, next: object }|null}
+   */
+  #patchAccount(userId, makeChanges) {
+    const normalizedUserId = toText(userId);
     if (!normalizedUserId) {
-      return null
+      return null;
     }
-
-    return this.getPool().accounts[normalizedUserId] || null
+    const pool = this.getPool();
+    const previous = pool.accounts[normalizedUserId];
+    if (!previous) {
+      return null;
+    }
+    const next = this.#normalizeAccount({
+      ...previous,
+      ...makeChanges(previous)
+    }, previous);
+    pool.accounts[normalizedUserId] = next;
+    this.#savePool(pool);
+    return {
+      previous,
+      next
+    };
   }
-
+  getPool() {
+    this.#migrateLegacyPoolIfNeeded();
+    return this.#normalizePool(readJsonSafe(AUTH_POOL_FILE, EMPTY_POOL));
+  }
+  getAccount(userId) {
+    const normalizedUserId = toText(userId);
+    if (!normalizedUserId) {
+      return null;
+    }
+    return this.getPool().accounts[normalizedUserId] || null;
+  }
   listAccounts() {
-    return this.#sortAccountsByPriority(Object.values(this.getPool().accounts))
+    return this.#sortAccountsByPriority(Object.values(this.getPool().accounts));
   }
-
   upsertAccount(account) {
-    const userId = normalizeUserId(account.userId)
+    const userId = toText(account.userId);
     if (!userId) {
-      throw new Error('缺少营地 userId，无法保存登录态')
+      throw new Error('缺少营地 userId，无法保存登录态');
     }
-
-    const pool = this.getPool()
-    const existing = pool.accounts[userId] || {}
+    const pool = this.getPool();
+    const existing = pool.accounts[userId] || {};
     const next = this.#normalizeAccount({
       ...account,
       userId
-    }, existing)
-
+    }, existing);
     if (account.resetAuthState) {
-      next.authInvalid = false
-      next.authErrorCount = 0
-      next.lastAuthErrorAt = ''
-      next.lastAuthErrorMessage = ''
+      next.authInvalid = false;
+      next.authErrorCount = 0;
+      next.lastAuthErrorAt = '';
+      next.lastAuthErrorMessage = '';
     }
-
-    pool.accounts[userId] = next
+    pool.accounts[userId] = next;
 
     // 刻意不再「一山不容二虎」地清掉其他全局账号：全局账号现在是一个轮询池
-    // （见 getAuthCandidates 里的 #rotateGlobals），扫码登记第二个号不该把第一个顶掉。
+    // （轮转在 api.js 的 #rotateGlobals），扫码登记第二个号不该把第一个顶掉。
 
-    this.#savePool(pool)
-    logger.debug('[营地账号池] 已保存账号登录态', {
+    this.#savePool(pool);
+    logger.debug(`${LOG_TAG} 已保存账号登录态`, {
       userId: next.userId,
       ownerBotUserId: next.ownerBotUserId,
       loginPlatform: next.loginPlatform,
       isGlobalDefault: next.isGlobalDefault,
       priority: next.priority,
-      token: maskValue(next.token),
-      userKey: maskValue(next.userKey),
-      encodeRes: maskValue(next.encodeRes),
-      appOpenid: maskValue(next.appOpenid),
-      openId: maskValue(next.openId),
-      gameOpenId: maskValue(next.gameOpenId),
+      token: maskSecret(next.token),
+      userKey: maskSecret(next.userKey),
+      encodeRes: maskSecret(next.encodeRes),
+      appOpenid: maskSecret(next.appOpenid),
+      openId: maskSecret(next.openId),
+      gameOpenId: maskSecret(next.gameOpenId),
       gameRoleId: next.gameRoleId,
       gameServerId: next.gameServerId,
       gameAreaId: next.gameAreaId,
       gameUserSex: next.gameUserSex,
       kohDimGender: next.kohDimGender,
       nickname: next.nickname || next.userName || ''
-    })
-    return next
+    });
+    return next;
   }
 
+  /**
+   * 标记登录态失效：累加错误次数、记下最后一条错因，并回一句「这次是不是**刚**失效」。
+   * `newlyInvalid` 是给 api.js 用的 —— 它只在「刚失效」那一次私信主人，
+   * 否则一个坏号会按请求量反复轰炸。
+   */
   markAuthFailure(userId, message = '') {
-    const normalizedUserId = normalizeUserId(userId)
-    if (!normalizedUserId) {
-      return null
-    }
-
-    const pool = this.getPool()
-    const account = pool.accounts[normalizedUserId]
-    if (!account) {
-      return null
-    }
-
-    const next = this.#normalizeAccount({
-      ...account,
+    const patched = this.#patchAccount(userId, account => ({
       authInvalid: true,
       authErrorCount: Number(account.authErrorCount || 0) + 1,
       lastAuthErrorAt: new Date().toISOString(),
-      lastAuthErrorMessage: toStringValue(message)
-    }, account)
-
-    pool.accounts[normalizedUserId] = next
-    this.#savePool(pool)
-    logger.warn('[营地账号池] 已标记账号登录态失效', {
+      lastAuthErrorMessage: toText(message)
+    }));
+    if (!patched) {
+      return null;
+    }
+    const {
+      previous,
+      next
+    } = patched;
+    logger.warn(`${LOG_TAG} 已标记账号登录态失效`, {
       userId: next.userId,
       ownerBotUserId: next.ownerBotUserId,
       isGlobalDefault: next.isGlobalDefault,
       authErrorCount: next.authErrorCount,
       lastAuthErrorMessage: next.lastAuthErrorMessage
-    })
+    });
     return {
       ...next,
-      newlyInvalid: !Boolean(account.authInvalid)
-    }
+      newlyInvalid: !Boolean(previous.authInvalid)
+    };
   }
 
+  /**
+   * 登录成功：清掉失效标记和错误计数，记下成功时间。
+   *
+   * ⚠️ **无事早退**：账号本来就健康（没标 authInvalid、没有错误计数、没有
+   *    lastAuthErrorAt/Message）时，一次成功请求没有任何**状态**要纠正，
+   *    只读不写。这条路径原先是每个成功请求都全量重写 AuthPool.json
+   *    （一天数千次磁盘放大，还把全池 updatedAt 刷成一样，审计意义归零）。
+   *    读盘这一步省不掉：AuthPool 是唯一事实源，锅巴/手工随时会改它，
+   *    不能加内存缓存假装没这回事——省掉的是写，不是读。
+   *
+   * ⚠️ `lastSuccessAt` 剩余的唯一语义是「大概最后一次成功」（锅巴面板展示用，
+   *    没有任何逻辑消费它的新鲜度，别拿它当覆盖率指标），所以**节流写盘**：距上次落盘不足
+   *    `LAST_SUCCESS_FLUSH_MS` 就只在内存里攒着，到点随下一次成功一起写。
+   */
   markAuthSuccess(userId) {
-    const normalizedUserId = normalizeUserId(userId)
+    const normalizedUserId = toText(userId);
     if (!normalizedUserId) {
-      return null
+      return null;
     }
-
-    const pool = this.getPool()
-    const account = pool.accounts[normalizedUserId]
+    const account = this.getAccount(normalizedUserId);
     if (!account) {
-      return null
+      return null;
     }
+    const now = Date.now();
+    const isHealthy = !account.authInvalid && !Number(account.authErrorCount || 0) && !toText(account.lastAuthErrorAt) && !toText(account.lastAuthErrorMessage);
 
-    const next = this.#normalizeAccount({
-      ...account,
+    // 健康账号：唯一的变化是 lastSuccessAt，节流——距上次落盘未到点就不写
+    if (isHealthy) {
+      const lastFlushedAt = Date.parse(toText(account.lastSuccessAt)) || 0;
+      if (now - lastFlushedAt < LAST_SUCCESS_FLUSH_MS) {
+        return account;
+      }
+    }
+    const patched = this.#patchAccount(normalizedUserId, () => ({
       authInvalid: false,
       authErrorCount: 0,
       lastAuthErrorAt: '',
       lastAuthErrorMessage: '',
       lastSuccessAt: new Date().toISOString()
-    }, account)
-
-    pool.accounts[normalizedUserId] = next
-    this.#savePool(pool)
-    return next
+    }));
+    return patched ? patched.next : null;
   }
 
+  /**
+   * 撤销一轮「误判的失效标记」——给 api.js 候选循环末尾的
+   * 「全部候选以相同原因失败 → 判定为配置/系统问题」保险用。
+   *
+   * ⚠️ `expectedMessage` 必须与该账号池里**当前**的 lastAuthErrorMessage 一致
+   *    才撤销：并发请求可能刚用别的原因标过这个号，那种标记不归本轮管，
+   *    撤了就是把别的事故现场抹掉。
+   */
+  unmarkAuthFailure(userId, expectedMessage = '') {
+    const normalizedUserId = toText(userId);
+    if (!normalizedUserId) {
+      return null;
+    }
+    const account = this.getAccount(normalizedUserId);
+    if (!account || !account.authInvalid) {
+      return null;
+    }
+    if (toText(account.lastAuthErrorMessage) !== toText(expectedMessage)) {
+      return null;
+    }
+    const patched = this.#patchAccount(normalizedUserId, previous => ({
+      authInvalid: false,
+      // 错误计数本轮 +1 过了，撤回时也减回来（不到 0 以下），保持「计数 ≈ 真实失效次数」
+      authErrorCount: Math.max(0, Number(previous.authErrorCount || 0) - 1),
+      lastAuthErrorAt: '',
+      lastAuthErrorMessage: ''
+    }));
+    if (patched) {
+      logger.warn(`${LOG_TAG} 已撤销账号登录态失效标记（判定为系统/配置问题）`, {
+        userId: patched.next.userId,
+        ownerBotUserId: patched.next.ownerBotUserId,
+        isGlobalDefault: patched.next.isGlobalDefault
+      });
+      return patched.next;
+    }
+    return null;
+  }
+
+  /**
+   * 设置全局账号：传 userId 就把那一个设成全局、其余全部取消；传空串则全部取消。
+   * 账号池里没有这个 userId 时抛错（静默成功会让主人以为设上了）。
+   */
   setGlobalAccount(userId = '') {
-    const normalizedUserId = normalizeUserId(userId)
-    const pool = this.getPool()
-    let found = !normalizedUserId
-
+    const normalizedUserId = toText(userId);
+    const pool = this.getPool();
+    let found = !normalizedUserId;
     for (const [accountUserId, account] of Object.entries(pool.accounts)) {
-      const shouldBeGlobal = normalizedUserId && accountUserId === normalizedUserId
+      // ⚠️⚠️ 左边**必须再包一层 `Boolean`**（2026-10-05 修）。
+      //
+      // 裸写 `normalizedUserId && accountUserId === normalizedUserId` 时，
+      // `&&` 短路返回的是**左操作数本身**：传空串时结果是 `''` 而不是 `false`。
+      // 而 #normalizeAccount 的 flag 分支只认真正的布尔
+      // （`typeof account[key] === 'boolean'`），拿到 `''` 会**沿用池里的旧标记** ——
+      // 于是 `setGlobalAccount('')` 一个全局标记都清不掉（上游一直是这个行为）。
+      //
+      // 这不是「特意保留的怪癖」，上游就是错的：传空串的语义是「全部取消」，
+      // 清不掉等于这个入口白给。包成布尔之后两条语义都对：
+      //   传 userId → 那一个是 true、其余是 false
+      //   传空串   → 全部是 false
+      const shouldBeGlobal = Boolean(normalizedUserId) && accountUserId === normalizedUserId;
       if (shouldBeGlobal) {
-        found = true
+        found = true;
       }
-
       if (Boolean(account.isGlobalDefault) === Boolean(shouldBeGlobal)) {
-        continue
+        continue;
       }
-
       pool.accounts[accountUserId] = this.#normalizeAccount({
         ...account,
         isGlobalDefault: shouldBeGlobal
-      }, account)
+      }, account);
     }
-
     if (!found) {
-      throw new Error(`账号池中不存在营地账号 ${normalizedUserId}`)
+      throw new Error(`账号池中不存在营地账号 ${normalizedUserId}`);
     }
-
-    this.#savePool(pool)
-    return normalizedUserId
+    this.#savePool(pool);
+    return normalizedUserId;
   }
 
+  /** 优先级最高的那个全局账号（多个全局号时只是「第一个」，实际用哪个由 api.js 轮转决定） */
   getGlobalAccount() {
-    const globals = this.#sortAccountsByPriority(
-      this.listAccounts().filter(account => account.isGlobalDefault)
-    )
-
-    return globals[0] || null
+    return this.listAccounts().find(account => account.isGlobalDefault) || null;
   }
-
   getGlobalAccountId() {
-    return this.getGlobalAccount()?.userId || ''
+    return this.getGlobalAccount()?.userId || '';
   }
 
   /**
@@ -412,18 +600,20 @@ class AuthStore {
    * ⚠️ `includeOrphan`：这之前扫的全局账号 `ownerBotUserId` 是空的（那时全局登录只有主人能发，
    * 所以那批号一律算主人的）。主人查询时传 true 才不会把老号漏掉。
    */
-  listGlobalAccountsByOwner(botUserId, { includeOrphan = false } = {}) {
-    const owner = normalizeUserId(botUserId)
+  listGlobalAccountsByOwner(botUserId, {
+    includeOrphan = false
+  } = {}) {
+    const owner = toText(botUserId);
     return this.listAccounts().filter(account => {
       if (!account.isGlobalDefault || account.authInvalid || !isUsableAuth(account)) {
-        return false
+        return false;
       }
-      const accountOwner = normalizeUserId(account.ownerBotUserId)
+      const accountOwner = toText(account.ownerBotUserId);
       if (!accountOwner) {
-        return includeOrphan
+        return includeOrphan;
       }
-      return Boolean(owner) && accountOwner === owner
-    })
+      return Boolean(owner) && accountOwner === owner;
+    });
   }
 
   /**
@@ -437,152 +627,163 @@ class AuthStore {
       ...account,
       isGlobalDefault: true,
       resetAuthState: true
-    })
-
+    });
     logger.info('[营地全局账号] 已更新全局账号池配置', {
       userId: next.userId,
-      token: maskValue(next.token),
-      userKey: maskValue(next.userKey),
-      encodeRes: maskValue(next.encodeRes)
-    })
-
-    return next
+      token: maskSecret(next.token),
+      userKey: maskSecret(next.userKey),
+      encodeRes: maskSecret(next.encodeRes)
+    });
+    return next;
   }
-
   removeAccount(userId) {
-    const normalizedUserId = normalizeUserId(userId)
+    const normalizedUserId = toText(userId);
     if (!normalizedUserId) {
-      return false
+      return false;
     }
-
-    const pool = this.getPool()
+    const pool = this.getPool();
     if (!pool.accounts[normalizedUserId]) {
-      return false
+      return false;
     }
-
-    delete pool.accounts[normalizedUserId]
-    this.#savePool(pool)
-    return true
+    delete pool.accounts[normalizedUserId];
+    this.#savePool(pool);
+    return true;
   }
 
+  /**
+   * 清理失效登录态，**全局账号除外** —— 全局号失效要么重扫要么留着看错因，
+   * 静默删掉会让主人不知道「为什么突然没号可用了」。
+   *
+   * @returns {{removedAccounts: object[], skippedGlobalAccounts: object[]}}
+   */
   clearInvalidAccounts() {
-    const pool = this.getPool()
-    const removedAccounts = []
-    const skippedGlobalAccounts = []
-
+    const pool = this.getPool();
+    const removedAccounts = [];
+    const skippedGlobalAccounts = [];
     for (const account of Object.values(pool.accounts)) {
       if (!account?.authInvalid) {
-        continue
+        continue;
       }
-
       if (account.isGlobalDefault) {
-        skippedGlobalAccounts.push({
-          userId: account.userId,
-          ownerBotUserId: account.ownerBotUserId || '',
-          nickname: account.nickname || account.userName || '',
-          lastAuthErrorMessage: account.lastAuthErrorMessage || ''
-        })
-        continue
+        skippedGlobalAccounts.push(summarizeAccount(account));
+        continue;
       }
-
-      removedAccounts.push({
-        userId: account.userId,
-        ownerBotUserId: account.ownerBotUserId || '',
-        nickname: account.nickname || account.userName || '',
-        lastAuthErrorMessage: account.lastAuthErrorMessage || ''
-      })
-
-      delete pool.accounts[account.userId]
+      removedAccounts.push(summarizeAccount(account));
+      delete pool.accounts[account.userId];
     }
-
     if (!removedAccounts.length) {
       return {
         removedAccounts,
         skippedGlobalAccounts
-      }
+      };
     }
-
-    this.#savePool(pool)
-
-    logger.info('[营地账号池] 已清理失效登录态', {
+    this.#savePool(pool);
+    logger.info(`${LOG_TAG} 已清理失效登录态`, {
       removedCount: removedAccounts.length,
       skippedGlobalCount: skippedGlobalAccounts.length,
       removedAccounts,
       skippedGlobalAccounts
-    })
-
+    });
     return {
       removedAccounts,
       skippedGlobalAccounts
-    }
+    };
   }
 
-  bindCampUserId(botUserId, campUserId) {
-    const normalizedBotUserId = normalizeUserId(botUserId)
-    const normalizedCampUserId = normalizeUserId(campUserId)
-    const userData = readYamlSafe(USER_DATA_FILE, this.#getDefaultUserData())
+  /**
+   * 取一个机器人用户**当前选中的**营地号（`UserData.yaml` 的 `{ ids, current }`）。
+   *
+   * ## 为什么需要它
+   *
+   * 一个人名下可以绑好几个营地号（主人就有 5 个）。要做「账号级」的事
+   * （`#营地兑换` 花币、查余额这类）时，**必须有个明确的「用哪个号」**。
+   *
+   * ⚠️⚠️ **别拿 `listGlobalAccountsByOwner(...)[0]` 当「当前号」** ——
+   *    那个列表是按 `isGlobalDefault` → `priority` → **userId 字符串**排的，
+   *    多号之间这些字段往往完全相同（主人 5 个号 priority 都是 100），
+   *    于是「第一个」实际由 **userId 的字典序**决定 —— 2026-10-11 实测就因此
+   *    把别人（`1476924610`）的号当成了主人的默认号显示出来。
+   *    「当前号」只有 `UserData.yaml` 里的 `current` 说了算。
+   *
+   * ⚠️ `current` 是**下标**不是 id：它在 `ids` 里越界（手改 YAML、备份还原、
+   *    删过号）时回落第一个，**不抛错** —— 展示用的东西不该让指令整个挂掉。
+   *
+   * @param {string} botUserId 机器人用户（QQ 号）
+   * @returns {string} 当前营地号；没绑过就回 `''`
+   */
+  getCurrentCampUserId(botUserId) {
+    const id = toText(botUserId);
+    if (!id) return '';
+    const userData = readYamlSafe(USER_DATA_FILE, EMPTY_USER_DATA);
+    const entry = userData?.[id];
+    if (!entry || !Array.isArray(entry.ids) || !entry.ids.length) return '';
+    const index = Number(entry.current);
+    const picked = Number.isInteger(index) && index >= 0 && index < entry.ids.length ? entry.ids[index] : entry.ids[0];
+    return toText(picked);
+  }
 
+  /**
+   * 把营地ID绑到机器人用户身上（`UserData.yaml` 里 `{ ids: [], current: 0 }` 那套）。
+   * 已绑过的号不重复入列，只把它切到 `current`。
+   */
+  bindCampUserId(botUserId, campUserId) {
+    const normalizedBotUserId = toText(botUserId);
+    const normalizedCampUserId = toText(campUserId);
+    const userData = readYamlSafe(USER_DATA_FILE, EMPTY_USER_DATA);
     if (!userData[normalizedBotUserId]) {
       userData[normalizedBotUserId] = {
         ids: [],
         current: 0
-      }
+      };
     }
-
-    const entry = userData[normalizedBotUserId]
-
+    const entry = userData[normalizedBotUserId];
     if (!Array.isArray(entry.ids)) {
-      entry.ids = []
+      entry.ids = [];
     }
-
-    let index = entry.ids.indexOf(normalizedCampUserId)
+    let index = entry.ids.indexOf(normalizedCampUserId);
     if (index === -1) {
-      entry.ids.push(normalizedCampUserId)
-      index = entry.ids.length - 1
+      entry.ids.push(normalizedCampUserId);
+      index = entry.ids.length - 1;
     }
-
-    entry.current = index
-    this.#saveUserData(userData)
-    logger.debug('[营地账号池] 已绑定营地ID到机器人用户', {
+    entry.current = index;
+    this.#saveUserData(userData);
+    logger.debug(`${LOG_TAG} 已绑定营地ID到机器人用户`, {
       botUserId: normalizedBotUserId,
       campUserId: normalizedCampUserId,
       current: entry.current,
       ids: entry.ids
-    })
-    return entry
+    });
+    return entry;
   }
 
   /**
    * 挑这次请求可以用的鉴权账号。
    *
-   * 现在**只有全局账号**这一类候选，多个时轮询（见 #rotateGlobals）。
-   * 早先还有「共享账号」和「个人登录态兜底」两档，都是「全局账号都不可用才轮到」的
-   * 兜底——多全局账号轮询 + 按账号冷却换号之后，那个前提基本不会发生，
-   * 2026-09-13 一并删掉了（连字段一起）。
+   * 现在**只有全局账号**这一类候选。早先还有「共享账号」和「个人登录态兜底」两档，
+   * 都是「全局账号都不可用才轮到」的兜底——多全局账号轮询 + 按账号冷却换号之后，
+   * 那个前提基本不会发生，2026-09-13 一并删掉了（连字段一起）。
    *
    * `targetUserId` 参数留着是为了不给调用方添改动，实际已经用不到了。
+   *
+   * @param {string} targetUserId 已废弃，仅为兼容调用方保留
+   * @param {{includeGlobal?: boolean}} options
    */
   getAuthCandidates(targetUserId, options = {}) {
-    const { includeGlobal = true } = options
-    const pool = this.getPool()
-    const candidates = []
-    const seen = new Set()
-
+    const {
+      includeGlobal = true
+    } = options;
+    const pool = this.getPool();
+    const candidates = [];
+    const seen = new Set();
     const pushCandidate = (auth, source, label) => {
-      if (!isUsableAuth(auth)) {
-        return
+      if (!isUsableAuth(auth) || auth.authInvalid) {
+        return;
       }
-
-      if (auth.authInvalid) {
-        return
-      }
-
-      const key = normalizeUserId(auth.userId)
+      const key = toText(auth.userId);
       if (!key || seen.has(key)) {
-        return
+        return;
       }
-
-      seen.add(key)
+      seen.add(key);
       candidates.push({
         auth: {
           ...auth,
@@ -590,32 +791,36 @@ class AuthStore {
         },
         source,
         label: label || key
-      })
+      });
+    };
+    const globalAccounts = includeGlobal ? this.#sortAccountsByPriority(Object.values(pool.accounts).filter(account => account.isGlobalDefault)) : [];
+    // ⚠️⚠️ 这里**不要再 rotate**：api.js 的 `#getAuthCandidates` 已经转过一次了。
+    //   两处都转 = 每次请求队首前进 **2** 格，池子大小是偶数时「奇数位永远当不上队首」
+    //   → **一半的账号从来不会被用到**（2026-09-19 实测：8 个号实际只用到 4 个，
+    //   另一半一直闲置到登录态失效）。
+    //   轮转的活儿交给调用方做（api.js 那边有游标和日志），这里只负责「给全 + 排好序」。
+    for (const globalAccount of globalAccounts) {
+      pushCandidate(globalAccount, 'global', `全局账号 ${globalAccount.userId}`);
     }
-
-    if (includeGlobal) {
-      const globalAccounts = this.#sortAccountsByPriority(
-        Object.values(pool.accounts).filter(account => account.isGlobalDefault)
-      )
-      // ⚠️⚠️ 这里**不要再 rotate**：api.js 的 `#getAuthCandidates` 已经转过一次了。
-      //   两处都转 = 每次请求队首前进 **2** 格，池子大小是偶数时「奇数位永远当不上队首」
-      //   → **一半的账号从来不会被用到**（2026-09-19 实测：8 个号实际只用到 4 个，
-      //   另一半一直闲置到登录态失效，保活也救不到它们）。
-      //   轮转的活儿交给调用方做（api.js 那边有游标和日志），这里只负责「给全 + 排好序」。
-      for (const globalAccount of globalAccounts) {
-        pushCandidate(globalAccount, 'global', `全局账号 ${globalAccount.userId}`)
-      }
-    }
-
-    return candidates
+    return candidates;
   }
 
+  /**
+   * 锅巴面板要的账号快照。
+   *
+   * ⚠️ 这份形状是锅巴表单的**数据契约**：字段名和 `replaceAccountsFromGuoba`
+   *    的读取一一对应，两边同时加/删，否则会出现「表单里看不到」或「存回去就丢」。
+   *    这里不做排序（`listAccounts` 已经排好）。
+   */
   getGuobaAccounts() {
     return this.listAccounts().map(account => ({
       userId: account.userId,
       ownerBotUserId: account.ownerBotUserId,
       isGlobalDefault: Boolean(account.isGlobalDefault),
-      priority: Number(account.priority || 100),
+      // ⚠️ 用 `??` 而不是 `||`（2026-10-06 修）：`priority: 0` 是**合法值**（数值越小越优先），
+      //    `||` 会把它吞成 DEFAULT_PRIORITY，而这个函数的输出正是锅巴表单契约 ——
+      //    于是「手工把优先级设成 0」的账号在面板上显示 100、保存一次就被静默降级。
+      priority: Number(account.priority ?? DEFAULT_PRIORITY),
       authInvalid: Boolean(account.authInvalid),
       authErrorCount: Number(account.authErrorCount || 0),
       nickname: account.nickname || account.userName || '',
@@ -649,89 +854,108 @@ class AuthStore {
       lastSuccessAt: account.lastSuccessAt || '',
       lastAuthErrorAt: account.lastAuthErrorAt || '',
       lastAuthErrorMessage: account.lastAuthErrorMessage || ''
-    }))
+    }));
   }
 
+  /**
+   * 锅巴整表保存：用 payload 覆盖整池（payload 里没有的号就是被删了）。
+   *
+   * ⚠️⚠️ `isGlobalDefault` 只在 payload **明确给了布尔值**时才改，其余沿用池子里的现状。
+   *
+   * 原本写的是 `Boolean(item.isGlobalDefault)`：payload 里少了这个字段（undefined）
+   * 就会被静默算成 false，把「扫码登录时设成的全局账号」一把刷回非全局。
+   * 2026-09-20 实测踩到：主人用 #营地QQ全局登录 扫的号，锅巴保存一次之后就
+   * 不在全局名单里了 —— #营地消息开 再也管不着它，而号本身还是好的
+   * （token / userSig 都在），排查时极难对上账。
+   *
+   * 注意：拿 `existing.isGlobalDefault` 兜底而不是包成 Boolean(existing...)，
+   * 是为了保留「面板上显式关掉某个全局号」的能力（那时 payload 带的是明确的 false）。
+   */
   replaceAccountsFromGuoba(accounts = []) {
-    const pool = this.getPool()
-    const nextAccounts = {}
-
+    const pool = this.getPool();
+    const nextAccounts = {};
     for (const item of accounts) {
-      const userId = normalizeUserId(item.userId)
+      const userId = toText(item.userId);
       if (!userId) {
-        continue
+        continue;
       }
-
-      const existing = pool.accounts[userId] || {}
-
-      // ⚠️⚠️ 只在 payload **明确给了布尔值**时才改全局标记，其余沿用池子里的现状。
-      //
-      // 原本写的是 `Boolean(item.isGlobalDefault)`：payload 里少了这个字段（undefined）
-      // 就会被静默算成 false，把「扫码登录时设成的全局账号」一把刷回非全局。
-      // 2026-09-20 实测踩到：主人用 #营地QQ全局登录 扫的号，锅巴保存一次之后就
-      // 不在全局名单里了 —— #营地消息开 再也管不着它，而号本身还是好的
-      // （token / userSig 都在），排查时极难对上账。
-      //
-      // 注意：拿 `existing.isGlobalDefault` 兜底而不是包成 Boolean(existing...)，
-      // 是为了保留「面板上显式关掉某个全局号」的能力（那时 payload 带的是明确的 false）。
-      const isGlobalDefault = typeof item.isGlobalDefault === 'boolean'
-        ? item.isGlobalDefault
-        : Boolean(existing.isGlobalDefault)
+      const existing = pool.accounts[userId] || {};
+      const isGlobalDefault = typeof item.isGlobalDefault === 'boolean' ? item.isGlobalDefault : Boolean(existing.isGlobalDefault);
 
       // 被从全局刷成非全局时留一条日志：这种改动以前是完全静默的，
       // 出事后只能靠翻 createdAt 反推。
       if (existing.isGlobalDefault === true && isGlobalDefault === false) {
-        logger.warn(
-          `[营地账号池] 全局账号 ${userId} 被标记为非全局（isGlobalDefault: true → false）`
-        )
+        logger.warn(`${LOG_TAG} 全局账号 ${userId} 被标记为非全局（isGlobalDefault: true → false）`);
       }
-      const next = this.#normalizeAccount({
+
+      // ⭐ 救回语义：主人在面板上把关键凭证换成了**新值**（且不是清空），说明这个号
+      //    被人工修过 —— 旧的「登录态失效」标记继续留着的话，请求照样跳过它，等于白修。
+      //    检测到凭证变化就把 authInvalid 和累计的错误计数/时间/文案一并清掉，
+      //    让号回到候选里，由后续真实请求重新验证。
+      //    ⚠️ 空串提交（把字段清空了）不算修复：那号坏得更彻底了，原 flag 必须保持。
+      const credentialChanged = ['token', 'userKey', 'encodeRes', 'userSig'].some(field => {
+        const incoming = toText(item[field]);
+        return incoming && incoming !== toText(existing[field]);
+      });
+      const rescued = Boolean(existing.authInvalid) && credentialChanged;
+      if (rescued) {
+        logger.warn(`${LOG_TAG} 账号 ${userId} 凭证被手动更新（锅巴保存），撤销登录态失效标记与错误计数，等待真实请求重新验证`);
+      }
+      nextAccounts[userId] = this.#normalizeAccount({
         ...existing,
         userId,
-        ownerBotUserId: normalizeUserId(item.ownerBotUserId),
+        ownerBotUserId: toText(item.ownerBotUserId),
         isGlobalDefault,
-        priority: toNumberValue(item.priority ?? existing.priority ?? 100, 100),
-        authInvalid: Boolean(item.authInvalid),
-        authErrorCount: Number(item.authErrorCount ?? existing.authErrorCount ?? 0),
-        nickname: toStringValue(item.nickname || existing.nickname || existing.userName),
-        userName: toStringValue(item.userName),
-        snsnickname: toStringValue(item.snsnickname),
-        remark: toStringValue(item.remark),
-        token: toStringValue(item.token),
-        userKey: toStringValue(item.userKey),
-        encodeRes: toStringValue(item.encodeRes),
-        accessToken: toStringValue(item.accessToken),
-        refreshToken: toStringValue(item.refreshToken),
-        appOpenid: toStringValue(item.appOpenid),
-        openId: toStringValue(item.openId),
-        gameOpenId: toStringValue(item.gameOpenId),
-        gameRoleId: toStringValue(item.gameRoleId),
-        gameServerId: toStringValue(item.gameServerId),
-        gameAreaId: toStringValue(item.gameAreaId),
-        gameUserSex: toStringValue(item.gameUserSex),
-        kohDimGender: toStringValue(item.kohDimGender),
-        avatar: toStringValue(item.avatar),
-        bigAvatar: toStringValue(item.bigAvatar),
-        icon: toStringValue(item.icon),
-        sex: toStringValue(item.sex),
-        expires: toStringValue(item.expires),
-        uin: toStringValue(item.uin),
-        userSig: toStringValue(item.userSig),
-        realRegisterTime: toStringValue(item.realRegisterTime),
-        loginPlatform: toStringValue(item.loginPlatform),
-        updatedAt: toStringValue(item.updatedAt || existing.updatedAt),
-        lastLoginAt: toStringValue(item.lastLoginAt || existing.lastLoginAt),
-        lastSuccessAt: toStringValue(item.lastSuccessAt || existing.lastSuccessAt),
-        lastAuthErrorAt: toStringValue(item.lastAuthErrorAt || existing.lastAuthErrorAt),
-        lastAuthErrorMessage: toStringValue(item.lastAuthErrorMessage || existing.lastAuthErrorMessage)
-      }, existing)
-
-      nextAccounts[userId] = next
+        priority: toNumber(item.priority ?? existing.priority ?? DEFAULT_PRIORITY, DEFAULT_PRIORITY),
+        // ⚠️ 与上面的 isGlobalDefault 同一套语义（2026-10-06 修）：payload 里**没带**这个字段
+        //    （undefined）时沿用池中现值，只有显式布尔才改。写成 `Boolean(item.authInvalid)`
+        //    会把缺字段静默算成 false —— 一个已被标记失效的账号被改回「健康」，
+        //    重新进入 getAuthCandidates 的候选池，每个请求都先拿它试一次并再次标记失效，
+        //    主人从面板上看到的状态也在「正常/失效」之间来回跳。
+        //    这也与本函数里 rescued 的设计意图冲突：只有凭证被换成新值才允许清掉标记。
+        authInvalid: rescued ? false : typeof item.authInvalid === 'boolean' ? item.authInvalid : Boolean(existing.authInvalid),
+        authErrorCount: rescued ? 0 : Number(item.authErrorCount ?? existing.authErrorCount ?? 0),
+        // ⚠️ 这里用 `??` 而不是 `||`（2026-10-05 修）：`||` 分不出
+        //    「表单压根没带这个字段」和「表单明确把昵称清空了」——
+        //    后者（`nickname: ''`）会被当成没带，又落回旧值 / `userName`，
+        //    主人把昵称清空之后怎么保存都还在。
+        nickname: toText(item.nickname ?? existing.nickname ?? existing.userName),
+        userName: toText(item.userName),
+        snsnickname: toText(item.snsnickname),
+        remark: toText(item.remark),
+        token: toText(item.token),
+        userKey: toText(item.userKey),
+        encodeRes: toText(item.encodeRes),
+        accessToken: toText(item.accessToken),
+        refreshToken: toText(item.refreshToken),
+        appOpenid: toText(item.appOpenid),
+        openId: toText(item.openId),
+        gameOpenId: toText(item.gameOpenId),
+        gameRoleId: toText(item.gameRoleId),
+        gameServerId: toText(item.gameServerId),
+        gameAreaId: toText(item.gameAreaId),
+        gameUserSex: toText(item.gameUserSex),
+        kohDimGender: toText(item.kohDimGender),
+        avatar: toText(item.avatar),
+        bigAvatar: toText(item.bigAvatar),
+        icon: toText(item.icon),
+        sex: toText(item.sex),
+        expires: toText(item.expires),
+        uin: toText(item.uin),
+        userSig: toText(item.userSig),
+        realRegisterTime: toText(item.realRegisterTime),
+        loginPlatform: toText(item.loginPlatform),
+        updatedAt: toText(item.updatedAt || existing.updatedAt),
+        lastLoginAt: toText(item.lastLoginAt || existing.lastLoginAt),
+        lastSuccessAt: toText(item.lastSuccessAt || existing.lastSuccessAt),
+        lastAuthErrorAt: rescued ? '' : toText(item.lastAuthErrorAt || existing.lastAuthErrorAt),
+        lastAuthErrorMessage: rescued ? '' : toText(item.lastAuthErrorMessage || existing.lastAuthErrorMessage)
+      }, existing);
     }
-
-    this.#savePool({ accounts: nextAccounts })
+    this.#savePool({
+      accounts: nextAccounts
+    });
   }
 }
-
-export const authStore = new AuthStore()
-export default authStore
+export const authStore = new AuthStore();
+export default authStore;
