@@ -1,6 +1,6 @@
 {
   "name": "karin-plugin-glory-of-kings",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "王者荣耀营地查询插件（Karin 原生 npm 版）",
   "homepage": "https://github.com/cchanlan/karin-plugin-glory-of-kings",
   "bugs": {

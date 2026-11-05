@@ -27,7 +27,9 @@ pnpm add karin-plugin-glory-of-kings @karinjs/plugin-puppeteer --registry=https:
 
 ## 更新
 
-在 Karin 根目录执行 `pnpm update karin-plugin-glory-of-kings --registry=https://registry.npmjs.org`，或发送 `#王者更新`。查看版本说明发送 `#王者更新日志`。
+在 Karin 根目录执行 `pnpm add karin-plugin-glory-of-kings@latest --registry=https://registry.npmjs.org`，或发送 `#王者更新`。查看版本说明发送 `#王者更新日志`。
+
+更新完成后重启 Karin 生效。
 
 ## 指令
 
