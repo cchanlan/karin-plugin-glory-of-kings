@@ -29,7 +29,7 @@ import { Plugin, render, segment, logger } from "node-karin";
  *    `utils/campMall.js` 的 `parseGoodsList` / `utils/api.js` 的 `getMallGoods`）。
  */
 
-import { shouldQuote, getImgType, AT_HEAD, AT_TAIL } from '#utils';
+import { shouldQuote, getImgType, getUserAvatar, AT_HEAD, AT_TAIL } from '#utils';
 import authStore from '../utils/authStore.js';
 import apiService from '../utils/api.js';
 import { parseCoinBalance, balanceLineOf } from '../utils/campMall.js';
@@ -291,7 +291,7 @@ export class CampCoin extends Plugin {
           coinText,
           who,
           endTime: view.endTime,
-          avatar: `https://q1.qlogo.cn/g?b=qq&s=100&nk=${e.userId}`,
+          avatar: await getUserAvatar(e, e.userId),
           _res_path: ResourceUrl
         },
         pageGotoParams: {

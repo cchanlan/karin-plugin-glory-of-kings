@@ -34,7 +34,7 @@ import { Plugin, render, segment, logger } from "node-karin";
  *    反复发容易撞频控，命中一次这个号静默 12 小时。
  */
 
-import { shouldQuote, getImgType, AT_HEAD, AT_TAIL } from '#utils';
+import { shouldQuote, getImgType, getUserAvatar, AT_HEAD, AT_TAIL } from '#utils';
 import authStore from '../utils/authStore.js';
 import apiService from '../utils/api.js';
 import { parsePrivacyMenu, pickItem, matchDetail, planWrites, describeItem, toCard, isVisibleItem, battleVisibility, battleVisibilityText, gatewayFor, VISIBLE, HIDDEN, BATTLE_PRIVACY_IDS, WRITE_GAP_MS, EFFECT_DELAY_SEC } from '../utils/campPrivacy.js';
@@ -242,7 +242,7 @@ export class CampPrivacy extends Plugin {
           battleText: battleVisibilityText(seen),
           battleHidden: seen.known && seen.hidden,
           battleUnknown: !seen.known,
-          avatar: `https://q1.qlogo.cn/g?b=qq&s=100&nk=${e.userId}`,
+          avatar: await getUserAvatar(e, e.userId),
           generatedAt: new Date().toLocaleString(),
           _res_path: ResourceUrl
         },

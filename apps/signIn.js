@@ -58,7 +58,7 @@ import { Plugin, render, segment, logger, karin } from "node-karin";
  * 一轮跑完在日志里留一行汇总，主人自查看日志就够。
  */
 
-import { shouldQuote, getImgType, AT_HEAD, AT_TAIL } from '#utils';
+import { shouldQuote, getImgType, getUserAvatar, resolveMemberName, AT_HEAD, AT_TAIL } from '#utils';
 import { Config, PluginName, ResourcePath, ResourceUrl } from '#components';
 import authStore from '../utils/authStore.js';
 import { signOneAccount, probeAccount, summarizeViews, groupByOwner } from '../utils/campSignTask.js';
@@ -217,35 +217,6 @@ function signResultText(views) {
   return lines.join('\n');
 }
 
-/**
- * 取群名片，出图标题用。
- *
- * ⚠️ 取不到就回 QQ 号 —— 群成员接口在不同适配器上差异很大（有的没有
- * `pickMember`、有的 `getInfo` 不存在），**不能让它把整条推送带崩**。
- */
-async function groupNickname(bot, groupId, userId) {
-  try {
-    const info = await bot.getGroupMemberInfo(String(groupId), String(userId));
-    return String(info.card || info.nick || userId);
-  } catch {
-    return String(userId);
-  }
-}
-
-/**
- * 私聊取好友昵称，出图标题用 —— 同 `groupNickname` 的口径：
- * 拿不到（没加好友 / 适配器没有 `getInfo`）就回 QQ 号，**绝不抛**。
- *
- * ⚠️ 跟群路一样**收 bot 参数**（多账号下别拿错号去查好友）。
- */
-async function friendNickname(bot, userId) {
-  try {
-    const info = await bot?.getFriendInfo(String(userId));
-    return String(info?.nick || userId);
-  } catch {
-    return String(userId);
-  }
-}
 export class CampSignIn extends Plugin {
   constructor() {
     super({
@@ -637,8 +608,9 @@ export class CampSignIn extends Plugin {
         mode: 'sign',
         ...summarizeViews(views)
       }, {
-        userId: owner,
-        username: await groupNickname(bot, target.groupId, owner)
+        bot,
+        groupId: target.groupId,
+        userId: owner
       });
       await sendGroup(target.groupId, [segment.at(owner), image || textFallback], group);
       return {
@@ -678,8 +650,8 @@ export class CampSignIn extends Plugin {
         mode: 'sign',
         ...summarizeViews(views)
       }, {
-        userId: owner,
-        username: await friendNickname(bot, owner)
+        bot,
+        userId: owner
       });
       textFallback = rendered.textFallback || '';
       if (rendered.image) sent = await sendPrivate(owner, [rendered.image], {
@@ -751,10 +723,7 @@ export class CampSignIn extends Plugin {
     const {
       image,
       textFallback
-    } = await renderSignImage(views, meta, {
-      userId: e.userId,
-      username: e.sender?.card || e.sender?.nick || String(e.userId)
-    });
+    } = await renderSignImage(views, meta, e);
     await e.reply(image || textFallback, {
       reply: shouldQuote()
     });
@@ -774,10 +743,14 @@ export class CampSignIn extends Plugin {
  *
  * @param {object[]} views signOneAccount 的结果数组
  * @param {object} meta `{ mode, okCount, alreadyCount, failCount, noRoleCount }`
- * @param {object} who `{ userId, username }` —— 头像和标题用
+ * @param {object} who Karin 事件或 `{ bot, userId, groupId? }`，由框架获取头像和昵称
  * @returns {Promise<{image: any, textFallback: string}>}
  */
 export async function renderSignImage(views, meta, who = {}) {
+  const [avatar, username] = await Promise.all([
+    getUserAvatar(who, who.userId),
+    resolveMemberName(who.bot, who.groupId, who.userId, who.sender?.card || who.sender?.nick || '召唤师')
+  ]);
   const data = buildSignView({
     views,
     mode: meta.mode,
@@ -786,8 +759,8 @@ export async function renderSignImage(views, meta, who = {}) {
     failCount: meta.failCount || 0,
     // 「没绑王者角色」单独透传，别让它混进「没签上」的计数
     noRoleCount: meta.noRoleCount || 0,
-    avatar: `https://q1.qlogo.cn/g?b=qq&s=100&nk=${who.userId || ''}`,
-    username: String(who.username || who.userId || '')
+    avatar,
+    username
   });
   let image = null;
   try {
