@@ -1,7 +1,12 @@
 import { isRealBot } from './botAccount.js';
 import { getAllBot, sendMsg, contactFriend, contactGroupTemp, logger } from 'node-karin';
 
-/** 仅凭原生发送回执确认；私信失败绝不改发群消息。 */
+/** 群聊和私聊共用 Karin 的原生成功回执判据。 */
+export function isConfirmedReceipt(result) {
+  return Boolean(result?.messageId);
+}
+
+/** 仅凭原生发送回执确认；本工具不自行改发群消息。 */
 export async function sendPrivate(userId, message, {
   bot,
   groupId
@@ -19,7 +24,7 @@ export async function sendPrivate(userId, message, {
     for (const contact of contacts) {
       try {
         const result = await sendMsg(current.selfId, contact, message);
-        if (result?.messageId) return {
+        if (isConfirmedReceipt(result)) return {
           ok: true,
           via: contact.scene,
           messageId: result.messageId

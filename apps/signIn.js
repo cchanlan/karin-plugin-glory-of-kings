@@ -1,6 +1,6 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { registeredBot, resolveGroupBot, sendGroup } from "../utils/group.js";
+import { registeredBot, resolveGroupBot, sendGroup, randomCommonGroup } from "../utils/group.js";
 import path from "node:path";
 import { Plugin, render, segment, logger, karin } from "node-karin";
 /**
@@ -63,7 +63,7 @@ import { Config, PluginName, ResourcePath, ResourceUrl } from '#components';
 import authStore from '../utils/authStore.js';
 import { signOneAccount, probeAccount, summarizeViews, groupByOwner } from '../utils/campSignTask.js';
 import { buildSignView } from '../utils/campSign.js';
-import { sendPrivate } from '../utils/privateMsg.js';
+import { sendPrivate, isConfirmedReceipt } from '../utils/privateMsg.js';
 import { sendMaster } from '../utils/masterMsg.js';
 import { hotBox } from '../utils/hotState.js';
 import { rescheduleOwnTask, isCronOn } from '../utils/taskCtl.js';
@@ -560,6 +560,7 @@ export class CampSignIn extends Plugin {
    *
    * ⚠️⚠️ 发送位置按 `utils/signReportTarget.js` 的记录走（2026-10-11 主人要求）：
    *    在群里开的就回那个群（**@他 + 出图**），私聊开的 / 没有记录的走私聊。
+   *    私聊发送失败时，只改投号主的一个随机共同群；无群或群发送失败只记日志。
    *    「没有记录」是**老用户的正常状态**（这个表 10-11 才有），必须回落私聊，
    *    不能当成出错跳过 —— 否则所有老用户一夜之间收不到报告。
    */
@@ -580,8 +581,21 @@ export class CampSignIn extends Plugin {
       const target = getTarget(owner);
       const sent = target?.groupId ? await this.#sendToGroup(target, owner, needTell) : await this.#sendToPrivateChat(target, owner, needTell);
       if (!sent.ok) {
-        // 发不出去（私聊多半没加好友、群里多半是退群了）→ 转告主人，别静默丢
         logger.warn(`[${PluginName}] 签到结果推给 ${owner} 失败：${sent.reason}`);
+        if (!target?.groupId) {
+          // 私聊失败只转到号主的一个随机共同群，不改开启位置，也不再转告主人。
+          const common = await randomCommonGroup(owner, registeredBot(target?.botId));
+          if (!common) {
+            logger.warn(`[${PluginName}] 签到报告 ${owner} 没有可确认的共同群，本轮停止投递`);
+            continue;
+          }
+          const fallback = await this.#sendToGroup(common, owner, needTell);
+          if (!fallback.ok) {
+            logger.warn(`[${PluginName}] 签到报告 ${owner} 转发群 ${common.groupId} 失败：${fallback.reason}`);
+          }
+          continue;
+        }
+        // 原本就在群里开启的报告，仍保留原有的失败通知。
         await sendMaster(`营地号主 ${owner} 的签到结果推不出去（${sent.reason}），内容：\n${signResultText(needTell)}`);
       }
     }
@@ -612,11 +626,10 @@ export class CampSignIn extends Plugin {
         groupId: target.groupId,
         userId: owner
       });
-      await sendGroup(target.groupId, [segment.at(owner), image || textFallback], group);
-      return {
-        ok: true,
-        reason: ''
-      };
+      const receipt = await sendGroup(target.groupId, [segment.at(owner), image || textFallback], group);
+      return isConfirmedReceipt(receipt)
+        ? { ok: true, reason: '' }
+        : { ok: false, reason: 'unconfirmed_receipt' };
     } catch (error) {
       return {
         ok: false,
