@@ -32,7 +32,7 @@ import { Plugin, logger, segment, karin } from "node-karin";
  *
  * 数据层与全部纯计算逻辑在 utils/pushStore.js，这里只管指令交互和消息发送。
  */
-import { loadPushList, savePushList, mergeSubState, mergeSubStates, beginSubBatch, endSubBatch, disableSubFlag, isFlagOn, isJunkSub, subGroups, withSubGroup, withoutSubGroup, sweepLeftGroups, streakMilestone, fetchLatest, fetchOnlineState, collectSnapshot, hasOnlineSignal, getHeroNameMap, calcStreak, pickNewBattles, diffOnlineState, summarizeSession, resolveOnlineSince, formatBattleText, formatGamingText, formatGamingHintText, formatOnlineText, needBattleList, isSubActive, resolveNextCheck, normalizeName, ONLINE_LABEL, FETCH_HIDDEN, MAX_DETAIL_BATTLES, REQUEST_INTERVAL, DEFAULT_IDLE_BACKOFF_MAX, decideHint, sleep } from '../utils/pushStore.js';
+import { loadPushList, savePushList, mergeSubState, mergeSubStates, beginSubBatch, endSubBatch, disableSubFlag, isFlagOn, isJunkSub, subGroups, withSubGroup, withoutSubGroup, sweepLeftGroups, streakMilestone, fetchLatest, fetchOnlineState, collectSnapshot, hasOnlineSignal, getHeroNameMap, calcStreak, pickNewBattles, diffOnlineState, summarizeSession, resolveOnlineSince, formatBattleText, resolveBatchRankNames, formatGamingText, formatGamingHintText, formatOnlineText, needBattleList, isSubActive, resolveNextCheck, normalizeName, ONLINE_LABEL, FETCH_HIDDEN, MAX_DETAIL_BATTLES, REQUEST_INTERVAL, DEFAULT_IDLE_BACKOFF_MAX, decideHint, sleep } from '../utils/pushStore.js';
 import { fetchBattleDetail, renderBattleDetail } from '../utils/battleDetailImage.js';
 import { fetchRoleNames } from '../utils/roleName.js';
 // 锁 / 游标 / 退避 / 安静期 / 盯梢闸必须跨热重载共享，否则会被热重载架空（见 utils/hotState.js）
@@ -1481,13 +1481,25 @@ export class GameRecordPush extends Plugin {
     // 只详细展示最近几场，更早的漏推场次折叠成一行，避免刷屏
     const shown = fresh.slice(-MAX_DETAIL_BATTLES);
     const omitted = fresh.length - shown.length;
+    // 营地整批只给一个段位名（查询时刻的当前段位），逐局校正后再比，
+    // 否则补推/连打时所有历史局都会被写成当前段位
+    const rankNames = resolveBatchRankNames(fullList);
     const blocks = shown.map((item, idx) => {
       // 段位星数要和时间上更早的那场比，列表是倒序的，所以是 index + 1
       const index = fullList.findIndex(x => String(x.gameSeq || '') === String(item.gameSeq || ''));
       const prev = index >= 0 ? fullList[index + 1] : undefined;
+      // 校正后的名字注入副本再交给文案层，不动 fullList 本身（连胜计算还要用原列表）
+      const itemForText = index >= 0 && rankNames[index] ? {
+        ...item,
+        roleJobName: rankNames[index]
+      } : item;
+      const prevForText = index >= 0 && rankNames[index + 1] ? {
+        ...prev,
+        roleJobName: rankNames[index + 1]
+      } : prev;
       // 只有最新那局（数组最后一项）配了详情图，它才用精简文案；补推的旧局仍是完整文字
       const brief = hasImage && idx === shown.length - 1;
-      return formatBattleText(item, prev, heroMap, {
+      return formatBattleText(itemForText, prevForText, heroMap, {
         brief
       });
     });

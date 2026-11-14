@@ -12,7 +12,7 @@ import { Plugin, render, segment, logger } from "node-karin";
  * 所以链路是 profile → pagedetails 两次请求，和其他 roleId 系接口一样。
  */
 import path from 'path';
-import { getImgType, ApiService, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, getUserAvatar, resolveMemberName, isQQNumber } from '#utils';
+import { getImgType, ApiService, Button, campIdGuidePayload, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, getUserAvatar, resolveMemberName, isQQNumber } from '#utils';
 import { PluginPath, ResourcePath, ResourceUrl } from '#components';
 import { resolveHero } from '../utils/heroName.js';
 import { buildHeroDetail } from '../utils/heroDetail.js';
@@ -87,7 +87,7 @@ export class HeroDetail extends Plugin {
       }
     }
     if (!campId) {
-      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+      await e.reply(campIdGuidePayload(), {
         reply: shouldQuote()
       });
       return;

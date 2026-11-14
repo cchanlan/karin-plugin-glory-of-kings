@@ -6,7 +6,7 @@ import { Plugin, render, segment, logger } from "node-karin";
 // 注意只有传具体 seasonId 时才带 heroFightPower/honorTitle，seasonId=0 的 historyList 里这两个字段是空的。
 // 生涯累计榜（/game/profile/herolist）作为赛季无数据时的兜底，字段参考自 https://github.com/KimigaiiWuyi/WzryUID
 
-import { getImgType, ApiService, readYamlFile, getLocalImage, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import { getImgType, ApiService, readYamlFile, getLocalImage, Button, campIdGuidePayload, CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
 import path from 'path';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 import { reportHeroPowers } from '../utils/heroPowerShare.js';
@@ -81,7 +81,7 @@ export class HeroList extends Plugin {
     const userInfo = allUserData[userId];
     const ID = msg || (userInfo && userInfo.ids && userInfo.ids.length ? userInfo.ids[userInfo.current || 0] : null);
     if (!ID) {
-      await e.reply(['未查询到营地ID，请先使用 #绑定营地 绑定营地ID，或在指令后附带营地ID', Button.bind()]);
+      await e.reply(campIdGuidePayload([CAMP_ID_SUFFIX_HINT, CAMP_ID_GUIDE_HINT].join(String.fromCharCode(10))));
       return;
     }
 

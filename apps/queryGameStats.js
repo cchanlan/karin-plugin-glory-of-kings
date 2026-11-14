@@ -29,7 +29,7 @@ import { Plugin, render, segment, logger } from "node-karin";
 import fs from 'node:fs';
 import path from 'path';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
-import { getImgType, ApiService, readYamlFile, getUserAvatar, isQQNumber, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, resolveMemberName } from '#utils';
+import { getImgType, ApiService, readYamlFile, getUserAvatar, isQQNumber, Button, campIdGuidePayload, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, resolveMemberName } from '#utils';
 import { estimateRequestSeconds } from '../utils/api.js';
 // 详情图与评价图标解析被战绩推送共用，抽到了 utils/battleDetailImage.js
 import { fetchBattleDetail, renderBattleDetail, resolveMvp, resolveEvaluate, buildKillTags } from '../utils/battleDetailImage.js';
@@ -181,7 +181,7 @@ export class QueryGameStats extends Plugin {
     const userData = await resolveUserData(userId);
     const ID = this.getUserID(userData[userId], userId);
     if (!ID) {
-      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+      await e.reply(campIdGuidePayload(), {
         reply: shouldQuote()
       });
       return;
@@ -313,7 +313,7 @@ export class QueryGameStats extends Plugin {
     } else if (idSlot) {
       const ids = userData[userId]?.ids || [];
       if (!ids.length) {
-        await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+        await e.reply(campIdGuidePayload(), {
           reply: shouldQuote()
         });
         return;
@@ -327,7 +327,7 @@ export class QueryGameStats extends Plugin {
       ID = index > 9999 ? index : this.getUserID(userData[userId], userId);
     }
     if (!ID) {
-      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+      await e.reply(campIdGuidePayload(), {
         reply: shouldQuote()
       });
       return;

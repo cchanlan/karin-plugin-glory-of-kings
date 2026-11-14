@@ -1255,7 +1255,7 @@ class CampAuthSession {
    *
    * （原 `#getAuthCandidates`，被 utils/authStore.js 的注释引用着）
    */
-  candidates(targetUserId, requesterBotUserId = '') {
+  candidates(targetUserId, requesterBotUserId = '', options = {}) {
     const baseAuth = this.#baseConfig();
     const candidates = authStore.getAuthCandidates(targetUserId);
     const mappedCandidates = candidates.map(candidate => ({
@@ -1295,6 +1295,7 @@ class CampAuthSession {
     // ⚠️ 有接口传进来的 `targetUserId` **是 roleId 不是营地号**（赛季表现 / 对战五维 /
     //    赛季常用英雄，见 `roleIdToCampId` 的说明）—— 归属判据比的都是营地号，
     //    所以先译一道；译不到就按原样用（行为等同修复前，不会误判）。
+    const preferSelf = options.selfFirst !== false;
     const ownTargetId = roleIdToCampId.get(targetId) || targetId;
     const rawRequester = toText(requesterBotUserId);
     // ⚠️ 防呆：定时任务拼的假 e 壳子没有 `user_id`，调用方一个 `String(e.user_id)` 就会
@@ -1315,7 +1316,7 @@ class CampAuthSession {
     };
     if (targetId && requester) {
       const ownedIds = authStore.listGlobalAccountsByOwner(requester).map(account => toText(account.userId));
-      if (ownedIds.includes(ownTargetId)) {
+      if (preferSelf && ownedIds.includes(ownTargetId)) {
         // ① **本人查自己的号** → 提到队首，走营地的「自我豁免」
         selfCandidate = takeSelf();
       } else {
@@ -1332,8 +1333,9 @@ class CampAuthSession {
         if (filtered.length) pool = filtered;
       }
     } else if (targetId) {
-      // ③ **没传发起人**（内部工具调用，如取角色名）→ 维持改动前的行为，免得这些功能退化
-      selfCandidate = takeSelf();
+      // ③ **没传发起人**（内部工具调用，如取角色名）→ 维持改动前的行为，免得这些功能退化。
+      //    但显式要求轮转（selfFirst:false）时不提前，让请求分摊到池里所有号。
+      if (preferSelf) selfCandidate = takeSelf();
     }
 
     // 先轮转再打日志：日志要反映**这次实际会按什么顺序试**，打轮转前的顺序
@@ -1777,7 +1779,7 @@ class CampTransport {
     const url = `${this.#baseUrls.main}${endpoint}`;
     // options.accountId：只发**指定的那一个**账号、不轮转。签到这类
     // 「状态绑在具体账号上」的接口必须走它，否则会读到 / 改到别的号。
-    const candidates = options.accountId ? this.#auth.candidatesForAccount(options.accountId) : this.#auth.candidates(targetUserId, requesterBotUserId);
+    const candidates = options.accountId ? this.#auth.candidatesForAccount(options.accountId) : this.#auth.candidates(targetUserId, requesterBotUserId, options);
     if (!candidates.length) {
       throw new AuthConfigError('未找到可用的营地登录态，请先完成营地登录，或在账号池中配置一个可用的全局账号');
     }
@@ -1907,7 +1909,7 @@ class CampTransport {
     // ⚠️ 只给**账号级数据**（余额这种「我的」数据）用它。
     //    `getGameHeroList` 那种「看谁由参数决定、本来就该用任意登录态去查」的
     //    接口**不要**传，传了会让「查非好友」失效。
-    const candidates = options.accountId ? this.#auth.candidatesForAccount(options.accountId) : this.#auth.candidates(targetUserId, requesterBotUserId);
+    const candidates = options.accountId ? this.#auth.candidatesForAccount(options.accountId) : this.#auth.candidates(targetUserId, requesterBotUserId, options);
     if (!candidates.length) {
       throw new AuthConfigError('未找到可用的营地登录态，请先完成营地登录，或在账号池中配置一个可用的全局账号');
     }
@@ -2102,8 +2104,8 @@ class ApiService {
    *
    * （原 `#makeAuthRequest`；中间那层纯转发的 `#request` 已合并掉）
    */
-  async #makeAuthRequest(endpoint, body, targetUserId = '', requesterBotUserId = '') {
-    return this.#transport.requestWithCandidates('POST', endpoint, body, {}, 2, targetUserId, requesterBotUserId);
+  async #makeAuthRequest(endpoint, body, targetUserId = '', requesterBotUserId = '', options = {}) {
+    return this.#transport.requestWithCandidates('POST', endpoint, body, {}, 2, targetUserId, requesterBotUserId, options);
   }
 
   /* ------------------------------------------------------------ 通用请求门面 */
@@ -2184,14 +2186,14 @@ class ApiService {
   /* ============================================ 二、主页与英雄数据 */
 
   /** 获取营地主页信息 */
-  async getProfile(ID, requesterBotUserId = '') {
+  async getProfile(ID, requesterBotUserId = '', options = {}) {
     const res = await this.#makeAuthRequest('/game/koh/profile', {
       targetUserId: ID,
       targetRoleId: '0',
       resVersion: '3',
       recommendPrivacy: '0',
       apiVersion: '2'
-    }, ID, requesterBotUserId);
+    }, ID, requesterBotUserId, options);
 
     // 顺手记下 roleId ↔ 营地号。用 roleId 的那几个接口（赛季表现 / 对战五维 /
     // 赛季常用英雄）要靠它把 targetId 译回营地号，才能正确判断归属

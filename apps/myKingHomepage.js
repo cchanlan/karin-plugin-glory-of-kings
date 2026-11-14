@@ -1,7 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import { Plugin, render, segment, logger } from "node-karin";
-import { getImgType, ApiService, readYamlFile, Button, AT_HEAD, AT_TAIL, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import { getImgType, ApiService, readYamlFile, Button, campIdGuidePayload, AT_HEAD, AT_TAIL, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
 import path from 'path';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 import moment from 'moment';
@@ -269,8 +269,11 @@ export class MyKingHomepage extends Plugin {
     if (hint) return e.reply(hint);
     const userInfo = await this.getUserInfo(userId);
     const ids = userInfo?.ids || [];
-    if (!ids.length) {
-      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+    // 只有「要靠绑定列表」的用法才拦未绑定：空输入取默认号、4 位以内纯数字当序号。
+    // 用户直接写了营地ID（#王者主页93622596）就该照查，原来一律先判 ids.length 会把人拦成教程图
+    const usesSlot = !input || /^\d+$/.test(input) && Number(input) <= 9999;
+    if (!ids.length && usesSlot) {
+      await e.reply(campIdGuidePayload(), {
         reply: shouldQuote()
       });
       return;
@@ -302,7 +305,7 @@ export class MyKingHomepage extends Plugin {
     const userInfo = await this.getUserInfo(userId);
     const ids = userInfo?.ids || [];
     if (!ids.length) {
-      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+      await e.reply(campIdGuidePayload(), {
         reply: shouldQuote()
       });
       return;

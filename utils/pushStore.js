@@ -672,54 +672,295 @@ export const STREAK_MIN = 3;
  * 3. 不写只对某个具体数字成立的话（「再赢一把就上两位数」这种）—— 一池覆盖好几个场次，
  *    抽到时数字对不上就闹笑话。一句话要在整段区间里都说得通才能放进来。
  */
-const WIN_STREAK_POOLS = [{
-  max: 4,
-  texts: ['🎉🔥 {count} 连胜！手感彻底热起来了，趁热再来一把', '🔥🔥 {count} 连胜！已经可以开始挑对手了', '✨🔥 {count} 连胜！今天这手感建议别停', '🎯 {count} 连胜！稳住这个节奏就行', '🔥 {count} 连胜！开局就顺，接着来', '😎 {count} 连胜！看着是准备干票大的', '⚡ {count} 连胜！热身结束了是吧', '🎉 {count} 连胜！这波状态在线']
-}, {
-  max: 6,
-  texts: ['⚡ {count} 连胜！对面要开始查战绩了', '⚡🔥 {count} 连胜！一个人把全队胜率抬起来了', '🔥⚡ {count} 连胜！这手感有点烫手', '🌟 {count} 连胜！赢得有点习惯了', '💪 {count} 连胜！这一串开始有分量了', '⚔️ {count} 连胜！谁遇上谁倒霉', '📈 {count} 连胜！分数一路往上走', '😏 {count} 连胜！对面大概不太想再碰到']
-}, {
-  max: 9,
-  texts: ['🚀 {count} 连胜！这是要打穿一整个赛季', '🚀✨ {count} 连胜！排到一队的都在偷偷道谢', '🔥🚀 {count} 连胜！刹车是坏了吗', '🌠 {count} 连胜！这势头有点收不住', '🛡️ {count} 连胜！队友只要跟着走就行', '🎢 {count} 连胜！这一串越滚越大', '💥 {count} 连胜！打谁都像打训练营', '😤 {count} 连胜！这会儿谁劝退都不好使']
-}, {
-  max: 12,
-  texts: ['👑🎉 {count} 连胜达成！建议直接开个直播', '🏆 {count} 连胜！已经开始不讲道理了', '🏆🔥 {count} 连胜！对面选人阶段看到就想投', '💯 {count} 连胜！两位数了，这数字自己都不敢信', '👑 {count} 连胜！峡谷今天姓你了', '🎇 {count} 连胜！赢到有点找不到对手', '🥇 {count} 连胜！这一串够吹一整周了', '🔮 {count} 连胜！开局就知道结果那种']
-}, {
-  max: 16,
-  texts: ['💫 {count} 连胜！这把要是输了都算大新闻', '💫👑 {count} 连胜！峡谷公告栏该挂个名了', '🌟 {count} 连胜！已经是本群传说了', '🌟🔥 {count} 连胜！胜率曲线开始垂直向上', '🎆 {count} 连胜！这战绩截图出去没人信', '⚜️ {count} 连胜！对面是排队来送的吗', '🧨 {count} 连胜！这串数字看着都发烫', '🗿 {count} 连胜！稳得让人怀疑是不是本人']
-}, {
-  max: 20,
-  texts: ['🐉 {count} 连胜！这已经不是上分，是搬家', '🐉✨ {count} 连胜！再来两把该被写进史书了', '🎖️👑 {count} 连胜！不是在打游戏，是在巡视领地', '🌟 {count} 连胜！这一串已经不像人类战绩了', '🏅 {count} 连胜！峡谷该给发个荣誉证书', '⛩️ {count} 连胜！对面已经放弃抵抗了', '🎇 {count} 连胜！这数字群里能吹一整个赛季', '🚩 {count} 连胜！这块地方算是插旗了']
-}, {
-  max: Infinity,
-  texts: ['🔱 {count} 连胜！还在赢，已经没人拦得住了', '🔱🔥 {count} 连胜！这对局记录看着像假的', '🌌 {count} 连胜！给对面留一条活路吧', '🌌👑 {count} 连胜！这一串到底什么时候能到头', '🛸 {count} 连胜！这已经超出正常范围了', '🗻 {count} 连胜！这数字看着都得仰头', '♾️ {count} 连胜！赢的次数比歇的次数都多', '🎺 {count} 连胜！峡谷该奏乐了']
-}];
+const WIN_STREAK_POOLS = [
+  {
+    max: 4,
+    texts: [
+      '🎉🔥 {count} 连胜！手感彻底热起来了，趁热再来一把',
+      '🔥🔥 {count} 连胜！已经可以开始挑对手了',
+      '✨🔥 {count} 连胜！今天这手感建议别停',
+      '🎯 {count} 连胜！稳住这个节奏就行',
+      '🔥 {count} 连胜！开局就顺，接着来',
+      '😎 {count} 连胜！看着是准备干票大的',
+      '⚡ {count} 连胜！热身结束了是吧',
+      '🎉 {count} 连胜！这波状态在线',
+      '🎊 {count} 连胜！开局就这么顺，接着走',
+      '✅🔥 {count} 连胜！节奏抓在手里了',
+      '😄 {count} 连胜！今天状态在线得很',
+      '🚀 {count} 连胜！起步就带着风',
+      '🏹 {count} 连胜！准头今天特别稳',
+      '🍀 {count} 连胜！运气和状态一起来了',
+      '🫶 {count} 连胜！这一串开得漂亮',
+    ],
+  },
+  {
+    max: 6,
+    texts: [
+      '⚡ {count} 连胜！对面要开始查战绩了',
+      '⚡🔥 {count} 连胜！一个人把全队胜率抬起来了',
+      '🔥⚡ {count} 连胜！这手感有点烫手',
+      '🌟 {count} 连胜！赢得有点习惯了',
+      '💪 {count} 连胜！这一串开始有分量了',
+      '⚔️ {count} 连胜！谁遇上谁倒霉',
+      '📈 {count} 连胜！分数一路往上走',
+      '😏 {count} 连胜！对面大概不太想再碰到',
+      '💥 {count} 连胜！对面的心态开始动摇了',
+      '🥊 {count} 连胜！一路顺畅得不像真的',
+      '🎯🔥 {count} 连胜！指哪打哪的手感',
+      '🧿 {count} 连胜！稳得有点不像话',
+      '🍾 {count} 连胜！值得先小庆祝一下',
+      '🛫 {count} 连胜！起飞了就系好安全带',
+      '😌 {count} 连胜！赢得很从容，看着都舒服',
+    ],
+  },
+  {
+    max: 9,
+    texts: [
+      '🚀 {count} 连胜！这是要打穿一整个赛季',
+      '🚀✨ {count} 连胜！排到一队的都在偷偷道谢',
+      '🔥🚀 {count} 连胜！刹车是坏了吗',
+      '🌠 {count} 连胜！这势头有点收不住',
+      '🛡️ {count} 连胜！队友只要跟着走就行',
+      '🎢 {count} 连胜！这一串越滚越大',
+      '💥 {count} 连胜！打谁都像打训练营',
+      '😤 {count} 连胜！这会儿谁劝退都不好使',
+      '🌪️ {count} 连胜！势头卷得停不下来',
+      '🏎️ {count} 连胜！越打越快，刹不住',
+      '🎪 {count} 连胜！对面排着队来上课',
+      '🪄 {count} 连胜！赢得有点像魔法',
+      '⛰️ {count} 连胜！这高度开始有点飘了',
+      '🎖️ {count} 连胜！状态好得让人眼红',
+      '🧗 {count} 连胜！还在往上，别松手',
+    ],
+  },
+  {
+    max: 12,
+    texts: [
+      '👑🎉 {count} 连胜达成！建议直接开个直播',
+      '🏆 {count} 连胜！已经开始不讲道理了',
+      '🏆🔥 {count} 连胜！对面选人阶段看到就想投',
+      '💯 {count} 连胜！两位数了，这数字自己都不敢信',
+      '👑 {count} 连胜！峡谷今天姓你了',
+      '🎇 {count} 连胜！赢到有点找不到对手',
+      '🥇 {count} 连胜！这一串够吹一整周了',
+      '🔮 {count} 连胜！开局就知道结果那种',
+      '🏆✨ {count} 连胜！奖杯都快不够发了',
+      '📸 {count} 连胜！建议每把都截图留念',
+      '🎬 {count} 连胜！这剧情比电视剧还爽',
+      '🦅 {count} 连胜！视野里快没对手了',
+      '🎯👑 {count} 连胜！这数字开始离谱了',
+      '🏛️ {count} 连胜！可以直接进名人堂了',
+      '🎉🎉 {count} 连胜！连胜已经成了日常',
+    ],
+  },
+  {
+    max: 16,
+    texts: [
+      '💫 {count} 连胜！这把要是输了都算大新闻',
+      '💫👑 {count} 连胜！峡谷公告栏该挂个名了',
+      '🌟 {count} 连胜！已经是本群传说了',
+      '🌟🔥 {count} 连胜！胜率曲线开始垂直向上',
+      '🎆 {count} 连胜！这战绩截图出去没人信',
+      '⚜️ {count} 连胜！对面是排队来送的吗',
+      '🧨 {count} 连胜！这串数字看着都发烫',
+      '🗿 {count} 连胜！稳得让人怀疑是不是本人',
+      '🌟💯 {count} 连胜！这串数字亮得晃眼',
+      '🐲 {count} 连胜！传说都是这么写出来的',
+      '🎠 {count} 连胜！赢得跟在散步一样',
+      '👑💫 {count} 连胜！这气场藏不住了',
+      '🚀🌌 {count} 连胜！冲得有点远了',
+      '🪙 {count} 连胜！分数进账根本没停',
+      '🧊 {count} 连胜！冷静得像块冰',
+    ],
+  },
+  {
+    max: 20,
+    texts: [
+      '🐉 {count} 连胜！这已经不是上分，是搬家',
+      '🐉✨ {count} 连胜！再来两把该被写进史书了',
+      '🎖️👑 {count} 连胜！不是在打游戏，是在巡视领地',
+      '🌟 {count} 连胜！这一串已经不像人类战绩了',
+      '🏅 {count} 连胜！峡谷该给发个荣誉证书',
+      '⛩️ {count} 连胜！对面已经放弃抵抗了',
+      '🎇 {count} 连胜！这数字群里能吹一整个赛季',
+      '🚩 {count} 连胜！这块地方算是插旗了',
+      '🐉🔥 {count} 连胜！这条龙彻底翻身了',
+      '🏰 {count} 连胜！对面的高地快成你家了',
+      '📜 {count} 连胜！战绩单可以裱起来挂墙',
+      '🎺👑 {count} 连胜！这排面直接拉满',
+      '🌋 {count} 连胜！火热程度压不住',
+      '🧭 {count} 连胜！一路顺到没边',
+      '💎 {count} 连胜！这一串比宝石还稀罕',
+    ],
+  },
+  {
+    max: Infinity,
+    texts: [
+      '🔱 {count} 连胜！还在赢，已经没人拦得住了',
+      '🔱🔥 {count} 连胜！这对局记录看着像假的',
+      '🌌 {count} 连胜！给对面留一条活路吧',
+      '🌌👑 {count} 连胜！这一串到底什么时候能到头',
+      '🛸 {count} 连胜！这已经超出正常范围了',
+      '🗻 {count} 连胜！这数字看着都得仰头',
+      '♾️ {count} 连胜！赢的次数比歇的次数都多',
+      '🎺 {count} 连胜！峡谷该奏乐了',
+      '🌠 {count} 连胜！数字已经超出常识',
+      '🪐 {count} 连胜！峡谷快装不下你了',
+      '🔭 {count} 连胜！这个纪录只能远远看',
+      '🗿👑 {count} 连胜！稳得让人害怕',
+      '🧬 {count} 连胜！这是什么物种的胜率',
+      '🎆🔥 {count} 连胜！烟花还在放，还不停',
+      '🏔️ {count} 连胜！峰顶只剩你一个人',
+    ],
+  },
+];
 
 /** 连败文案池，分段规则同上（不写名字、不写模式名、不写死数字）。语气要泄气但不能真扎人，群里被推的是本人 */
-const LOSE_STREAK_POOLS = [{
-  max: 4,
-  texts: ['😮‍💨🧊 {count} 连败，先去喝口水，下一把稳住', '🧊🧊 {count} 连败，换个英雄试试运气', '😮‍💨 {count} 连败，节奏乱了，缓一把', '🧊 {count} 连败，这几局队友是抽到什么了', '💧 {count} 连败，不慌，翻回来不难', '🌀 {count} 连败，先深呼吸，别急着再开', '🍵 {count} 连败，喝口茶再战', '🙃 {count} 连败，运气也该轮到你了']
-}, {
-  max: 6,
-  texts: ['☕ {count} 连败，认真的，歇一把再打', '☕😵 {count} 连败，今天大概不是上分的日子', '🌧️ {count} 连败，这雨下得有点久', '😵‍💫 {count} 连败，手感是不是不在身上', '🧊😮‍💨 {count} 连败，越急越乱，停一会儿', '🎧 {count} 连败，听两首歌再回来', '🍜 {count} 连败，先去吃点东西', '🙈 {count} 连败，这几把就当没打']
-}, {
-  max: 9,
-  texts: ['🌧️ {count} 连败，峡谷欠一个正式道歉', '🌧️😮‍💨 {count} 连败，系统怕是安排了一路扶贫', '🛌 {count} 连败，下线睡觉才是最优解', '😩 {count} 连败，这运气该被投诉了', '🧊🧊 {count} 连败，真的该停手了', '🕯️ {count} 连败，给今天的手感点根蜡', '🪫 {count} 连败，电量见底了，充会儿', '🤝 {count} 连败，不是你的问题，是今天的问题']
-}, {
-  max: 12,
-  texts: ['🛌💤 {count} 连败达成，明天再战一点都不丢人', '🕳️ {count} 连败，分数正在自由落体', '🕳️😭 {count} 连败，这是在挖隧道吗', '🧊💔 {count} 连败，两位数了，今天到此为止吧', '😔 {count} 连败，这串数字看着都心疼', '🚧 {count} 连败，前面全是坑，绕个路', '📉 {count} 连败，曲线已经不忍直视', '🫂 {count} 连败，群里给个抱抱']
-}, {
-  max: 16,
-  texts: ['🆘 {count} 连败，群里有人愿意来救一下吗', '🆘🧊 {count} 连败，强烈建议今天到此为止', '⚰️ {count} 连败，峡谷已经降半旗了', '⚰️😵 {count} 连败，还在坚持，这份毅力值得敬礼', '🥶 {count} 连败，手感冻成冰了', '🧱 {count} 连败，撞墙撞了这么久，绕一下吧', '😭 {count} 连败，真的别再点开始了', '🛑 {count} 连败，这里插个牌子：请停']
-}, {
-  max: 20,
-  texts: ['🌑 {count} 连败，运气应该已经见底了', '🌑😔 {count} 连败，真的不用再证明什么了', '🧯 {count} 连败，谁去把手机没收一下', '🧯🪦 {count} 连败，今天这一串就当没发生过', '🌚 {count} 连败，今晚的运气全被吃掉了', '💤 {count} 连败，睡一觉比什么都管用', '🫥 {count} 连败，建议原地消失一会儿', '🙏 {count} 连败，明天重新开始，真的']
-}, {
-  max: Infinity,
-  texts: ['🥀 {count} 连败，已经打出了一种境界', '🥀😵‍💫 {count} 连败，胜率需要考古修复了', '🫠 {count} 连败，明天一定会赢的（大概）', '🫠🧊 {count} 连败，这一串再长下去要立碑了', '🕸️ {count} 连败，这一串能进博物馆了', '😶‍🌫️ {count} 连败，已经打到没有情绪了', '🔚 {count} 连败，今天该收摊了', '🌪️ {count} 连败，这阵风什么时候能过去']
-}];
+const LOSE_STREAK_POOLS = [
+  {
+    max: 4,
+    texts: [
+      '😮‍💨🧊 {count} 连败，先去喝口水，下一把稳住',
+      '🧊🧊 {count} 连败，换个英雄试试运气',
+      '😮‍💨 {count} 连败，节奏乱了，缓一把',
+      '🧊 {count} 连败，这几局队友是抽到什么了',
+      '💧 {count} 连败，不慌，翻回来不难',
+      '🌀 {count} 连败，先深呼吸，别急着再开',
+      '🍵 {count} 连败，喝口茶再战',
+      '🙃 {count} 连败，运气也该轮到你了',
+      '🌱 {count} 连败，慢慢来，手感会回来的',
+      '🍃 {count} 连败，喘口气，翻盘还有机会',
+      '🧸 {count} 连败，抱一下，下一把再说',
+      '🫖 {count} 连败，来杯热的，缓缓',
+      '🌤️ {count} 连败，坏运气用不了多久',
+      '🕹️ {count} 连败，换种打法也许更顺',
+      '🐢 {count} 连败，慢一点，稳住节奏',
+    ],
+  },
+  {
+    max: 6,
+    texts: [
+      '☕ {count} 连败，认真的，歇一把再打',
+      '☕😵 {count} 连败，今天大概不是上分的日子',
+      '🌧️ {count} 连败，这雨下得有点久',
+      '😵‍💫 {count} 连败，手感是不是不在身上',
+      '🧊😮‍💨 {count} 连败，越急越乱，停一会儿',
+      '🎧 {count} 连败，听两首歌再回来',
+      '🍜 {count} 连败，先去吃点东西',
+      '🙈 {count} 连败，这几把就当没打',
+      '🛋️ {count} 连败，先靠一下，别硬撑',
+      '🎵 {count} 连败，BGM 换一首提提气',
+      '🌙 {count} 连败，今晚先别较劲',
+      '🧦 {count} 连败，鞋都磨破了，歇歇脚',
+      '🍬 {count} 连败，吃颗糖回回血',
+      '😴 {count} 连败，困了就先睡吧',
+      '🎈 {count} 连败，心态先放轻松',
+    ],
+  },
+  {
+    max: 9,
+    texts: [
+      '🌧️ {count} 连败，峡谷欠一个正式道歉',
+      '🌧️😮‍💨 {count} 连败，系统怕是安排了一路扶贫',
+      '🛌 {count} 连败，下线睡觉才是最优解',
+      '😩 {count} 连败，这运气该被投诉了',
+      '🧊🧊 {count} 连败，真的该停手了',
+      '🕯️ {count} 连败，给今天的手感点根蜡',
+      '🪫 {count} 连败，电量见底了，充会儿',
+      '🤝 {count} 连败，不是你的问题，是今天的问题',
+      '🫠 {count} 连败，这锅不该全你背',
+      '🪑 {count} 连败，从椅子上起来走两步',
+      '📵 {count} 连败，建议暂时放下手机',
+      '🧊😑 {count} 连败，越打越僵，先停停',
+      '🕰️ {count} 连败，把节奏交给时间',
+      '🍲 {count} 连败，先吃口热的',
+      '🌫️ {count} 连败，今天状态有点糊',
+    ],
+  },
+  {
+    max: 12,
+    texts: [
+      '🛌💤 {count} 连败达成，明天再战一点都不丢人',
+      '🕳️ {count} 连败，分数正在自由落体',
+      '🕳️😭 {count} 连败，这是在挖隧道吗',
+      '🧊💔 {count} 连败，两位数了，今天到此为止吧',
+      '😔 {count} 连败，这串数字看着都心疼',
+      '🚧 {count} 连败，前面全是坑，绕个路',
+      '📉 {count} 连败，曲线已经不忍直视',
+      '🫂 {count} 连败，群里给个抱抱',
+      '🕳️🪜 {count} 连败，梯子得先找回来',
+      '😮‍💨💔 {count} 连败，心疼分也心疼你',
+      '📉📉 {count} 连败，曲线还没止住',
+      '🚿 {count} 连败，冲个澡冷静一下',
+      '🌄 {count} 连败，睡醒再看这段也不迟',
+      '🎭 {count} 连败，今天这剧本不太友好',
+      '🧩 {count} 连败，等状态拼回来再说',
+    ],
+  },
+  {
+    max: 16,
+    texts: [
+      '🆘 {count} 连败，群里有人愿意来救一下吗',
+      '🆘🧊 {count} 连败，强烈建议今天到此为止',
+      '⚰️ {count} 连败，峡谷已经降半旗了',
+      '⚰️😵 {count} 连败，还在坚持，这份毅力值得敬礼',
+      '🥶 {count} 连败，手感冻成冰了',
+      '🧱 {count} 连败，撞墙撞了这么久，绕一下吧',
+      '😭 {count} 连败，真的别再点开始了',
+      '🛑 {count} 连败，这里插个牌子：请停',
+      '🚨 {count} 连败，警报响半天了',
+      '🧊🧊🧊 {count} 连败，冻得动不了了',
+      '🛟 {count} 连败，先扔个救生圈过去',
+      '🕳️🕳️ {count} 连败，坑越挖越深',
+      '😵‍💫🛑 {count} 连败，真的该暂停了',
+      '📴 {count} 连败，关机休息比坚持有用',
+      '🌊 {count} 连败，浪太大，先靠岸',
+    ],
+  },
+  {
+    max: 20,
+    texts: [
+      '🌑 {count} 连败，运气应该已经见底了',
+      '🌑😔 {count} 连败，真的不用再证明什么了',
+      '🧯 {count} 连败，谁去把手机没收一下',
+      '🧯🪦 {count} 连败，今天这一串就当没发生过',
+      '🌚 {count} 连败，今晚的运气全被吃掉了',
+      '💤 {count} 连败，睡一觉比什么都管用',
+      '🫥 {count} 连败，建议原地消失一会儿',
+      '🙏 {count} 连败，明天重新开始，真的',
+      '🌑🌑 {count} 连败，月色都不太好看',
+      '📦 {count} 连败，把今天的战绩打包封存',
+      '🪦 {count} 连败，这块碑越立越高',
+      '🔕 {count} 连败，通知都懒得看了吧',
+      '🧊🪦 {count} 连败，冻住了，先解冻',
+      '🛌🛌 {count} 连败，床比继续打靠谱',
+      '🍵😮‍💨 {count} 连败，茶凉了，人也累了',
+    ],
+  },
+  {
+    max: Infinity,
+    texts: [
+      '🥀 {count} 连败，已经打出了一种境界',
+      '🥀😵‍💫 {count} 连败，胜率需要考古修复了',
+      '🫠 {count} 连败，明天一定会赢的（大概）',
+      '🫠🧊 {count} 连败，这一串再长下去要立碑了',
+      '🕸️ {count} 连败，这一串能进博物馆了',
+      '😶‍🌫️ {count} 连败，已经打到没有情绪了',
+      '🔚 {count} 连败，今天该收摊了',
+      '🌪️ {count} 连败，这阵风什么时候能过去',
+      '🎗️ {count} 连败，这枚纪念章收下了',
+      '📖 {count} 连败，这一章可以翻过去了',
+      '🧊♾️ {count} 连败，冻成了一座雕像',
+      '🌠 {count} 连败，许个愿明天会赢',
+      '🎬 {count} 连败，导演该喊停了',
+      '🫥💤 {count} 连败，消失一天也没关系',
+      '🗿 {count} 连败，已经麻木得很有风度',
+    ],
+  },
+];
 
 /** 上一条抽到的文案，同一池连着播两次时避开它，免得刚说过的话又来一遍。只放内存，重启忘掉无所谓 */
+
 const lastStreakText = new Map();
 
 /** 按场次找到所在那一段的文案池 */
@@ -903,7 +1144,9 @@ export async function getHeroNameMap() {
  */
 export async function fetchOnlineState(campId, qq) {
   try {
-    const res = await ApiService.getProfile(String(campId), String(qq));
+    // 在线状态是公开资料，不需要营地的自我豁免 —— 显式要求轮转，别把本人号
+    // 全天钉在推送轮询上（2026-11-09 教训：自查自的订阅把本人号打到 -30107，静默 12 小时）。
+    const res = await ApiService.getProfile(String(campId), String(qq), { selfFirst: false });
     const code = Number(res?.returnCode || 0);
 
     // ⚠️ 和 fetchLatest 同一口径：两个码都表示「这个号在营地侧取不到数据」
@@ -1282,6 +1525,118 @@ export function describeCrossBandDrop(item, prev) {
   };
 }
 
+/** 段位名拆成「前缀 + 小段罗马数字」；王者这类没有小段的返回 null */
+function splitSmallRankName(name) {
+  const m = String(name || '').trim().match(/^(.*?)(I{1,3}|IV|V)$/);
+  if (!m) return null;
+  const idx = SMALL_RANK_ROMAN.indexOf(m[2]);
+  return idx < 0 ? null : {
+    prefix: m[1],
+    idx
+  };
+}
+
+/**
+ * 由「较新一局的名字」推「较旧一局的名字」。
+ *
+ * 营地一次查询只返回一个 roleJobName —— **查询时刻的当前段位**，不是每局结束时的段位
+ * （见 resolvePrevRankName 的说明）。所以只有最新一局的名字可信，更早的局只能拿
+ * roleJob 编号往回退。
+ *
+ * 编号规律（rankTrend.js 文件头实测，同一账号内）：同一大段内单调递增
+ * （星耀 V/IV/III/II/I = 22~26），跨大段不连续（钻石 I = 15、王者恒 16 都比星耀小），所以：
+ * - 编号相同 → 同一小段
+ * - 编号差 1~2 档 → 小段降几档（补推漏掉几局时会出现差 2 档）
+ * - 编号大跳 → 只能落在端点上：较新是「X V」→ 上一大段 I；较新是「X I」→ 下一大段顶端
+ * - 王者往回跳 → 星耀 I（王者之上没有小段）
+ *
+ * @param {string} nameNew 较新一局的段位名（可信）
+ * @param {number} jobNew 较新一局 roleJob 编号
+ * @param {number} jobOld 较旧一局 roleJob 编号
+ * @returns {string} 较旧一局的段位名，推不出来返回空串
+ */
+function stepRankNameBack(nameNew, jobNew, jobOld) {
+  const name = String(nameNew || '').trim();
+  const band = rankBand(name);
+  const jn = toInt(jobNew);
+  const jo = toInt(jobOld);
+  if (!band || !jn || !jo) return '';
+  if (jn === jo) return name;
+  const diff = jn - jo;
+
+  // 王者段：新体系编号恒为 16，编号一变就是跨段。旧体系王者段内还有 25→26 这种小差
+  // （见 describeCrossBandNames），小差不敢判，留空让调用方走保守文案
+  if (band === 7) return Math.abs(diff) >= CROSS_BAND_JOB_GAP ? `${RANK_BAND_NAMES[5]}I` : '';
+  const small = splitSmallRankName(name);
+  if (!small) return '';
+
+  // 同一大段内回退：编号少几档就退几档
+  if (diff > 0 && diff < CROSS_BAND_JOB_GAP) {
+    if (small.idx + diff <= 4) return small.prefix + SMALL_RANK_ROMAN[small.idx + diff];
+    return band > 1 ? `${RANK_BAND_NAMES[band - 2]}I` : '';
+  }
+
+  // 跨大段：较新必须停在大段端点，才能确定较旧落在哪一端
+  if (small.idx === 4) {
+    // 较新是「X V」，往回是升大段之前 → 上一大段 I。
+    // 例外：较旧编号正好是王者 16，说明那是从王者掉下来的一局，称号不可考，只写「王者」
+    if (band < 7 && jo === KING_ROLE_JOB) return '王者';
+    return band > 1 ? `${RANK_BAND_NAMES[band - 2]}I` : '';
+  }
+  if (small.idx === 0) {
+    // 较新是「X I」，往回是大段顶端掉下来 → 下一大段（星耀 I 往回是王者，王者没有小段）
+    if (band === 6) return '王者';
+    return band < 6 ? `${RANK_BAND_NAMES[band]}V` : '';
+  }
+  return '';
+}
+
+/**
+ * 校正一整批（同一次查询返回、按时间倒序）对局的段位名。
+ *
+ * 营地一次查询只给一个 roleJobName —— 查询时刻的当前段位（见 resolvePrevRankName）。
+ * 实时播报里 (item, prev) 来自同一批，名字恒等，导致：
+ * - formatScoreChange 里「段位 A → B」那条分支永远走不到；
+ * - 补推多局、或玩家无缝连打时，所有历史局都被写成「当前段位」——
+ *   刚升王者，前面几局星耀会被播成「最强王者 3 → 4星（上了1星）」。
+ *
+ * 这里只信最新一局的名字（它刚打完，名字就是该局结束时的段位），更早的局用
+ * stepRankNameBack 按 roleJob 编号逐级回退。推不出来就留空串，调用方保持原有保守文案：
+ * 宁可少写名字，不写错名字。
+ *
+ * @param {Array<object>} list 同一批对局，时间倒序（和接口返回顺序一致）
+ * @returns {Array<string>} 与 list 等长；取不到段位名的位置是空串
+ */
+export function resolveBatchRankNames(list = []) {
+  const arr = Array.isArray(list) ? list : [];
+  const names = new Array(arr.length).fill('');
+  let anchor = -1;
+  for (let i = 0; i < arr.length; i += 1) {
+    if (String(arr[i]?.roleJobName || '').trim() && toInt(arr[i]?.roleJob)) {
+      anchor = i;
+      break;
+    }
+  }
+  if (anchor < 0) return names;
+
+  // 最新一局的名字也可能「慢一拍」（升王者那局名字还停在星耀，见 resolveBattleRankName）
+  const anchorName = resolveBattleRankName(arr[anchor], arr[anchor + 1]);
+  // 名字是王者、编号却不是 16：升王者那局还没进列表，这一批的锚点本身超前，
+  // 任何一局的名字都不可信 —— 整批放弃校正，交给原来的保守文案
+  if (rankBand(anchorName) === 7 && toInt(arr[anchor]?.roleJob) !== KING_ROLE_JOB) return names;
+  names[anchor] = anchorName;
+  let newer = anchor;
+  for (let i = anchor + 1; i < arr.length; i += 1) {
+    const job = toInt(arr[i]?.roleJob);
+    if (!job) continue;
+    const name = stepRankNameBack(names[newer], arr[newer]?.roleJob, job);
+    names[i] = name;
+    if (!name) break;
+    newer = i;
+  }
+  return names;
+}
+
 /**
  * 一场战绩的分数变化。巅峰赛给巅峰分，排位给段位星数，都拿不到就返回空。
  *
@@ -1341,12 +1696,15 @@ export function formatScoreChange(item, prev) {
   })) return current;
 
   // 段位名变了：stars 两边不同口径，减出来的差没意义，只报段位变化。
-  // 方向按大段层级判（星耀 → 王者是升），认不出段位名就不带方向
+  // 方向优先按大段层级判（星耀 → 王者是升）；同一大段内换小段时层级相同，
+  // 再看 roleJob 编号（同一大段内编号与段位同向递增，见 rankTrend.js 文件头），
+  // 不然「星耀II → 星耀I」这种升小段会被判成 flat
   if (prevJob !== job) {
     const gap = rankBand(job) - rankBand(prevJob);
+    const dir = gap !== 0 ? Math.sign(gap) : jobNum && prevJobNum && jobNum !== prevJobNum ? Math.sign(jobNum - prevJobNum) : 0;
     return {
       text: `段位 ${prevJob} → ${job}（${stars}星）`,
-      tone: gap > 0 ? 'up' : gap < 0 ? 'down' : 'flat'
+      tone: dir > 0 ? 'up' : dir < 0 ? 'down' : 'flat'
     };
   }
 

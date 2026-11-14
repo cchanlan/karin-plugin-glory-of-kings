@@ -21,7 +21,7 @@ import { Plugin, render, segment, logger } from "node-karin";
 // 所以只从历史接口补 maxHeroFightPower 与称号两个字段。
 // 历史接口拿不到时（没绑角色 / 接口异常）历史列显示「—」，排序退回当前战力，保证图还能出。
 
-import { getImgType, ApiService, readYamlFile, getLocalImage, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import { getImgType, ApiService, readYamlFile, getLocalImage, Button, campIdGuidePayload, CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
 import path from 'path';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 
@@ -93,7 +93,7 @@ export class MyHeroList extends Plugin {
       ID = userInfo?.ids?.[userInfo.current || 0] || '';
     }
     if (!ID) {
-      await e.reply(['未查询到营地ID，请先使用 #绑定营地 绑定营地ID，或在指令后附带营地ID', Button.bind()]);
+      await e.reply(campIdGuidePayload([CAMP_ID_SUFFIX_HINT, CAMP_ID_GUIDE_HINT].join(String.fromCharCode(10))));
       return;
     }
     let res;

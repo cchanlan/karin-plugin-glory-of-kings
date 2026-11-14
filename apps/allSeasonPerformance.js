@@ -2,7 +2,7 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import { Plugin, render, segment } from "node-karin";
 import path from 'path';
-import { getImgType, ApiService, readYamlFile, Button, parsePerfArgs, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import { getImgType, ApiService, readYamlFile, Button, campIdGuidePayload, parsePerfArgs, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 import { privacyScope } from '../utils/seasonFallback.js';
 import { getNickMap, nickOf, withGroupNick } from '../utils/groupNick.js';
@@ -57,7 +57,7 @@ export class AllSeasonPerformance extends Plugin {
     const args = parsePerfArgs(input);
     const campId = args.campId || userInfo?.ids?.[userInfo.current ?? 0];
     if (!campId) {
-      await e.reply([segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', '营地ID获取.png'))), Button.bind()], {
+      await e.reply(campIdGuidePayload(), {
         reply: shouldQuote()
       });
       return;

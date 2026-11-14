@@ -3,7 +3,7 @@ import { resourceUrl, sendForward } from "../utils/message.js";
 import { Plugin, render, segment, logger } from "node-karin";
 // 皮肤墙功能：营地皮肤列表接口调用逻辑参考自 https://github.com/KimigaiiWuyi/WzryUID
 
-import { getImgType, ApiService, readYamlFile, getLocalImage, sniffImageMime, getUserAvatar, getPvpSkinCover, Button, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, resolveMemberName, isQQNumber, SZ_ORDER, normalizeSzClass, tierRank, pickTierText, QUALITY_STATS, countQuality, cleanImageCache, resolveCacheMaxBytes } from '#utils';
+import { getImgType, ApiService, readYamlFile, getLocalImage, sniffImageMime, getUserAvatar, getPvpSkinCover, Button, campIdGuidePayload, CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, resolveMemberName, isQQNumber, SZ_ORDER, normalizeSzClass, tierRank, pickTierText, QUALITY_STATS, countQuality, cleanImageCache, resolveCacheMaxBytes } from '#utils';
 import path from 'path';
 import { PluginData, ResourcePath, ResourceUrl } from '#components';
 
@@ -149,7 +149,7 @@ export class SkinWall extends Plugin {
     const userInfo = allUserData[userId];
     const ID = msgID || (userInfo && userInfo.ids && userInfo.ids.length ? userInfo.ids[userInfo.current || 0] : null);
     if (!ID) {
-      await e.reply(['未查询到营地ID，请先使用 #绑定营地 绑定营地ID，或在指令后附带营地ID', Button.bind()]);
+      await e.reply(campIdGuidePayload([CAMP_ID_SUFFIX_HINT, CAMP_ID_GUIDE_HINT].join(String.fromCharCode(10))));
       return;
     }
     let data;
