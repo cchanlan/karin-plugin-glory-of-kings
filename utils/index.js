@@ -11,7 +11,7 @@ import { getPvpSkinCover, getPvpHeroSkins } from './pvpSkinImage.js';
 import { getCampSkinConf, getCampHeroSkins, isClassicSkin, SZ_ORDER, normalizeSzClass, TIER_PRIORITY, tierRank, pickTierText, QUALITY_STATS, countQuality } from './skinCatalog.js';
 import { createWechatLoginSession, waitForWechatLogin, decodeEncodeResUserKey } from './wechatLogin.js';
 import Button from './button.js';
-import { CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, campIdGuidePayload } from './campIdGuide.js';
+import { CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, campIdGuidePayload, replyCampIdGuide } from './campIdGuide.js';
 import { getBlackList, isBlackUser, isBlockedEvent, addBlackUser, removeBlackUser, followGlobalBlack, getHostBlackList } from './blackList.js';
 import { getImgType } from './imageType.js';
 import { extractImages, photoMark } from './campImImage.js';
@@ -21,7 +21,7 @@ export {
 // 详见 utils/imageType.js 顶部关于「微信下 webp 会变成文件」的说明
 getImgType,
 // 营地图片消息的解析（正文空、地址在 links 里，见 utils/campImImage.js）
-extractImages, photoMark, ApiService, readJsonFile, writeJsonFile, getFilePath, getLocalImage, sniffImageMime, cleanImageCache, scanImageCache, resolveCacheMaxBytes, DEFAULT_CACHE_MAX_MB, readYamlFile, writeYamlFile, cache, authStore, isProfileHidden, markProfileHidden, listHiddenProfiles, clearHiddenProfile, clearAllHiddenProfiles, HIDDEN_TTL_MS, getUserAvatar, getGroupAvatar, qlogoUrl, groupQlogoUrl, isQQNumber, resolveMemberName, AT_HEAD, AT_TAIL, pickAtText, stripAtText, resolveTargetUserId, getPvpSkinCover, getPvpHeroSkins, getCampSkinConf, getCampHeroSkins, isClassicSkin, SZ_ORDER, normalizeSzClass, TIER_PRIORITY, tierRank, pickTierText, QUALITY_STATS, countQuality, createWechatLoginSession, waitForWechatLogin, decodeEncodeResUserKey, Button, CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, campIdGuidePayload, getBlackList, isBlackUser, isBlockedEvent, addBlackUser, removeBlackUser, followGlobalBlack, getHostBlackList };
+extractImages, photoMark, ApiService, readJsonFile, writeJsonFile, getFilePath, getLocalImage, sniffImageMime, cleanImageCache, scanImageCache, resolveCacheMaxBytes, DEFAULT_CACHE_MAX_MB, readYamlFile, writeYamlFile, cache, authStore, isProfileHidden, markProfileHidden, listHiddenProfiles, clearHiddenProfile, clearAllHiddenProfiles, HIDDEN_TTL_MS, getUserAvatar, getGroupAvatar, qlogoUrl, groupQlogoUrl, isQQNumber, resolveMemberName, AT_HEAD, AT_TAIL, pickAtText, stripAtText, resolveTargetUserId, getPvpSkinCover, getPvpHeroSkins, getCampSkinConf, getCampHeroSkins, isClassicSkin, SZ_ORDER, normalizeSzClass, TIER_PRIORITY, tierRank, pickTierText, QUALITY_STATS, countQuality, createWechatLoginSession, waitForWechatLogin, decodeEncodeResUserKey, Button, CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, campIdGuidePayload, replyCampIdGuide, getBlackList, isBlackUser, isBlockedEvent, addBlackUser, removeBlackUser, followGlobalBlack, getHostBlackList };
 
 export { shouldQuote } from './quote.js';
 

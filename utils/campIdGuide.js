@@ -1,45 +1,48 @@
-/**
- * 「还没绑定营地ID」时的统一回复载荷：示例文案 + 小程序入口 + 教程图 + 绑定按钮。
- *
- * 原来各指令的未绑定分支各写各的，多数只甩一张「营地ID从哪看」的教程图，
- * 用户看完不知道该发什么。文案格式和示例统一收在这里，改一处全体生效。
- */
+/** Unified camp-ID guidance using Karin-native JSON and reply APIs. */
 import { segment } from 'node-karin';
 import path from 'path';
 import { PluginPath } from '#components';
 import { resourceUrl } from './message.js';
 import Button from './button.js';
+import { sendCampMiniapp } from './campMiniappSender.js';
+import { CAMP_MINIAPP_URL } from './campMiniappDiag.js';
 
-/** 教程图文件名（resources/img 下） */
 const CAMP_ID_GUIDE_IMG = '营地ID获取.png';
-
-/** 教程图配的文案：光有图用户不知道该发什么，格式和示例都得写出来 */
 export const CAMP_ID_GUIDE_HINT = '绑定方式：#绑定营地 + 营地ID（纯数字）\n示例：#绑定营地 123456';
-
-/**
- * 营地小程序入口：QQ 短链来自实际收到的官方分享卡片，AppID 为 wx898cb4b08963dccb；
- * 微信分享口令由用户提供。QQ 可承载微信小程序，不以分享口令前缀判断客户端能力。
- * HTTP 跳转页已在 Linux 验证，手机内的授权与资料页导航尚待真机验收；
- * 不把短链当作登录凭证，也不从分享人的页面参数自动绑定账号。
- */
-const CAMP_ID_QQ_MINI_PROGRAM_LINK = 'https://m.q.qq.com/a/s/1bacb484aaf1419520802da0b1204504';
-const CAMP_ID_WECHAT_MINI_PROGRAM_LINK = '#小程序://王者营地/7NoAEzcBCr2YH8I';
-const CAMP_ID_MINI_PROGRAM_GUIDE = [
-  '查看营地ID：打开「王者营地」小程序，授权登录后进入「我的 → 编辑资料」，复制「营地ID」。',
-  `QQ入口：${CAMP_ID_QQ_MINI_PROGRAM_LINK}`,
-  '微信入口：',
-  CAMP_ID_WECHAT_MINI_PROGRAM_LINK,
-  '入口打不开时，在微信搜索「王者营地」小程序，授权登录后进入「我的 → 编辑资料」。'
-].join('\n');
-
-/** 支持「指令后附带营地ID」的那几条指令用这句：两条路都告诉用户，别让他以为只能先绑定 */
 export const CAMP_ID_SUFFIX_HINT = '未查询到营地ID：可以直接在指令后附带营地ID，也可以先绑定';
-
-/**
- * 未绑定营地ID的标准回复：示例文案 + 小程序入口 + 教程图 + 绑定按钮。
- *
- * @param {string} [hint] 覆盖默认文案。支持「指令后附带营地ID」的指令用得上。
- */
+function guideText(hint) {
+  return `${hint}\n\n点开「王者营地」小程序并授权登录，进入「我的 → 编辑资料」，复制「营地ID」。\n打不开时点此入口：${CAMP_MINIAPP_URL}`;
+}
 export function campIdGuidePayload(hint = CAMP_ID_GUIDE_HINT) {
-  return [`${hint}\n\n${CAMP_ID_MINI_PROGRAM_GUIDE}`, segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', CAMP_ID_GUIDE_IMG))), Button.bind()];
+  return [guideText(hint), segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', CAMP_ID_GUIDE_IMG))), Button.bind()];
+}
+export async function replyCampIdGuide(e, hint = CAMP_ID_GUIDE_HINT, replyOptions) {
+  const outcome = await sendCampMiniapp(e);
+  try {
+    const payload = outcome.fallback ? campIdGuidePayload(hint) : [guideText(hint), Button.bind()];
+    const result = await e.reply(payload, replyOptions);
+    const receipt = outcome.receipt(result);
+    if (receipt.explicitFailure) {
+      const error = new Error('guide_send_rejected');
+      error.code = 'GUIDE_SEND_REJECTED';
+      error.error = result;
+      throw error;
+    }
+    outcome.log(receipt.messageIds.length ? 'info' : 'warn', 'guide_receipt', { receipt });
+    return result;
+  } catch (error) {
+    outcome.fail('guide_send_failed', error);
+    try {
+      const result = await e.reply(guideText(hint), replyOptions);
+      const receipt = outcome.receipt(result);
+      outcome.log(receipt.explicitFailure || !receipt.messageIds.length ? 'warn' : 'info', 'guide_text_fallback', { receipt });
+      if (receipt.explicitFailure) return false;
+      return result;
+    } catch (fallbackError) {
+      outcome.fail('guide_text_fallback_failed', fallbackError);
+      return false;
+    }
+  } finally {
+    outcome.log('info', 'flow_end', { cardReceiptConfirmed: outcome.confirmed, serverVerification: outcome.serverVerification, usedImageFallback: outcome.fallback });
+  }
 }

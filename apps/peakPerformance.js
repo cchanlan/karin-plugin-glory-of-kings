@@ -2,7 +2,7 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import { Plugin, render, segment } from "node-karin";
 import path from 'path';
-import { getImgType, ApiService, readYamlFile, Button, campIdGuidePayload, parsePerfArgs, seasonNo, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
+import { getImgType, ApiService, readYamlFile, Button, replyCampIdGuide, parsePerfArgs, seasonNo, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 import { loadArchive } from '../utils/battleArchive.js';
 import { buildDailyTrend } from '../utils/scoreTrend.js';
@@ -56,7 +56,7 @@ export class PeakPerformance extends Plugin {
     const wantSeason = args.season ?? args.count;
     const campId = args.campId || userInfo?.ids?.[userInfo.current ?? 0];
     if (!campId) {
-      await e.reply(campIdGuidePayload(), {
+      await replyCampIdGuide(e, undefined, {
         reply: shouldQuote()
       });
       return;

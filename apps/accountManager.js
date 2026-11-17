@@ -23,7 +23,7 @@ import { Plugin, render, segment, logger } from "node-karin";
  * 外，类内其余方法一律 `#` 私有：它们没有任何外部调用方，名字只是内部实现细节。
  */
 import path from 'path';
-import { getImgType, writeYamlFile, readYamlFile, Button, campIdGuidePayload, AT_HEAD, AT_TAIL, stripAtText, resolveTargetUserId, shouldQuote, invalidateShareCache, querySharedBind, listHiddenProfiles, clearHiddenProfile, clearAllHiddenProfiles } from '#utils';
+import { getImgType, writeYamlFile, readYamlFile, Button, replyCampIdGuide, AT_HEAD, AT_TAIL, stripAtText, resolveTargetUserId, shouldQuote, invalidateShareCache, querySharedBind, listHiddenProfiles, clearHiddenProfile, clearAllHiddenProfiles } from '#utils';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';
 import authStore from '../utils/authStore.js';
 import { syncUserBind } from '../utils/shareUsers.js';
@@ -665,7 +665,7 @@ export class AccountManager extends Plugin {
           reply: shouldQuote()
         });
       }
-      return e.reply(campIdGuidePayload(), {
+      return replyCampIdGuide(e, undefined, {
         reply: shouldQuote()
       });
     }
@@ -676,7 +676,7 @@ export class AccountManager extends Plugin {
 
   // 营地ID获取教程：示例文案 + 图 + 按钮统一从 utils/campIdGuide.js 取
   async #replyCampIdGuide(e) {
-    await e.reply(campIdGuidePayload(), {
+    await replyCampIdGuide(e, undefined, {
       reply: shouldQuote()
     });
   }
