@@ -17,7 +17,7 @@ import { sendMaster } from './masterMsg.js';
  *
  * | 层 | 类 | 管什么 |
  * |---|---|---|
- * | 频控与队列 | `CampRateLimiter` | 按账号记的 -30107 冷却、按账号分的发车队列 |
+ * | 频控与队列 | `CampRateLimiter` | 按账号的 -30107 / 按端点的 -32002 冷却、按账号分的发车队列 |
  * | 签名与请求头 | `CampRequestSigner` | encodeParam、traceparent、主站 / 表单两套 header |
  * | 响应解析 | `CampResponseReader` | 响应头业务码、campencrypt 解密、JSON 解析 |
  * | 鉴权会话 | `CampAuthSession` | auth.yaml 默认值、候选账号轮转、失效标记、对用户文案 |
@@ -60,8 +60,16 @@ const HOST_GAME_FORM = 'ssl.kohsocialapp.qq.com:10001';
 /** 业务码：成功 */
 const CODE_SUCCESS = 0;
 
-/** 营地频控错误码：操作频繁 */
+/** 营地频控错误码：操作频繁（账号级：同一个号怎么等都被拒、换个号立刻通） */
 const CODE_RATE_LIMITED = -30107;
+
+/**
+ * 端点级频控错误码：操作太频繁。
+ * 与 -30107 的区别是**换号无效**：2026-11-18 实测同一时刻 4 个账号依次请求
+ * `/play/h5getherolist` 全部返回它，而同一出口 IP 下的 profile / 皮肤墙照常。
+ * 挨个换候选只是多打三次、把风控拖长，识别出来直接暂停这个端点。
+ */
+const CODE_ENDPOINT_RATE_LIMITED = -32002;
 
 /**
  * 福利中心任务的 `gameId`：**50001 是营地自己**，不是王者的 20001。
@@ -94,8 +102,10 @@ const BUSINESS_CODE = {
   NONE: 'none',
   /** 0：成功 */
   SUCCESS: 'success',
-  /** -30107：操作频繁 */
+  /** -30107：操作频繁（账号级，换号可绕） */
   RATE_LIMITED: 'rate-limited',
+  /** -32002：操作太频繁（端点级，换号无效） */
+  ENDPOINT_RATE_LIMITED: 'endpoint-rate-limited',
   /** -10107：对方隐藏了主页 */
   PROFILE_HIDDEN: 'profile-hidden',
   /** 其余非 0 业务码 */
@@ -124,6 +134,17 @@ export const MIN_REQUEST_GAP_MS = 1200;
  * 主人 2026-09-13 拍板：命中即静默 12 小时，并私信主人（见 utils/rateLimitNotice.js）。
  */
 const RATE_LIMIT_SILENCE_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * 命中 -32002 后这个**端点**静默多久：30 分钟。
+ *
+ * 它按出口 IP + 端点限，账号之间共享配额（实测 4 个号同时中招），所以不能照
+ * -30107 那套按账号静默 12 小时：那等于把整个号池停半天。但也不能太短——
+ * 2026-11-18 实测首次命中后 25 分钟仍然全是 -32002，5 分钟冷却只会变成
+ * 「到期再撞一次」，而反复试探会把惩罚期续长（和 -30107 那次实测一个脾气）。
+ * 也不私信主人：批量任务（#英雄名总排名 / #称号墙）偶尔会撞上，每次都通知只会变成噪音。
+ */
+const ENDPOINT_RATE_LIMIT_SILENCE_MS = 30 * 60 * 1000;
 
 /**
  * 单次营地请求的超时。**只计「发车之后」**，不含排队等待——
@@ -360,6 +381,9 @@ function classifyBusinessCode(code) {
   if (numeric === CODE_RATE_LIMITED) {
     return BUSINESS_CODE.RATE_LIMITED;
   }
+  if (numeric === CODE_ENDPOINT_RATE_LIMITED) {
+    return BUSINESS_CODE.ENDPOINT_RATE_LIMITED;
+  }
   if (numeric === CODE_PROFILE_HIDDEN) {
     return BUSINESS_CODE.PROFILE_HIDDEN;
   }
@@ -473,6 +497,14 @@ class CampRateLimiter {
   #cooldownUntilByUser = new Map();
 
   /**
+   * endpoint -> 静默截止时间戳（ms）。
+   *
+   * -32002 是**端点级**的（同一 IP 下所有账号共享配额），只能按端点记；
+   * 按账号记会误伤池子里其实没问题的号。
+   */
+  #endpointCooldownUntil = new Map();
+
+  /**
    * 最近一次真命中 -30107 的时刻（ms），0 = 从没命中过。
    *
    * 只给定时轮询当「命中信号」用（它靠这个判断本轮是不是又撞上了）。
@@ -555,6 +587,24 @@ class CampRateLimiter {
       }).catch(() => {});
     }
     return RATE_LIMIT_SILENCE_MS;
+  }
+
+  /** 这个端点还剩多少毫秒冷却（0 = 可正常请求） */
+  endpointCooldownLeft(endpoint) {
+    return Math.max(0, (this.#endpointCooldownUntil.get(endpoint) || 0) - Date.now());
+  }
+
+  /**
+   * 记录一次 -32002 命中：暂停整个端点（换号没用，见 CODE_ENDPOINT_RATE_LIMITED）。
+   * 不通知主人：短时限流会自愈，批量任务撞上属于常态。
+   * @param {string} endpoint 端点路径
+   * @returns {number} 本次静默毫秒数
+   */
+  markEndpointRateLimited(endpoint) {
+    this.#endpointCooldownUntil.set(endpoint, Date.now() + ENDPOINT_RATE_LIMIT_SILENCE_MS);
+    this.#lastRateLimitAt = Date.now();
+    logger.warn(`[王者接口] 端点 ${endpoint} 命中频控 -32002，静默 ${Math.round(ENDPOINT_RATE_LIMIT_SILENCE_MS / 60000)} 分钟`);
+    return ENDPOINT_RATE_LIMIT_SILENCE_MS;
   }
 
   /** 该账号请求成功即视为它自己恢复，清掉它的静默记录（原 `#clearRateLimit`） */
@@ -1536,7 +1586,7 @@ class CampTransport {
    *        - { action: 'return', value }        原样交还给调用方（既不算成功也不算失败）
    *        - { action: 'retry', error, mark, reason }  当失败处理，mark 为真时标记该账号失效；
    *          还有候选就继续，没有则抛出 error
-   *        - { action: 'rate-limit' }           命中频控 -30107
+   *        - { action: 'rate-limit', scope }     命中频控（-30107 账号级 / -32002 端点级）
    * @param {object} [opts.errorLogExtra]  兜底 logger.error 的附加字段
    */
   async #runWithCandidates({
@@ -1553,6 +1603,14 @@ class CampTransport {
       targetUserId = '',
       requesterBotUserId = ''
     } = context;
+
+    // 端点还在 -32002 的静默期里：这个端点现在谁发都失败，直接快速失败，
+    // 一个请求都不打（批量任务会连着查很多号，不能每次白撞一轮）。
+    const endpointCooldown = this.#rateLimiter.endpointCooldownLeft(endpoint);
+    if (endpointCooldown > 0) {
+      throw new RateLimitError(`接口请求太频繁，约 ${describeWait(endpointCooldown)}后恢复，请稍后再试`);
+    }
+
     let lastError = null;
     // 本轮给哪些账号打过失效标记（{ userId, message, definite }），
     // 给循环结束后的「全候选同错 → 判定系统性问题、撤销标记」保险用。
@@ -1626,6 +1684,14 @@ class CampTransport {
           return decision.value;
         }
         if (decision.action === 'rate-limit') {
+          // -32002 是端点级：换号没用，直接暂停这个端点并结束循环，
+          // 别再拿剩下的候选去撞同一面墙（那只会把风控拖长）。
+          if (decision.scope === 'endpoint') {
+            const cooldown = this.#rateLimiter.markEndpointRateLimited(endpoint);
+            lastError = new RateLimitError(`接口请求太频繁，约 ${describeWait(cooldown)}后恢复，请稍后再试`);
+            break;
+          }
+
           // 只冷却触发频控的这个号，然后换下一个候选——池子里还有好号就不该整体停摆
           const cooldown = this.#rateLimiter.markRateLimited(candidate.auth, this.#auth.usableCount());
           lastError = new RateLimitError(`营地接口操作频繁(-30107)，该账号已暂停 ${describeWait(cooldown)}，请稍后再试`);
@@ -1836,7 +1902,15 @@ class CampTransport {
         // 把这个该进冷却的号错标成 authInvalid。
         if (kind === BUSINESS_CODE.RATE_LIMITED) {
           return {
-            action: 'rate-limit'
+            action: 'rate-limit',
+            scope: 'account'
+          };
+        }
+
+        if (kind === BUSINESS_CODE.ENDPOINT_RATE_LIMITED) {
+          return {
+            action: 'rate-limit',
+            scope: 'endpoint'
           };
         }
 
@@ -1979,7 +2053,15 @@ class CampTransport {
         }
         if (kind === BUSINESS_CODE.RATE_LIMITED) {
           return {
-            action: 'rate-limit'
+            action: 'rate-limit',
+            scope: 'account'
+          };
+        }
+
+        if (kind === BUSINESS_CODE.ENDPOINT_RATE_LIMITED) {
+          return {
+            action: 'rate-limit',
+            scope: 'endpoint'
           };
         }
 
@@ -1996,7 +2078,7 @@ class CampTransport {
         }
         return {
           action: 'retry',
-          reason: isDefinite ? '登录态失效' : '皮肤墙请求返回错误码',
+          reason: isDefinite ? '登录态失效' : '请求返回错误码',
           error: isDefinite ? new AuthAccountError(`${candidate.label} 登录态失效(returnCode=${returnCode}): ${data.returnMsg || data.message || ''}`.trim()) : new AuthConfigError(`${candidate.label} 返回错误码 ${returnCode}: ${data.returnMsg || data.message || ''}`.trim()),
           mark: isDefinite
         };
