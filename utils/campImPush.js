@@ -1,5 +1,6 @@
 import { resourceUrl } from "./message.js";
-import { render, segment, logger } from "node-karin";
+import { segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 营地消息 → QQ 私信推送。
  *

@@ -2,7 +2,8 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resolveGroupBot, sendGroup } from "../utils/group.js";
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
-import { Plugin, render, segment, logger, karin } from "node-karin";
+import { Plugin, segment, logger, karin } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * #皮肤上新 —— 官网资料库里的皮肤日历（今日上线 / 即将上线 / 最近上线），
  * 以及按群订阅的「上新提醒」定时推送。
@@ -208,7 +209,7 @@ export class SkinNews extends Plugin {
         continue;
       }
       try {
-        await sendGroup(groupId, [`🎨 皮肤上新 · ${summary}`, img], group);
+        await sendGroup(groupId, [img, `🎨 皮肤上新 · ${summary}`], group);
         sent += 1;
       } catch (error) {
         logger.error(`[皮肤上新] 推送到群 ${groupId} 失败: ${error.message}`);

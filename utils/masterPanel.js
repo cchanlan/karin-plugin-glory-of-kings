@@ -1,6 +1,7 @@
 import { resourceUrl } from "./message.js";
 import path from "node:path";
-import { render, segment, logger } from "node-karin";
+import { segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 import { Config, ResourcePath, ResourceUrl } from '#components';
 import authStore from './authStore.js';
 import { getImgType } from './imageType.js';

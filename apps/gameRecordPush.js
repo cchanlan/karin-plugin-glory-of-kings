@@ -1544,7 +1544,7 @@ export class GameRecordPush extends Plugin {
       logger.debug(`[王者推送] ${qq} 没有推送群，跳过`);
       return false;
     }
-    const message = [text];
+    const message = [];
     if (image) {
       message.push(image);
     } else if (iconUrl) {
@@ -1552,6 +1552,9 @@ export class GameRecordPush extends Plugin {
       const icon = await getLocalImage(iconUrl);
       if (icon) message.push(segment.image(resourceUrl(icon)));
     }
+    // 图片是主体，文案放在图片下方；无图时仍只发送原文案。
+    message.push(text);
+
     let ok = 0;
     for (const groupId of groups) {
       try {

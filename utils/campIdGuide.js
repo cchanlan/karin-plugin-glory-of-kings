@@ -14,7 +14,7 @@ function guideText(hint) {
   return `${hint}\n\n点开「王者营地」小程序并授权登录，进入「我的 → 编辑资料」，复制「营地ID」。\n打不开时点此入口：${CAMP_MINIAPP_URL}`;
 }
 export function campIdGuidePayload(hint = CAMP_ID_GUIDE_HINT) {
-  return [guideText(hint), segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', CAMP_ID_GUIDE_IMG))), Button.bind()];
+  return [segment.image(resourceUrl(path.join(PluginPath, 'resources', 'img', CAMP_ID_GUIDE_IMG))), guideText(hint), Button.bind()];
 }
 export async function replyCampIdGuide(e, hint = CAMP_ID_GUIDE_HINT, replyOptions) {
   const outcome = await sendCampMiniapp(e);

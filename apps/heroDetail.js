@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 英雄详情：一个英雄的生涯场次胜率、近一个月荣誉、荣耀战力趋势、表现五维、最近对局。
  *

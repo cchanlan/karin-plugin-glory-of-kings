@@ -2,7 +2,8 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
 import { ResourcePath, ResourceUrl } from "#components";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * #英雄攻略 —— 出装建议 / 铭文推荐 / 英雄关系（搭档·压制·被压制）/ 技能，一张图出完。
  *

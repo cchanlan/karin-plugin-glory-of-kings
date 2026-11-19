@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 import path from 'path';
 import { getImgType, readYamlFile, Button, getUserAvatar, shouldQuote, isShareReady, querySharedBind, fetchSharedRoster, uploadLocalBindings } from '#utils';
 import { collectRankData, buildRankList, getAllBindings, readSnapshot, SNAPSHOT_TTL } from '../utils/rankStore.js';

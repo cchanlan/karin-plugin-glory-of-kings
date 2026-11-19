@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 战绩查询：`#战绩` / `#排位战绩` / `#巅峰战绩` / `#查询N战绩` / `#查战绩 <英雄>`。
  *
@@ -34,6 +35,13 @@ import { estimateRequestSeconds } from '../utils/api.js';
 // 详情图与评价图标解析被战绩推送共用，抽到了 utils/battleDetailImage.js
 import { fetchBattleDetail, renderBattleDetail, resolveMvp, resolveEvaluate, buildKillTags } from '../utils/battleDetailImage.js';
 import { resolveHero } from '../utils/heroName.js';
+import { createBattleEquipmentService } from '../utils/battleEquipment.js'
+
+const battleEquipment = createBattleEquipmentService({
+  fetchDetail: fetchBattleDetail,
+  cachePath: path.join(PluginData, 'BattleEquipmentCache.json'),
+  logger: logger
+})
 
 /**
  * 战绩模式 → 服务端 `option` 参数。
@@ -257,7 +265,7 @@ export class QueryGameStats extends Plugin {
     const totalGames = shown.length;
     const totalWins = shown.filter(item => Number(item.gameresult) === 1).length;
     const winRate = Math.round(totalWins / totalGames * 100);
-    const processedData = shown.map(this.toListItem);
+    const processedData = await battleEquipment.hydrate(ID, shown, String(e.user_id), shown.map(this.toListItem));
     const listImg = segment.image(resourceUrl("base64://" + (await render.render({
       name: 'QueryGameRecordList',
       type: getImgType(),
@@ -400,7 +408,7 @@ export class QueryGameStats extends Plugin {
       }
       return;
     }
-    const processedData = battleList.list.map(this.toListItem);
+    const processedData = await battleEquipment.hydrate(ID, battleList.list, String(e.user_id), battleList.list.map(this.toListItem));
     const listImg = segment.image(resourceUrl("base64://" + (await render.render({
       name: 'QueryGameRecordList',
       type: getImgType(),

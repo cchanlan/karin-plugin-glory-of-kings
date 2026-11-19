@@ -2,7 +2,8 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import { registeredBot, resolveGroupBot, sendGroup, randomCommonGroup } from "../utils/group.js";
 import path from "node:path";
-import { Plugin, render, segment, logger, karin } from "node-karin";
+import { Plugin, segment, logger, karin } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 王者营地每日签到。
  *

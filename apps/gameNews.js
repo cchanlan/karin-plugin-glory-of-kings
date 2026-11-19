@@ -2,7 +2,8 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resolveGroupBot } from "../utils/group.js";
 import { resourceUrl, sendForward } from "../utils/message.js";
 import path from "node:path";
-import { render, segment, Plugin, logger, karin, sendMsg, contactGroup } from "node-karin";
+import { segment, Plugin, logger, karin, sendMsg, contactGroup } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * #王者公告 —— 官网公告的**完整正文**出图，以及按群订阅的新公告推送。
  *

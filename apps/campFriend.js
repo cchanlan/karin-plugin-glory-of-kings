@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 营地好友 —— 拉「当前营地号」在游戏里的好友，挑一个发消息。
  *

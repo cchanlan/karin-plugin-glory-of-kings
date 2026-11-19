@@ -2,7 +2,8 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
 import { ResourcePath, ResourceUrl } from "#components";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 // 英雄梯度榜：数据来自官方营地 getdetailranklistbyid 接口，实时拉取
 
 import { getImgType, ApiService, Button, shouldQuote, AT_HEAD, stripAtText } from '#utils';

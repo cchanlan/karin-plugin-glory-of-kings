@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl, sendForward } from "../utils/message.js";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 // 皮肤墙功能：营地皮肤列表接口调用逻辑参考自 https://github.com/KimigaiiWuyi/WzryUID
 
 import { getImgType, ApiService, readYamlFile, getLocalImage, sniffImageMime, getUserAvatar, getPvpSkinCover, Button, replyCampIdGuide, CAMP_ID_GUIDE_HINT, CAMP_ID_SUFFIX_HINT, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote, resolveMemberName, isQQNumber, SZ_ORDER, normalizeSzClass, tierRank, pickTierText, QUALITY_STATS, countQuality, cleanImageCache, resolveCacheMaxBytes } from '#utils';

@@ -1,7 +1,8 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * #营地观战 —— 看营地好友里谁正在打，挑一个开直播
  *

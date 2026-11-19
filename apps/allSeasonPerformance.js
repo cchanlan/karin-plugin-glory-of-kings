@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { Plugin, render, segment } from "node-karin";
+import { Plugin, segment } from "node-karin";
+import render from '../utils/uiRender.js';
 import path from 'path';
 import { getImgType, ApiService, readYamlFile, Button, replyCampIdGuide, parsePerfArgs, AT_HEAD, stripAtText, resolveTargetUserId, resolveUserData, shouldQuote } from '#utils';
 import { PluginData, PluginPath, ResourcePath, ResourceUrl } from '#components';

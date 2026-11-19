@@ -1,6 +1,7 @@
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 王者账号管理
  *
@@ -661,7 +662,7 @@ export class AccountManager extends Plugin {
         const idList = this.#formatIdList(list, nameMap);
         const currentId = shared.campIds[list.current] || shared.campIds[0];
         const html = await this.#renderAccountManageCard('查询', currentId, idList, nameMap[currentId]);
-        return e.reply(['这些是从共享库拿到的，本机还没绑（推送类功能要本机绑一次）', html, Button.bind()], {
+        return e.reply([html, '这些是从共享库拿到的，本机还没绑（推送类功能要本机绑一次）', Button.bind()], {
           reply: shouldQuote()
         });
       }

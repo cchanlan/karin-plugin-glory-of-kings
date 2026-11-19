@@ -4,7 +4,8 @@ import { resolveGroupBot, sendGroup } from "../utils/group.js";
 import { getMemberMap } from "../utils/groupNick.js";
 import path from "node:path";
 import { ResourcePath, ResourceUrl } from "#components";
-import { render, segment, Plugin, logger, getAllBot } from "node-karin";
+import { segment, Plugin, logger, getAllBot } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * 跨机器人开黑：`#发起开黑` / `#加入开黑`。
  *

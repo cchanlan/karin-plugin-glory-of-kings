@@ -2,7 +2,8 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
 import { ResourcePath, ResourceUrl } from "#components";
-import { Plugin, render, segment, logger } from "node-karin";
+import { Plugin, segment, logger } from "node-karin";
+import render from '../utils/uiRender.js';
 /**
  * #谁在打游戏 —— 列出本群谁正在对局、谁在线。
  *
