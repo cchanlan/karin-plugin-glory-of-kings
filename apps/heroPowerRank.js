@@ -1,4 +1,5 @@
 import { isBlockedEvent } from "../utils/blackList.js";
+import { heroPowerColor } from '../utils/heroPowerColor.js';
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
 import fs from "node:fs";
@@ -278,7 +279,7 @@ export class HeroPowerRank extends Plugin {
         heroName,
         heroIcon: heroId ? `${HERO_IMG_BASE}/${heroId}00.jpg?imageMogr2/thumbnail/x170/crop/270x170/gravity/east` : '',
         total: rows.length,
-        list: rows,
+        list: rows.map(row => ({ ...row, powerColor: heroPowerColor(row.power) })),
         _res_path: ResourceUrl
       },
       pageGotoParams: {

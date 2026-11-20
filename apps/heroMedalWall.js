@@ -1,4 +1,5 @@
 import { isBlockedEvent } from "../utils/blackList.js";
+import { heroPowerColor } from '../utils/heroPowerColor.js';
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
 import { ResourcePath, ResourceUrl } from "#components";
@@ -236,6 +237,7 @@ function groupMedals(picked, medals) {
         hero: parsed.hero || hero.name || '',
         heroIcon: heroIconUrl(hero.heroId),
         power: Number(hero.heroFightPower) || 0,
+        powerColor: heroPowerColor(hero.heroFightPower),
         playNum: Number(hero.playNum) || 0,
         text: parsed.text
       });

@@ -1,4 +1,5 @@
 import { isBlockedEvent } from "../utils/blackList.js";
+import { heroPowerColor } from '../utils/heroPowerColor.js';
 import { resourceUrl } from "../utils/message.js";
 import { Plugin, segment, logger } from "node-karin";
 import render from '../utils/uiRender.js';
@@ -167,7 +168,9 @@ function buildHomepageData(profileData, roleData, headData, roleNameOverride = '
       flagPag: parseFlagPag(peakParam.flagPag)
     }
   } : undefined;
-  const mod = mods.filter(i => i.stype === 0);
+  const mod = mods.filter(i => i.stype === 0).map(i => ({
+    ...i, powerColor: Number(i.modId) === 601 ? heroPowerColor(i.content) : ''
+  }));
   const combat = mods.find(i => i.stype === 1);
   const {
     rankingStar,

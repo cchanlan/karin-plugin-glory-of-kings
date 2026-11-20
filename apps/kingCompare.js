@@ -1,4 +1,5 @@
 import { getAtUserId } from '../utils/atTarget.js';
+import { heroPowerColor } from '../utils/heroPowerColor.js';
 import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import path from "node:path";
@@ -90,6 +91,8 @@ const ITEMS = [{
 }, {
   icon: '🔥',
   label: '最高战力',
+  heroPower: s => s.topHero.power,
+  heroName: s => s.topHero.heroName || '英雄',
   has: s => Number(s.topHero?.power) > 0,
   text: s => `${s.topHero.heroName || '英雄'} ${s.topHero.power}`,
   num: s => Number(s.topHero?.power) || 0,
@@ -339,6 +342,8 @@ function buildCompareView(a, b) {
       label: item.label,
       leftText: item.text(a),
       rightText: item.text(b),
+      leftHero: item.heroPower ? { name: item.heroName(a), power: item.heroPower(a), color: heroPowerColor(item.heroPower(a)) } : null,
+      rightHero: item.heroPower ? { name: item.heroName(b), power: item.heroPower(b), color: heroPowerColor(item.heroPower(b)) } : null,
       side: diff > 0 ? 'a' : diff < 0 ? 'b' : '',
       barA,
       barB

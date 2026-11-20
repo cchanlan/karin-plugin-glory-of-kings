@@ -1,4 +1,5 @@
 import { resourceUrl } from "./message.js";
+import { heroPowerColor } from './heroPowerColor.js';
 import { segment, logger } from "node-karin";
 import render from '../utils/uiRender.js';
 /**
@@ -541,6 +542,7 @@ function getMeData(myRoles, head) {
     meAssist: bs.assistCnt ?? 0,
     meGrade: bs.gradeGame || '',
     meFightPower: Number(bs.fightPower) || 0,
+    meFightPowerColor: heroPowerColor(bs.fightPower),
     meFightPowerDelta: delta,
     meFightPowerDeltaText: delta > 0 ? `+${delta}` : String(delta)
   };

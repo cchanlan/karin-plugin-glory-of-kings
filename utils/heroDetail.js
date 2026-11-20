@@ -6,6 +6,7 @@
  * 放在 utils 里是为了能脱机测纯计算（不依赖 plugin 桩）。
  */
 import { getLocalImage } from './fileUtils.js';
+import { heroPowerColor } from './heroPowerColor.js';
 import { localImg, resolveEvaluate, buildKillTags } from './battleDetailImage.js';
 
 /**
@@ -103,6 +104,8 @@ export async function buildHeroDetail(data, {
   if (!totalGames) return null;
   const portrait = await resolvePortrait(info);
   const curve = foldPowerCurve(data.powerData);
+  const power = curve.at(-1)?.value;
+  const values = curve.map(point => point.value);
   const radar = RADAR_DIMS.map(([key, label]) => {
     const value = Number(data.avgPerformance?.[key]) || 0;
     return {
@@ -131,7 +134,10 @@ export async function buildHeroDetail(data, {
       mvp: Number(info.mvpCount) || 0,
       score: info.avgGrade || '—'
     },
-    power: curve.length ? curve[curve.length - 1].value : 0,
+    power: power ?? 0,
+    powerColor: heroPowerColor(power),
+    minPowerColor: heroPowerColor(Math.min(...values)),
+    maxPowerColor: heroPowerColor(Math.max(...values)),
     powerCurve: curve,
     radar,
     // art-template 的作用域里没有 JSON，两个图的数据只能先在 Node 侧序列化好再递进去

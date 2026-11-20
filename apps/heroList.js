@@ -2,6 +2,7 @@ import { isBlockedEvent } from "../utils/blackList.js";
 import { resourceUrl } from "../utils/message.js";
 import { Plugin, segment, logger } from "node-karin";
 import render from '../utils/uiRender.js';
+import { heroPowerColor } from '../utils/heroPowerColor.js';
 // 常用英雄榜：数据取自营地赛季页（/game/seasonpage），排位赛在 behavior.rankInfo.heros、
 // 巅峰赛在 behavior.masterInfo.heros，两者各是当前赛季场次前 5 的英雄（营地自身的限制）。
 // 注意只有传具体 seasonId 时才带 heroFightPower/honorTitle，seasonId=0 的 historyList 里这两个字段是空的。
@@ -37,16 +38,6 @@ const HONOR_ICON = {
 function simplifyHeroName(text) {
   if (!text) return text;
   return text.replace(/元流之子\s*[（(]\s*(.)[^）)]*[）)]/g, '元$1');
-}
-
-// 战力配色，跟营地一致
-function fightColor(power) {
-  const p = Number(power) || 0;
-  if (p <= 2500) return '#c8c8c8';
-  if (p <= 5000) return '#6f8ef5';
-  if (p <= 7500) return '#a24bff';
-  if (p <= 10000) return '#f5d76e';
-  return '#ff5b7c';
 }
 
 // 赛季页的胜率是 0~1 的小数，营地展示成一位小数百分比
@@ -287,7 +278,7 @@ export class HeroList extends Plugin {
       peakCnt: hero.peak ? hero.peak.gameCnt : '',
       peakRate: hero.peak ? hero.peak.winRate : '',
       fightPower: hero.fightPower || '-',
-      fightColor: fightColor(hero.fightPower),
+      fightColor: heroPowerColor(hero.fightPower || null),
       honorIcon: honorType ? HONOR_ICON[honorType] || '' : '',
       honorText: simplifyHeroName(honorDesc?.full || honorDesc?.name || honorDesc?.abbr || '')
     };
