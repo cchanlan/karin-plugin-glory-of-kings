@@ -679,7 +679,7 @@ export class CampIm extends Plugin {
       reply: shouldQuote()
     });
     logger.warn(`[营地消息] 回复失败：${JSON.stringify(res).slice(0, 200)}`);
-    return e.reply('没发出去，稍后再试', {
+    return e.reply(client.sendFailureText(res), {
       reply: shouldQuote()
     });
   }
