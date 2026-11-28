@@ -32,3 +32,6 @@ body:is([data-gok-page="AllSeasonPerformance"],[data-gok-page="BattleReport"],[d
 body:is([data-gok-page="accountManage"],[data-gok-page="authPoolOverview"]) { --gok-page-art:url('../img/bgImgV2.png'); }
 body[data-gok-page="HeroGuide"] { --gok-page-art:var(--hero-bg,url('../img/background.jpg')); }
 body[data-gok-page] :is(.gok-overlay,.gok-veil),body[data-gok-page="RankList"] #container { background:transparent!important; }
+
+/* 带页面标记的模板由 body 绘制背景，内容根容器需透出该背景。 */
+html body[data-gok-page] > #container { background:transparent!important; }
